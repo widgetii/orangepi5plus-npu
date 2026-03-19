@@ -1,7 +1,8 @@
 # Rocket NPU Performance Patches
 
 Optimizations for the open-source Rocket NPU driver (RK3588), reducing MobileNetV1 INT8
-inference from 11.6ms to 10.2ms (12% improvement, bit-exact output).
+inference from 11.6ms to 10.2ms (12% improvement, bit-exact output). Also fixes a Teflon
+delegate crash (per-axis quantization assertion) that prevented loading YOLO models.
 
 ## Tested against
 
@@ -31,7 +32,10 @@ Standalone patch combining all Mesa optimizations (supersedes 0001 + 0002):
   bounded inner loop for general case (only iterate real channels)
 - **Cached per-operation submit**: Pre-build `drm_rocket_job` array in `subgraph_create`,
   zero malloc/free per invoke
-- Files: `rkt_device.h`, `rkt_device.c`, `rkt_ml.h`, `rkt_ml.c`
+- **Teflon per-axis quant fix**: Remove assertion crash in `tfl_device.c` `fill_tensor()`
+  when `quant->scale->size != quant->zero_point->size` (happens with YOLO models).
+  Gracefully skips per-axis storage when sizes mismatch.
+- Files: `rkt_device.h`, `rkt_device.c`, `rkt_ml.h`, `rkt_ml.c`, `tfl_device.c`
 
 ### 0001 + 0002 (legacy, superseded by 0003)
 

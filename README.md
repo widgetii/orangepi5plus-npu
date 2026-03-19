@@ -113,19 +113,26 @@ $BENCH $MODEL "" 100 7
 | MobileNetV1 224x224 | 2.6ms / 384 FPS | 1.6ms / 622 FPS |
 | YOLOv5s 640x640 | 16.7ms / 60 FPS | 9.5ms / 106 FPS |
 
-### Open-source Rocket (mainline 6.18, Mesa 26.0.2, single core)
+### Open-source Rocket (mainline 6.18, Mesa 26.1.0-devel, single core)
 
-| Model | CPU | Rocket NPU (stock) | Rocket NPU (optimized) |
-|-------|-----|-----------|---------|
-| MobileNetV1 224x224 | 68ms / 14.7 FPS | 11.6ms / 86 FPS | **10.2ms / 98 FPS** |
-| SSD MobileNetV1 | 89ms / 11.2 FPS | 22.9ms / 43.7 FPS | **19.8ms / 50.4 FPS** |
+| Model | CPU-only | Rocket NPU (optimized) |
+|-------|----------|----------------------|
+| MobileNetV1 224x224 | 68ms | **10.2ms** |
+| SSD MobileNetV1 | 89ms | **19.8ms** |
+| YOLOv5s-relu 640x640 | 142ms | NPU timeout (unsupported conv configs) |
+| YOLOv8n 640x640 | 86ms | NPU timeout (unsupported conv configs) |
 
-### Driver Comparison (single core, MobileNetV1)
+### Vendor vs Open-source (same YOLOv5s-relu model, single core)
 
-| | RKNN | Rocket (stock) | Rocket (optimized) |
+| | RKNN (vendor) | Rocket (open-source) | Gap |
 |--|------|--------|-----|
-| Latency | 2.6ms | 11.6ms | **10.2ms** |
-| vs RKNN | 1x | 4.5x | **3.9x** |
+| MobileNetV1 224 | 2.6ms | 10.2ms | 3.9x |
+| YOLOv5s 640 | 16.7ms | **Not functional** | — |
+
+YOLO models hit Rocket driver limitations: certain convolution configurations (from YOLOv5/v8
+feature pyramid and detection head layers) cause NPU job timeouts. The Teflon delegate splits
+the graph correctly (fixed per-axis quantization assertion crash in this patch set), but the
+NPU hardware rejects some of the resulting convolution subgraphs.
 
 ## NPU Hardware Architecture
 
