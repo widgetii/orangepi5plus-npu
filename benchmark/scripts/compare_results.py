@@ -80,7 +80,7 @@ def summary_table(results_dir):
     """Print summary table from all JSON files in a directory."""
     all_results = []
     for fname in sorted(os.listdir(results_dir)):
-        if fname.endswith('.json'):
+        if fname.endswith('.json') and fname != 'system_info.json':
             all_results.extend(load_results(os.path.join(results_dir, fname)))
 
     if not all_results:

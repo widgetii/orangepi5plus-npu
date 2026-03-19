@@ -1,4 +1,8 @@
-Warning: Permanently added '10.216.128.51' (ED25519) to the list of known hosts.
+ src/gallium/drivers/rocket/rkt_device.c | 125 ++++++++++++++++++++++++++------
+ src/gallium/drivers/rocket/rkt_device.h |  16 ++++
+ src/gallium/drivers/rocket/rkt_ml.c     | 116 ++++++++++++++---------------
+ src/gallium/drivers/rocket/rkt_ml.h     |  10 +++
+ 4 files changed, 189 insertions(+), 78 deletions(-)
 diff --git a/src/gallium/drivers/rocket/rkt_device.c b/src/gallium/drivers/rocket/rkt_device.c
 index 9c2da6a..3796d4c 100644
 --- a/src/gallium/drivers/rocket/rkt_device.c
