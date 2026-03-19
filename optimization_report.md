@@ -10,43 +10,38 @@
 
 ## Summary
 
-Seven optimizations across Mesa userspace and kernel module reduce MobileNetV1 INT8
-inference latency from 12.6ms to 9.9ms (22% improvement, bit-exact output).
+Optimizations across Mesa userspace and kernel module reduce MobileNetV1 INT8
+inference latency by 12% (bit-exact output):
 
 | Model | System Baseline | Optimized | Improvement |
 |-------|----------------|-----------|-------------|
-| MobileNetV1 224 INT8 | 12.62ms avg / 11.61ms min | **9.85ms avg / 9.02ms min** | **22%** |
-| SSD MobileNetV1 INT8 | 24.02ms avg / 23.19ms min | **20.28ms avg / 19.43ms min** | **16%** |
+| MobileNetV1 224 INT8 | 11.61ms avg / 10.91ms min | **10.23ms avg / 9.51ms min** | **12%** |
+| SSD MobileNetV1 INT8 | 22.90ms avg / 21.65ms min | **19.82ms avg / 18.58ms min** | **13%** |
 
-RKNN proprietary single-core reference: 2.6ms (MobileNetV1). The remaining 3.8x gap
-is dominated by hardware compute time (~3ms), irreducible format conversion (~1ms),
-and per-task kernel IRQ overhead (~1ms). Closing it further requires multi-core support
+RKNN proprietary single-core reference: 2.6ms (MobileNetV1). The remaining 3.9x gap
+is dominated by hardware compute time (~3ms), per-task kernel IRQ overhead (~2ms),
+and irreducible format conversion (~1ms). Closing it further requires multi-core support
 or a pre-compiled model format — both major new features beyond driver optimization.
 
 ## Patches
 
-### Mesa patches (apply in order against Mesa 26.1.0-devel / commit 384d128)
+### Mesa patch (apply against Mesa 26.1.0-devel / commit 384d128)
 
-**`patches/mesa/0001-rocket-buffer-pool-cache-sync-batched-submit.patch`**
-Round 1 optimizations targeting IOCTL overhead:
+**`patches/mesa/0003-rocket-bo-pool-cache-sync-output-reorder-neon-input-cached-submit.patch`**
+
+Standalone patch combining all Mesa optimizations:
 - **Buffer pool**: Recycle GEM BOs via a per-screen pool (best-fit, 256 cap) — eliminates CREATE_BO/GEM_CLOSE
-- **Cache sync reduction**: `device_resident` flag skips PREP_BO/FINI_BO for write-once BOs (weights, biases, regcmds); `persistent_map` keeps mmap alive
-- **Batched submission**: Pre-allocate and cache `drm_rocket_submit` structures
+- **Cache sync reduction**: `device_resident` flag skips PREP_BO/FINI_BO for write-once BOs (weights, biases, regcmds); `persistent_map` keeps mmap alive; `cpu_write_only` skips PREP_BO for graph input tensors
+- **Output conversion reorder**: Loop changed from `(oc, x, y)` to `(g, y, x, c)` for sequential reads from NPU interleaved format; NEON `vld1q/vaddq` fast path for single-group outputs (oc <= 16)
+- **Input conversion NEON**: 3-channel RGB fast path using NEON `vst1q_u8` for padding writes; bounded inner loop for general case (avoids branch per iteration for padding channels)
+- **Cached per-operation submit**: Pre-build `drm_rocket_job` array in `subgraph_create`, zero malloc/free per invoke
 - Files: `rkt_device.h`, `rkt_device.c`, `rkt_ml.h`, `rkt_ml.c`
-
-**`patches/mesa/0002-rocket-teflon-input-conv-skip-prep-single-job.patch`**
-Round 2 optimizations targeting CPU-side overhead and job scheduling:
-- **Input conversion fast path**: Pre-fill padding in `subgraph_create` (once); 3-channel RGB fast path writes only 3 of 16 bytes per pixel, avoiding branch-per-iteration and 5.3x fewer writes
-- **Skip input PREP_BO**: `cpu_write_only` flag on graph input tensors skips the PREP_BO IOCTL (802KB cache invalidation) since CPU only writes, never reads
-- **Single merged job**: All 27 per-operation DRM jobs consolidated into 1 job, saving 26x scheduler/fence/IOMMU overhead. Graph-input-only handles go in `in_bo_handles`, all others in `out_bo_handles` to avoid duplicate BO locks
-- **Teflon malloc elimination**: Pre-allocate `buffers`/`is_signed` arrays in `partition_init`, removing 4 malloc+free per invoke
-- Files: `rkt_device.h`, `rkt_device.c`, `rkt_ml.c`, `tfl_device.c`
 
 ### Kernel patch (apply against Linux 6.18.10, `drivers/accel/rocket/`)
 
 **`patches/kernel/0001-rocket-iommu-attach-caching-and-submit-error-propagation.patch`**
 - **IOMMU attach caching**: Cache attached domain on `rocket_core`; skip redundant `iommu_attach_group`/`iommu_detach_group` when consecutive jobs share the same domain. Detach only on suspend, file close, or reset
-- **Submit error propagation**: `rocket_ioctl_submit` now propagates per-job errors from `rocket_ioctl_submit_job` instead of silently ignoring them. This is a correctness bugfix — without it, a failed job (e.g. from invalid BO handles) is silently dropped and userspace gets success
+- **Submit error propagation**: `rocket_ioctl_submit` now propagates per-job errors from `rocket_ioctl_submit_job` instead of silently ignoring them
 - Files: `rocket_core.h`, `rocket_job.c`, `rocket_core.c`, `rocket_drv.c`
 
 ## Applying the patches
@@ -55,8 +50,7 @@ Round 2 optimizations targeting CPU-side overhead and job scheduling:
 
 ```sh
 cd mesa                         # Mesa 26.1.0-devel source tree
-git apply patches/mesa/0001-rocket-buffer-pool-cache-sync-batched-submit.patch
-git apply patches/mesa/0002-rocket-teflon-input-conv-skip-prep-single-job.patch
+git apply patches/mesa/0003-rocket-bo-pool-cache-sync-output-reorder-neon-input-cached-submit.patch
 
 meson setup build \
   -Dgallium-drivers=rocket -Dvulkan-drivers="" -Dteflon=true \
@@ -118,65 +112,74 @@ for lib in ["/usr/local/lib/aarch64-linux-gnu/libteflon.so",
 
 ## Detailed optimization analysis
 
-### IOCTL reduction (per inference, steady state)
+### Where the time goes (MobileNetV1 INT8, perf profile)
 
-| IOCTL | Unpatched | After round 1 | After round 2 |
-|-------|-----------|---------------|---------------|
-| CREATE_BO | 171 | 0 | 0 |
-| PREP_BO | 229 | 4 | 3 |
-| FINI_BO | 86 | 2 | 2 |
-| SUBMIT | 2 | 2 | 2 |
-| GEM_CLOSE | 114 | 0 | 0 |
-| **Total** | **757** | **8** | **7** |
+`perf record` on 200-iteration benchmark (cortex_a76 event counts):
+- 56.5% idle (openblas `blas_thread_server` spin during NPU compute)
+- 3.7% `rkt_ml_subgraph_invoke` (input conversion)
+- 2.8% `__pi_dcache_clean_poc` (FINI_BO cache flush)
+- 2.6% `rkt_ml_subgraph_read_outputs` (output conversion)
+- 1.3% `rkt_fill_weights` (warmup only)
+- 1.0% `_raw_spin_unlock_irqrestore` (kernel IRQ handling)
 
-### Where the time goes (MobileNetV1 INT8, single core)
+### Time budget breakdown (estimated per invoke)
 
-| Component | Unpatched | Optimized | Notes |
-|-----------|-----------|-----------|-------|
-| Input format conversion | ~2-3ms | ~0.5ms | Pre-fill + 3ch fast path |
-| PREP_BO cache invalidation | ~0.5ms | ~0ms | Skipped for input tensor |
-| IOMMU attach/detach (27x) | ~1-2ms | ~0ms | Cached, done once |
-| DRM scheduler overhead (27 jobs) | ~0.5-1ms | ~0ms | Merged to 1 job |
-| NPU hardware compute | ~3ms | ~3ms | Irreducible |
-| Output format conversion | ~1ms | ~1ms | Not yet optimized |
-| Kernel per-task IRQ chain | ~2ms | ~2ms | 41 IRQs for 41 tasks |
-| BO pool / persistent map | ~1ms saved | - | Round 1 |
-| **Total** | **~12.6ms** | **~9.9ms** | |
+| Component | Current | Notes |
+|-----------|---------|-------|
+| NPU hardware compute | ~3ms | Irreducible (single core) |
+| Per-task IRQ chain (41 tasks) | ~2ms | 41 IRQs, not removable without perf loss |
+| Output format conversion | ~0.5ms | Reordered loop + NEON |
+| Input format conversion | ~0.3ms | NEON fast path |
+| Kernel submit + cache flush | ~0.5ms | FINI_BO + scheduler |
+| Misc (fences, scheduling) | ~3.5ms | Partly irreducible |
+| **Total** | **~10ms** | |
 
-### Why RKNN is still 3.8x faster (2.6ms vs 9.9ms)
+### Hardware task chaining investigation
+
+**Goal**: Use `PC_TASK_CON_TASK_NUMBER(N)` to process N tasks with 1 IRQ instead of 41.
+
+**Findings**:
+- Within-operation task chaining via regcmd `PC_BASE_ADDRESS`/`PC_REGISTER_AMOUNTS` fields already works (tasks within an operation are chained in `compile_operation`)
+- Cross-operation chaining was implemented in Mesa: patch last task's regcmd to point to next operation's first task
+- `TASK_NUMBER(N)` with N > 1 does work — hardware processes all N tasks before generating an interrupt
+- **Problem**: Merging all tasks into 1 DRM job forces all tasks to a single NPU core, losing 3-core spatial parallelism. Result: 14.98ms (50% regression!) vs 10ms with per-task jobs
+- Per-operation jobs with `TASK_NUMBER(task_count)`: negligible gain since most operations have only 1 task (MobileNetV1: 27 operations, 41 tasks → only ~14 multi-task operations)
+- **Conclusion**: Per-task IRQ overhead (~2ms) is real but cannot be removed without losing multi-core parallelism. The DRM scheduler distributes per-task jobs across 3 cores, which provides more benefit than eliminating IRQ overhead
+
+### Why RKNN is still 3.9x faster (2.6ms vs 10.2ms)
 
 1. **Pre-compiled command stream**: RKNN's `.rknn` format contains the complete register
    program for the entire model. No per-invoke compilation or job construction.
    Rocket rebuilds `drm_rocket_submit` structures (cached after first invoke, but the
-   kernel still copies and validates 41 tasks from userspace each time).
+   kernel still copies and validates tasks from userspace each time).
 
 2. **Zero data conversion**: RKNN stores tensors in HW-native interleaved int8 format.
    Rocket converts NHWC uint8 to interleaved int8 with 0x80 bias offset every invoke.
 
 3. **Per-task IRQ overhead**: The kernel submits 41 tasks one-by-one via IRQ (each task
    triggers an interrupt, the handler programs the next task's registers). RKNN likely
-   uses hardware task chaining to avoid per-task IRQs.
+   uses hardware task chaining on a single core since it doesn't use the DRM scheduler.
 
 4. **Multi-core**: RKNN can split work across 3 NPU cores. Rocket's DRM scheduler
-   assigns all tasks to a single core.
+   distributes tasks across cores but with per-task job overhead.
 
 ### Remaining optimization paths
 
 **High impact (requires kernel UAPI changes):**
-- Hardware task chaining across operations — submit all 27 operations as a single
-  hardware task chain via regcmd patching (PC_REGCMD_BASE_ADDR), reducing 41 IRQs to 1.
-  Requires extending the `drm_rocket_task` struct or adding a chain flag.
-- Multi-core support — split output channels across 3 cores for ~2-3x throughput.
+- Single-core hardware task chaining with dedicated multi-core split — instead of relying on
+  the DRM scheduler, split operations across cores explicitly in Mesa and use TASK_NUMBER(N)
+  within each core's task chain. This could eliminate both IRQ overhead AND get multi-core.
+- Pre-compiled model cache — serialize the compiled subgraph to disk.
 
 **Medium impact (userspace only):**
-- Output conversion optimization — current loop is `(oc, x, y)` with scattered reads.
-  Reorder to `(g, y, x, c)` for sequential access; add NEON vectorization.
-- Pre-compiled model cache — serialize the compiled subgraph (regcmd BOs, tensor layout)
-  to disk, skip `subgraph_create` on subsequent loads.
+- Further output conversion NEON — the multi-group scatter-store path is still scalar.
+  For large channel counts, NEON gather-scatter could help.
+- Kernel cached task submission — avoid `copy_from_user` for repeated identical task arrays.
+  Measured at ~0.3ms via perf; moderate effort for small gain.
 
 **Low impact:**
-- NEON for input conversion — `vld3_u8`/`vst3_lane_u8` for 8 pixels at a time.
-  Current scalar 3-channel path is already fast (~0.5ms for 224x224).
+- Input conversion is already well-optimized (~0.3ms for 224x224x3).
+- BO pool is effective; further tuning unlikely to yield measurable gains.
 
 ## NPU hardware notes
 
@@ -193,9 +196,14 @@ The driver uses 4 custom IOCTLs: `CREATE_BO`, `PREP_BO`, `FINI_BO`, `SUBMIT`.
 
 Within an operation, `compile_operation` patches regcmd entries to chain tasks
 (sets `PC_REGCMD_BASE_ADDR` pointing to the next task's register block). The kernel
-submits one task at a time via IRQ; the hardware may or may not follow the chain
-autonomously — the `OPERATION_ENABLE=0` in the IRQ handler aborts any in-progress chain
-before re-submitting the next task explicitly.
+submits one task at a time via IRQ; the hardware follows the chain after
+`OPERATION_ENABLE` is written via the regcmd's final entry.
+
+`PC_TASK_CON_TASK_NUMBER(N)` tells the hardware to count N task completions before
+generating an interrupt. With N=1 (default), every task generates an IRQ. With N>1,
+the hardware auto-chains tasks via the regcmd linkage and only interrupts after N
+completions. This works correctly but is only beneficial when all tasks run on the
+same core (no multi-core parallelism).
 
 ## Known issues
 

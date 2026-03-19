@@ -115,19 +115,17 @@ $BENCH $MODEL "" 100 7
 
 ### Open-source Rocket (mainline 6.18, Mesa 26.0.2, single core)
 
-| Model | CPU | Rocket NPU | Speedup |
+| Model | CPU | Rocket NPU (stock) | Rocket NPU (optimized) |
 |-------|-----|-----------|---------|
-| MobileNetV1 224x224 | 68ms / 14.7 FPS | 12.4ms / 81 FPS | 5.5x |
-| SSD MobileNetV1 | 89ms / 11.2 FPS | 23.9ms / 41.9 FPS | 3.7x |
+| MobileNetV1 224x224 | 68ms / 14.7 FPS | 11.6ms / 86 FPS | **10.2ms / 98 FPS** |
+| SSD MobileNetV1 | 89ms / 11.2 FPS | 22.9ms / 43.7 FPS | **19.8ms / 50.4 FPS** |
 
 ### Driver Comparison (single core, MobileNetV1)
 
-| | RKNN | Rocket | Gap |
+| | RKNN | Rocket (stock) | Rocket (optimized) |
 |--|------|--------|-----|
-| Latency | 2.6ms | 12.4ms | 4.8x |
-| IOCTLs per inference | 63 | 634 | 10x |
-| Submit calls | 1 | 10 | 10x |
-| Buffer allocations | 5 | 171 | 34x |
+| Latency | 2.6ms | 11.6ms | **10.2ms** |
+| vs RKNN | 1x | 4.5x | **3.9x** |
 
 ## NPU Hardware Architecture
 
@@ -181,6 +179,8 @@ cat /sys/kernel/debug/tracing/trace
 
 ## Research Documents
 
+- [`optimization_report.md`](optimization_report.md) — Detailed analysis of all Rocket driver optimizations (12% latency reduction)
+- [`patches/README.md`](patches/README.md) — How to apply the optimization patches
 - [`rocket_ioctl_analysis.md`](rocket_ioctl_analysis.md) — Decoded IOCTL protocols for both Rocket and RKNPU drivers
 - [`npu_research_report.md`](npu_research_report.md) — Full research report: architecture, ftrace analysis, driver comparison
 
