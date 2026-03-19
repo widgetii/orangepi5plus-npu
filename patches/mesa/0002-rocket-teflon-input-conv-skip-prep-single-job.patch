@@ -1,0 +1,404 @@
+diff -ruN a/src/gallium/drivers/rocket/rkt_device.c b/src/gallium/drivers/rocket/rkt_device.c
+--- a/src/gallium/drivers/rocket/rkt_device.c	2026-03-19 20:35:26.728838583 +0300
++++ b/src/gallium/drivers/rocket/rkt_device.c	2026-03-19 20:35:26.731182696 +0300
+@@ -29,15 +29,6 @@
+ {
+    struct rkt_screen *screen = rkt_screen(pscreen);
+ 
+-   /* Free all pooled BOs */
+-   util_dynarray_foreach(&screen->bo_pool, struct rkt_bo_pool_entry, entry) {
+-      struct drm_gem_close arg = {0};
+-      arg.handle = entry->handle;
+-      drmIoctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &arg);
+-   }
+-   util_dynarray_fini(&screen->bo_pool);
+-   pthread_mutex_destroy(&screen->pool_mutex);
+-
+    if (screen->ro)
+       screen->ro->destroy(screen->ro);
+ 
+@@ -60,6 +51,7 @@
+ {
+    struct rkt_screen *screen = rkt_screen(pctx->screen);
+    struct rkt_resource *rsc = rkt_resource(prsc);
++   struct drm_rocket_prep_bo arg = {0};
+    int ret;
+ 
+    assert(level == 0);
+@@ -76,25 +68,15 @@
+ 
+    pipe_resource_reference(&transfer->resource, prsc);
+ 
+-   /* Skip PREP_BO for device-resident BOs (already synced, no NPU writes pending) */
+-   if (!rsc->device_resident) {
+-      struct drm_rocket_prep_bo arg = {0};
+-      arg.handle = rsc->handle;
+-      arg.timeout_ns = INT64_MAX;
+-      ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_PREP_BO, &arg);
+-      assert(ret != -1);
+-   }
++   arg.handle = rsc->handle;
++   arg.timeout_ns = INT64_MAX;
+ 
+-   /* Use persistent map if available */
+-   uint8_t *map;
+-   if (rsc->persistent_map) {
+-      map = rsc->persistent_map;
+-   } else {
+-      map = os_mmap(NULL, rsc->bo_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+-                    screen->fd, rsc->fake_offset);
+-      assert(map != MAP_FAILED);
+-      rsc->persistent_map = map;
+-   }
++   ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_PREP_BO, &arg);
++   assert(ret != -1);
++
++   uint8_t *map = os_mmap(NULL, prsc->width0, PROT_READ | PROT_WRITE, MAP_SHARED,
++                          screen->fd, rsc->fake_offset);
++   assert(map != MAP_FAILED);
+ 
+    *out_transfer = transfer;
+ 
+@@ -107,17 +89,16 @@
+ {
+    struct rkt_screen *screen = rkt_screen(pctx->screen);
+    struct rkt_resource *rsrc = rkt_resource(transfer->resource);
++   struct drm_rocket_fini_bo arg = {0};
++   int ret;
++
++   arg.handle = rsrc->handle;
+ 
+-   /* Skip FINI_BO for device-resident BOs */
+-   if (!rsrc->device_resident && transfer->usage == PIPE_MAP_WRITE) {
+-      struct drm_rocket_fini_bo arg = {0};
+-      arg.handle = rsrc->handle;
+-      int ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_FINI_BO, &arg);
++   if (transfer->usage == PIPE_MAP_WRITE) {
++      ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_FINI_BO, &arg);
+       assert(ret >= 0);
+    }
+ 
+-   /* Keep persistent map - do not munmap */
+-
+    pipe_resource_reference(&transfer->resource, NULL);
+    ralloc_free(transfer);
+ }
+@@ -157,7 +138,9 @@
+                     const struct pipe_resource *templat)
+ {
+    struct rkt_screen *screen = rkt_screen(pscreen);
++   struct drm_rocket_create_bo arg = {0};
+    struct rkt_resource *rsc;
++   int ret;
+ 
+    assert(templat->target == PIPE_BUFFER);
+    assert(templat->height0 == 1);
+@@ -175,46 +158,6 @@
+ 
+    rsc->bo_size = templat->width0;
+ 
+-   /* Try to find a pooled BO of matching size */
+-   pthread_mutex_lock(&screen->pool_mutex);
+-   int best_idx = -1;
+-   uint64_t best_size = UINT64_MAX;
+-   util_dynarray_foreach(&screen->bo_pool, struct rkt_bo_pool_entry, entry) {
+-      int idx = entry - (struct rkt_bo_pool_entry *)util_dynarray_begin(&screen->bo_pool);
+-      /* Exact size match or up to 2x larger (avoid waste) */
+-      if (entry->size >= templat->width0 && entry->size <= (uint64_t)templat->width0 * 2) {
+-         if (entry->size < best_size) {
+-            best_size = entry->size;
+-            best_idx = idx;
+-         }
+-      }
+-   }
+-
+-   if (best_idx >= 0) {
+-      struct rkt_bo_pool_entry *entry =
+-         util_dynarray_element(&screen->bo_pool, struct rkt_bo_pool_entry, best_idx);
+-      rsc->handle = entry->handle;
+-      rsc->phys_addr = entry->phys_addr;
+-      rsc->fake_offset = entry->fake_offset;
+-      rsc->bo_size = entry->size;
+-      rsc->pooled = true;
+-
+-      /* Remove from pool by swapping with last */
+-      int last = util_dynarray_num_elements(&screen->bo_pool, struct rkt_bo_pool_entry) - 1;
+-      if (best_idx < last) {
+-         *entry = *util_dynarray_element(&screen->bo_pool, struct rkt_bo_pool_entry, last);
+-      }
+-      (void)util_dynarray_pop_ptr(&screen->bo_pool, struct rkt_bo_pool_entry);
+-      pthread_mutex_unlock(&screen->pool_mutex);
+-
+-      return &rsc->base;
+-   }
+-   pthread_mutex_unlock(&screen->pool_mutex);
+-
+-   /* No suitable pooled BO - create new one */
+-   struct drm_rocket_create_bo arg = {0};
+-   int ret;
+-
+    arg.size = templat->width0;
+ 
+    ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_CREATE_BO, &arg);
+@@ -224,7 +167,6 @@
+    rsc->handle = arg.handle;
+    rsc->phys_addr = arg.dma_address;
+    rsc->fake_offset = arg.offset;
+-   rsc->pooled = false;
+ 
+    if (DBG_ENABLED(ROCKET_DBG_ZERO)) {
+       void *map = os_mmap(NULL, arg.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+@@ -245,35 +187,12 @@
+ {
+    struct rkt_resource *rsc = rkt_resource(prsc);
+    struct rkt_screen *screen = rkt_screen(pscreen);
+-
+-   /* Unmap persistent map */
+-   if (rsc->persistent_map) {
+-      os_munmap(rsc->persistent_map, rsc->bo_size);
+-      rsc->persistent_map = NULL;
+-   }
+-
+-   /* Return BO to pool instead of closing (cap pool at 256 entries) */
+-   pthread_mutex_lock(&screen->pool_mutex);
+-   unsigned pool_size = util_dynarray_num_elements(&screen->bo_pool,
+-                                                   struct rkt_bo_pool_entry);
+-   if (pool_size < 256) {
+-      struct rkt_bo_pool_entry entry = {
+-         .handle = rsc->handle,
+-         .phys_addr = rsc->phys_addr,
+-         .fake_offset = rsc->fake_offset,
+-         .size = rsc->bo_size,
+-      };
+-      util_dynarray_append(&screen->bo_pool, entry);
+-      pthread_mutex_unlock(&screen->pool_mutex);
+-      ralloc_free(rsc);
+-      return;
+-   }
+-   pthread_mutex_unlock(&screen->pool_mutex);
+-
+-   /* Pool full, actually close */
+    struct drm_gem_close arg = {0};
++   int ret;
++
+    arg.handle = rsc->handle;
+-   int ret = drmIoctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &arg);
++
++   ret = drmIoctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &arg);
+    assert(ret >= 0);
+ 
+    ralloc_free(rsc);
+@@ -302,8 +221,6 @@
+    rocket_debug = debug_get_option_rocket_debug();
+ 
+    rkt_screen->fd = fd;
+-   rkt_screen->bo_pool = UTIL_DYNARRAY_INIT;
+-   pthread_mutex_init(&rkt_screen->pool_mutex, NULL);
+ 
+    screen->get_screen_fd = rkt_screen_get_fd;
+    screen->destroy = rkt_destroy_screen;
+diff -ruN a/src/gallium/drivers/rocket/rkt_device.h b/src/gallium/drivers/rocket/rkt_device.h
+--- a/src/gallium/drivers/rocket/rkt_device.h	2026-03-19 20:35:26.723945315 +0300
++++ b/src/gallium/drivers/rocket/rkt_device.h	2026-03-19 20:35:26.726493886 +0300
+@@ -8,8 +8,6 @@
+ #include "pipe/p_state.h"
+ #include "renderonly/renderonly.h"
+ #include "util/log.h"
+-#include <util/u_dynarray.h>
+-#include <pthread.h>
+ 
+ #ifndef RKT_SCREEN_H
+ #define RKT_SCREEN_H
+@@ -31,21 +29,11 @@
+                    ##__VA_ARGS__);                    \
+    } while (0)
+ 
+-struct rkt_bo_pool_entry {
+-   uint32_t handle;
+-   uint64_t phys_addr;
+-   uint64_t fake_offset;
+-   uint64_t size;
+-};
+-
+ struct rkt_screen {
+    struct pipe_screen pscreen;
+ 
+    int fd;
+    struct renderonly *ro;
+-
+-   struct util_dynarray bo_pool;
+-   pthread_mutex_t pool_mutex;
+ };
+ 
+ static inline struct rkt_screen *
+@@ -72,10 +60,6 @@
+    uint64_t obj_addr;
+    uint64_t fake_offset;
+    uint64_t bo_size;
+-
+-   bool pooled;
+-   bool device_resident; /* BO written once, skip subsequent PREP/FINI */
+-   uint8_t *persistent_map; /* Kept mapped to avoid repeated mmap/munmap */
+ };
+ 
+ static inline struct rkt_resource *
+diff -ruN a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+--- a/src/gallium/drivers/rocket/rkt_ml.c	2026-03-19 20:35:26.733534685 +0300
++++ b/src/gallium/drivers/rocket/rkt_ml.c	2026-03-19 20:35:26.735831840 +0300
+@@ -156,9 +156,6 @@
+ 
+    pipe_buffer_unmap(pcontext, transfer);
+ 
+-   /* Regcmd is written once and never changes - mark as device-resident */
+-   rkt_resource(operation->regcmd)->device_resident = true;
+-
+    for (int i = 0; i < num_tasks; i++) {
+       util_dynarray_fini(&regcfgs[i]);
+    }
+@@ -199,10 +196,6 @@
+    operation->weights = rkt_fill_weights(subgraph, poperation);
+    operation->biases =
+       rkt_fill_biases(subgraph, poperation, &operation->truncate_bits);
+-
+-   /* Weights and biases are written once during subgraph creation */
+-   rkt_resource(operation->weights)->device_resident = true;
+-   rkt_resource(operation->biases)->device_resident = true;
+ }
+ 
+ static struct rkt_operation *
+@@ -480,29 +473,25 @@
+ 
+    DBG("Submitting graph\n");
+ 
+-   /* Build submit structures once, reuse on subsequent invokes */
+-   if (!subgraph->submit_cached) {
+-      unsigned op_count = util_dynarray_num_elements(&subgraph->operations,
+-                                                     struct rkt_operation);
+-      subgraph->cached_jobs = calloc(op_count, sizeof(struct drm_rocket_job));
+-      subgraph->cached_in_handles = calloc(op_count, sizeof(uint32_t *));
+-      subgraph->cached_out_handles = calloc(op_count, sizeof(uint32_t *));
+-      subgraph->cached_job_count = op_count;
+-
+-      unsigned job_idx = 0;
+-      util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+-                             operation) {
+-         unsigned num_inputs = operation->add_tensor != -1 ? 2 : 1;
+-         uint32_t *in_bo_handles = calloc(num_inputs, sizeof(uint32_t));
+-         uint32_t *out_bo_handles = malloc(sizeof(uint32_t));
+-
+-         in_bo_handles[0] = rkt_get_tensor(subgraph, operation->input_index)->handle;
+-         if (operation->add_tensor != -1)
+-            in_bo_handles[1] =
+-               rkt_get_tensor(subgraph, operation->add_tensor)->handle;
+-         out_bo_handles[0] =
+-            rkt_get_tensor(subgraph, operation->output_index)->handle;
++   struct util_dynarray jobs = UTIL_DYNARRAY_INIT;
++
++   util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
++                          operation) {
++      unsigned num_inputs = operation->add_tensor != -1 ? 2 : 1;
++      uint32_t *in_bo_handles = calloc(num_inputs, sizeof(uint32_t));
++      uint32_t *out_bo_handles = malloc(sizeof(uint32_t));
++
++      in_bo_handles[0] = rkt_get_tensor(subgraph, operation->input_index)->handle;
++
++      if (operation->add_tensor != -1)
++         in_bo_handles[1] =
++            rkt_get_tensor(subgraph, operation->add_tensor)->handle;
++
++      out_bo_handles[0] =
++         rkt_get_tensor(subgraph, operation->output_index)->handle;
+ 
++      if (operation->reuse_weights_cbuf) {
++         /* Submit all tasks to the same core, so weights can be reused */
+          unsigned num_tasks =
+             util_dynarray_num_elements(&operation->tasks, struct split_task);
+          struct drm_rocket_task *tasks = calloc(num_tasks, sizeof(*tasks));
+@@ -512,29 +501,50 @@
+             tasks[task_count].regcmd_count = task->regcfg_amount;
+             task_count++;
+          }
+-
+-         subgraph->cached_jobs[job_idx].task_struct_size = sizeof(struct drm_rocket_task);
+-         subgraph->cached_jobs[job_idx].in_bo_handles = (uint64_t)(uintptr_t)in_bo_handles;
+-         subgraph->cached_jobs[job_idx].in_bo_handle_count = num_inputs;
+-         subgraph->cached_jobs[job_idx].out_bo_handles = (uint64_t)(uintptr_t)out_bo_handles;
+-         subgraph->cached_jobs[job_idx].out_bo_handle_count = 1;
+-         subgraph->cached_jobs[job_idx].tasks = (uint64_t)tasks;
+-         subgraph->cached_jobs[job_idx].task_count = task_count;
+-
+-         subgraph->cached_in_handles[job_idx] = in_bo_handles;
+-         subgraph->cached_out_handles[job_idx] = out_bo_handles;
+-         job_idx++;
++         struct drm_rocket_job job = {0};
++         job.task_struct_size = sizeof(struct drm_rocket_task);
++         job.in_bo_handles = (uint64_t)(uintptr_t)in_bo_handles;
++         job.in_bo_handle_count = num_inputs;
++         job.out_bo_handles = (uint64_t)(uintptr_t)out_bo_handles;
++         job.out_bo_handle_count = 1;
++         job.tasks = (uint64_t)tasks;
++         job.task_count = task_count;
++         util_dynarray_append(&jobs, job);
++      } else {
++         /* Spread tasks among cores, for parallelism */
++         util_dynarray_foreach (&operation->tasks, struct split_task, task) {
++            struct drm_rocket_task *ktask = calloc(1, sizeof(*ktask));
++            ktask->regcmd = task->regcfg_addr;
++            ktask->regcmd_count = task->regcfg_amount;
++
++            struct drm_rocket_job job = {0};
++            job.task_struct_size = sizeof(struct drm_rocket_task);
++            job.in_bo_handles = (uint64_t)(uintptr_t)in_bo_handles;
++            job.in_bo_handle_count = num_inputs;
++            job.out_bo_handles = (uint64_t)(uintptr_t)out_bo_handles;
++            job.out_bo_handle_count = 1;
++            job.tasks = (uint64_t)ktask;
++            job.task_count = 1;
++            util_dynarray_append(&jobs, job);
++         }
+       }
+-
+-      subgraph->cached_submit.job_struct_size = sizeof(struct drm_rocket_job);
+-      subgraph->cached_submit.jobs = (uint64_t)subgraph->cached_jobs;
+-      subgraph->cached_submit.job_count = op_count;
+-      subgraph->submit_cached = true;
+    }
+ 
+-   ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_SUBMIT, &subgraph->cached_submit);
++   struct drm_rocket_submit submit = {0};
++   submit.job_struct_size = sizeof(struct drm_rocket_job);
++   submit.jobs = (uint64_t)util_dynarray_begin(&jobs);
++   submit.job_count = util_dynarray_num_elements(&jobs, struct drm_rocket_job);
++
++   ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_SUBMIT, &submit);
+    assert(ret == 0);
+ 
++   util_dynarray_foreach (&jobs, struct drm_rocket_job, job) {
++      free((void *)job->in_bo_handles);
++      free((void *)job->out_bo_handles);
++      free((void *)job->tasks);
++   }
++   util_dynarray_fini(&jobs);
++
+    DBG("Submitted graph\n");
+ }
+ 
+@@ -606,18 +616,6 @@
+ {
+    struct rkt_ml_subgraph *subgraph = (struct rkt_ml_subgraph *)(psubgraph);
+ 
+-   /* Free cached submit structures */
+-   if (subgraph->submit_cached) {
+-      for (unsigned i = 0; i < subgraph->cached_job_count; i++) {
+-         free(subgraph->cached_in_handles[i]);
+-         free(subgraph->cached_out_handles[i]);
+-         free((void *)subgraph->cached_jobs[i].tasks);
+-      }
+-      free(subgraph->cached_jobs);
+-      free(subgraph->cached_in_handles);
+-      free(subgraph->cached_out_handles);
+-   }
+-
+    util_dynarray_foreach (&subgraph->operations, struct rkt_operation, operation)
+       free_operation(operation);
+    util_dynarray_fini(&subgraph->operations);
