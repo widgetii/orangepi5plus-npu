@@ -91,12 +91,22 @@ Pattern: submit → IRQ → thread (submit next + cleanup previous) → IRQ → 
 | Buffer mgmt | Internal DMA pool | DRM GEM objects + IOMMU |
 | Job submission | Direct register writes | gpu_sched framework |
 
+### IOCTL Efficiency Comparison
+| Metric | RKNN | Rocket | Ratio |
+|--------|------|--------|-------|
+| Total IOCTLs per inference | 63 | 634 | 10x |
+| Submit calls | 1 (whole model) | 10 (layer-by-layer) | 10x |
+| Buffer allocations | 5 | 171 | 34x |
+| Cache sync calls | 16 | 339 | 21x |
+| Custom IOCTL types | 6 | 4 | — |
+
 ### Why Rocket is Slower
-1. **No multi-core**: RKNN can use all 3 cores (3x throughput potential)
-2. **JIT compilation**: Mesa compiles layer-by-layer vs RKNN's pre-compiled graphs
-3. **Limited op coverage**: Only convolution, addition, ReLU implemented
-4. **No hardware-specific optimizations**: RKNN uses tiled memory layout, DMA chaining
-5. **Extra cache sync overhead**: 340 PREP/FINI_BO calls per inference (cache maintenance)
+1. **IOCTL overhead**: 10x more kernel transitions per inference (634 vs 63)
+2. **No multi-core**: RKNN can use all 3 cores (3x throughput potential)
+3. **Layer-by-layer submission**: 10 submit calls vs RKNN's single whole-model submit
+4. **Cache sync overhead**: 339 PREP/FINI_BO calls vs RKNN's 16 MEM_SYNC calls
+5. **JIT compilation**: Mesa compiles per-layer vs RKNN's pre-compiled .rknn graphs
+6. **Many small buffers**: 171 GEM BOs vs RKNN's 5 large DMA-buf allocations
 
 ## 5. NPU Command Submission Protocol
 
@@ -118,4 +128,6 @@ for one convolution operation. The frontend (PC unit) reads these and writes the
 3. Each convolution layer = 1 task = set of register writes to configure CNA + trigger
 4. The CNA performs the actual MAC operations using configured weights/activations
 5. Three independent cores share the same design but can run different layers in parallel
-6. The proprietary RKNN stack's performance advantage comes primarily from multi-core scheduling and pre-compiled register command sequences
+6. The proprietary RKNN stack's performance advantage comes primarily from multi-core
+   scheduling, pre-compiled register command sequences, and dramatically fewer IOCTL
+   transitions (63 vs 634 per inference — a 10x reduction in kernel overhead)
