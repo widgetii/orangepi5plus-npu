@@ -9,7 +9,7 @@
  	struct mutex job_lock;
  	struct rocket_job *in_flight_job;
 --- rocket_job.c.bak	2026-03-19 19:58:39.462061991 +0300
-+++ rocket_job.c	2026-03-19 19:59:08.002619853 +0300
++++ rocket_job.c	2026-03-19 20:29:18.055926174 +0300
 @@ -314,9 +314,15 @@
  	if (ret < 0)
  		return fence;
@@ -50,6 +50,20 @@
  
  		core->in_flight_job = NULL;
  	}
+@@ -627,8 +636,11 @@
+ 	}
+ 
+ 
+-	for (i = 0; i < args->job_count; i++)
+-		rocket_ioctl_submit_job(dev, file, &jobs[i]);
++	for (i = 0; i < args->job_count; i++) {
++		ret = rocket_ioctl_submit_job(dev, file, &jobs[i]);
++		if (ret)
++			goto exit;
++	}
+ 
+ exit:
+ 	kvfree(jobs);
 --- rocket_core.c.bak	2026-03-19 19:58:39.466986159 +0300
 +++ rocket_core.c	2026-03-19 19:59:08.006297449 +0300
 @@ -95,6 +95,11 @@
