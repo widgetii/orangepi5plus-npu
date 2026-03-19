@@ -1,0 +1,236 @@
+--- src/gallium/drivers/rocket/rkt_device.h.bak	2026-03-19 19:34:27.309794676 +0300
++++ src/gallium/drivers/rocket/rkt_device.h	2026-03-19 19:41:56.152550769 +0300
+@@ -75,6 +75,7 @@
+ 
+    bool pooled;
+    bool device_resident; /* BO written once, skip subsequent PREP/FINI */
++   bool cpu_write_only;  /* CPU only writes (no read), skip PREP_BO */
+    uint8_t *persistent_map; /* Kept mapped to avoid repeated mmap/munmap */
+ };
+ 
+--- src/gallium/drivers/rocket/rkt_device.c.bak	2026-03-19 19:34:27.312027958 +0300
++++ src/gallium/drivers/rocket/rkt_device.c	2026-03-19 19:41:58.868544527 +0300
+@@ -76,8 +76,9 @@
+ 
+    pipe_resource_reference(&transfer->resource, prsc);
+ 
+-   /* Skip PREP_BO for device-resident BOs (already synced, no NPU writes pending) */
+-   if (!rsc->device_resident) {
++   /* Skip PREP_BO for device-resident BOs (already synced, no NPU writes pending)
++    * and for cpu_write_only BOs (no need to invalidate cache for write-only access) */
++   if (!rsc->device_resident && !rsc->cpu_write_only) {
+       struct drm_rocket_prep_bo arg = {0};
+       arg.handle = rsc->handle;
+       arg.timeout_ns = INT64_MAX;
+@@ -108,7 +109,8 @@
+    struct rkt_screen *screen = rkt_screen(pctx->screen);
+    struct rkt_resource *rsrc = rkt_resource(transfer->resource);
+ 
+-   /* Skip FINI_BO for device-resident BOs */
++   /* Skip FINI_BO for device-resident BOs.
++    * Keep FINI_BO for cpu_write_only BOs — must flush cache to device. */
+    if (!rsrc->device_resident && transfer->usage == PIPE_MAP_WRITE) {
+       struct drm_rocket_fini_bo arg = {0};
+       arg.handle = rsrc->handle;
+@@ -312,4 +314,4 @@
+    screen->resource_destroy = rkt_resource_destroy;
+ 
+    return screen;
+-}
+\ No newline at end of file
++}
+--- src/gallium/drivers/rocket/rkt_ml.c.bak	2026-03-19 19:34:27.307214604 +0300
++++ src/gallium/drivers/rocket/rkt_ml.c	2026-03-19 19:51:02.707778092 +0300
+@@ -386,6 +386,14 @@
+                     calc_raw_output_size(operation));
+    }
+ 
++   /* Phase 3: Mark graph input tensors as cpu_write_only (skip PREP_BO at invoke) */
++   util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
++                          operation) {
++      if (find_producer(subgraph, operation->input_index) == NULL) {
++         rkt_get_tensor(subgraph, operation->input_index)->cpu_write_only = true;
++      }
++   }
++
+    /* Compile */
+    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+                           operation) {
+@@ -393,6 +401,23 @@
+       compile_operation(subgraph, operation);
+    }
+ 
++   /* Phase 1: Pre-fill padding for graph input tensors */
++   util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
++                          operation) {
++      if (operation->input_channels > 1 &&
++          operation->input_channels % FEATURE_ATOMIC_SIZE != 0 &&
++          find_producer(subgraph, operation->input_index) == NULL) {
++         struct rkt_resource *input_tensor =
++            rkt_get_tensor(subgraph, operation->input_index);
++         struct pipe_transfer *transfer;
++         uint8_t *map = pipe_buffer_map(pcontext, &input_tensor->base,
++                                        PIPE_MAP_WRITE, &transfer);
++         memset(map, (uint8_t)(operation->input_zero_point - 0x80),
++                input_tensor->bo_size);
++         pipe_buffer_unmap(pcontext, transfer);
++      }
++   }
++
+    return &subgraph->base;
+ }
+ 
+@@ -449,19 +474,32 @@
+                      map[n++] = zero_point;
+                }
+             }
++         } else if (input_channels == 3 &&
++                    DIV_ROUND_UP(input_channels, FEATURE_ATOMIC_SIZE) == 1) {
++            /* Phase 1: Fast path for 3-channel (RGB) input */
++            unsigned n = 0;
++            for (int x = 0; x < input_width; x++) {
++               for (int y = 0; y < input_height; y++) {
++                  map[n]     = input_in[x][y][0] - 0x80;
++                  map[n + 1] = input_in[x][y][1] - 0x80;
++                  map[n + 2] = input_in[x][y][2] - 0x80;
++                  n += FEATURE_ATOMIC_SIZE;
++               }
++            }
+          } else {
++            /* Phase 1: Optimized general path - only write real channels */
+             unsigned n = 0;
+             for (int u = 0; u < DIV_ROUND_UP(input_channels, FEATURE_ATOMIC_SIZE);
+                  u++) {
++               unsigned base_ch = u * FEATURE_ATOMIC_SIZE;
++               unsigned ch_count = MIN2(input_channels - base_ch,
++                                        FEATURE_ATOMIC_SIZE);
+                for (int x = 0; x < input_width; x++) {
+                   for (int y = 0; y < input_height; y++) {
+-                     for (int c = 0; c < FEATURE_ATOMIC_SIZE; c++) {
+-                        unsigned input_channel = c + u * FEATURE_ATOMIC_SIZE;
+-                        if (input_channel < input_channels)
+-                           map[n++] = input_in[x][y][input_channel] - 0x80;
+-                        else
+-                           map[n++] = zero_point - 0x80;
++                     for (int c = 0; c < ch_count; c++) {
++                        map[n + c] = input_in[x][y][base_ch + c] - 0x80;
+                      }
++                     n += FEATURE_ATOMIC_SIZE;
+                   }
+                }
+             }
+--- src/gallium/frontends/teflon/tfl_device.c.bak	2026-03-19 19:34:30.070284832 +0300
++++ src/gallium/frontends/teflon/tfl_device.c	2026-03-19 19:34:47.549876601 +0300
+@@ -56,6 +56,12 @@
+ 
+    unsigned *output_tensors;
+    unsigned output_count;
++
++   /* Phase 5: Pre-allocated invoke buffers (avoid malloc/free per invoke) */
++   void **input_buffers;
++   bool *input_is_signed;
++   void **output_buffers;
++   bool *output_is_signed;
+ };
+ 
+ static struct pipe_resource *
+@@ -460,6 +466,13 @@
+    free(operation->output_tensors);
+ }
+ 
++static bool
++is_signed_type(TfLiteType type)
++{
++   return type == kTfLiteInt8 || type == kTfLiteInt16 ||
++          type == kTfLiteInt32 || type == kTfLiteInt64;
++}
++
+ static void *
+ partition_init(TfLiteContext *tf_context, const char *buffer, size_t length)
+ {
+@@ -514,6 +527,20 @@
+    memcpy(tsubgraph->output_tensors, params->output_tensors->data,
+           params->output_tensors->size * sizeof(*tsubgraph->output_tensors));
+ 
++   /* Phase 5: Pre-allocate invoke buffers */
++   tsubgraph->input_buffers = malloc(tsubgraph->input_count * sizeof(void *));
++   tsubgraph->input_is_signed = malloc(tsubgraph->input_count * sizeof(bool));
++   tsubgraph->output_buffers = malloc(tsubgraph->output_count * sizeof(void *));
++   tsubgraph->output_is_signed = malloc(tsubgraph->output_count * sizeof(bool));
++
++   for (unsigned i = 0; i < tsubgraph->input_count; i++)
++      tsubgraph->input_is_signed[i] =
++         is_signed_type(tf_context->tensors[tsubgraph->input_tensors[i]].type);
++
++   for (unsigned i = 0; i < tsubgraph->output_count; i++)
++      tsubgraph->output_is_signed[i] =
++         is_signed_type(tf_context->tensors[tsubgraph->output_tensors[i]].type);
++
+    if (unlikely(debug_get_option_debug_teflon() & TEFLON_DEBUG_VERBOSE)) {
+       struct timespec time;
+       clock_gettime(CLOCK_MONOTONIC, &time);
+@@ -547,6 +574,10 @@
+    context->ml_subgraph_destroy(context, subgraph);
+    free(tsubgraph->input_tensors);
+    free(tsubgraph->output_tensors);
++   free(tsubgraph->input_buffers);
++   free(tsubgraph->input_is_signed);
++   free(tsubgraph->output_buffers);
++   free(tsubgraph->output_is_signed);
+    free(tsubgraph);
+ }
+ 
+@@ -565,35 +596,24 @@
+       start = (long)time.tv_sec * 1000 + (long)time.tv_nsec / 1000000;
+    }
+ 
+-   void **buffers = malloc(tsubgraph->input_count * sizeof(*buffers));
+-   bool *is_signed = malloc(tsubgraph->input_count * sizeof(*is_signed));
+-   for (unsigned i = 0; i < tsubgraph->input_count; i++) {
+-      TfLiteTensor tf_tensor = tf_context->tensors[tsubgraph->input_tensors[i]];
+-
+-      buffers[i] = tf_tensor.data.data;
+-      is_signed[i] = tf_tensor.type == kTfLiteInt8 ||
+-                     tf_tensor.type == kTfLiteInt16 ||
+-                     tf_tensor.type == kTfLiteInt32 ||
+-                     tf_tensor.type == kTfLiteInt64;
+-   }
+-   context->ml_subgraph_invoke(context, subgraph, tsubgraph->input_count, tsubgraph->input_tensors, buffers, is_signed);
+-   free(buffers);
+-   free(is_signed);
+-
+-   buffers = malloc(tsubgraph->output_count * sizeof(*buffers));
+-   is_signed = malloc(tsubgraph->output_count * sizeof(*is_signed));
+-   for (unsigned i = 0; i < tsubgraph->output_count; i++) {
+-      TfLiteTensor tf_tensor = tf_context->tensors[tsubgraph->output_tensors[i]];
+-
+-      buffers[i] = tf_tensor.data.data;
+-      is_signed[i] = tf_tensor.type == kTfLiteInt8 ||
+-                     tf_tensor.type == kTfLiteInt16 ||
+-                     tf_tensor.type == kTfLiteInt32 ||
+-                     tf_tensor.type == kTfLiteInt64;
+-   }
+-   context->ml_subgraph_read_output(context, subgraph, tsubgraph->output_count, tsubgraph->output_tensors, buffers, is_signed);
+-   free(buffers);
+-   free(is_signed);
++   /* Phase 5: Use pre-allocated buffers instead of malloc/free per invoke */
++   for (unsigned i = 0; i < tsubgraph->input_count; i++)
++      tsubgraph->input_buffers[i] =
++         tf_context->tensors[tsubgraph->input_tensors[i]].data.data;
++
++   context->ml_subgraph_invoke(context, subgraph, tsubgraph->input_count,
++                               tsubgraph->input_tensors,
++                               tsubgraph->input_buffers,
++                               tsubgraph->input_is_signed);
++
++   for (unsigned i = 0; i < tsubgraph->output_count; i++)
++      tsubgraph->output_buffers[i] =
++         tf_context->tensors[tsubgraph->output_tensors[i]].data.data;
++
++   context->ml_subgraph_read_output(context, subgraph, tsubgraph->output_count,
++                                    tsubgraph->output_tensors,
++                                    tsubgraph->output_buffers,
++                                    tsubgraph->output_is_signed);
+ 
+    if (unlikely(debug_get_option_debug_teflon() & TEFLON_DEBUG_VERBOSE)) {
+       struct timespec time;
