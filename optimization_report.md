@@ -36,12 +36,12 @@ Consolidate tasks per operation into single jobs, pre-allocate submit structures
 | GEM_CLOSE | 114 | 0 |
 | **Total** | **757** | **8** |
 
-### Latency (CPU governor=performance, 100 runs)
-| Model | System Mesa | Custom Mesa | CPU | Speedup |
-|-------|------------|-------------|-----|---------|
-| MobileNetV1 224 INT8 | 12.51ms | **11.12ms** | 68.0ms | 6.1x |
-| MobileNetV2 224 INT8 | - | **13.36ms** | 39.8ms | 3.0x |
-| SSD MobileNetV1 INT8 | - | **22.07ms** | 89.5ms | 4.1x |
+### Latency (CPU governor=performance, 100 runs, single NPU core)
+| Model | RKNN (1 core) | RKNN (3 cores) | Rocket (before) | Rocket (after) | Gap |
+|-------|--------------|----------------|-----------------|----------------|-----|
+| MobileNetV1 224 INT8 | 2.6ms | 1.6ms | 12.51ms | **11.12ms** | 4.3x |
+| SSD MobileNetV1 INT8 | - | - | ~23.9ms | **22.07ms** | - |
+| MobileNetV2 224 INT8 | - | - | - | **13.36ms** | - |
 
 ### Correctness
 Custom Mesa produces **bit-exact identical** output to system Mesa (max_diff=0).
