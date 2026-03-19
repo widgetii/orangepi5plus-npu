@@ -40,7 +40,7 @@
 \ No newline at end of file
 +}
 --- src/gallium/drivers/rocket/rkt_ml.c.bak	2026-03-19 19:34:27.307214604 +0300
-+++ src/gallium/drivers/rocket/rkt_ml.c	2026-03-19 19:51:02.707778092 +0300
++++ src/gallium/drivers/rocket/rkt_ml.c	2026-03-19 20:04:49.411502593 +0300
 @@ -386,6 +386,14 @@
                      calc_raw_output_size(operation));
     }
