@@ -296,10 +296,26 @@ scale (`DPU_OUT_CVT_SCALE`) to all output channels — it cannot do per-channel 
 | 1 | [-117, -117] | [-116, -24] | [-128, 109] |
 | 2 | [-121, -121] | [-120, -29] | [-128, 117] |
 
-**Remaining error** (~210 max_diff): The NPU applies one scale and then we correct
-per-channel, but each layer loses int8 precision in the process. Over 61 layers,
-the rounding error compounds. This is inherent to the software workaround — true
-per-channel requantization would require hardware support.
+**Remaining error** (~210 max_diff): The NPU applies one scale then we correct
+per-channel, but each layer loses int8 precision. Over 61 layers, rounding error
+compounds. This is inherent to the software workaround — true per-channel
+requantization would require hardware support.
+
+### Detection accuracy comparison (grace_hopper.bmp — person in formal attire)
+
+| | CPU | NPU (per-axis corrected) |
+|---|---|---|
+| Inference time | 144ms | 1195ms |
+| Raw detections | 7384 | 12234 |
+| Top detection | **person** (0.495) — correct | **hair drier** (0.533) — wrong |
+| True positives | person, tie | none |
+| Class overlap | 0 (zero matched classes between CPU and NPU) | |
+
+The per-axis correction transforms the raw tensor output from constant to varied
+values, but the compounded quantization error across 61 layers is too large for the
+detection decoder to produce meaningful results. The NPU detects entirely different
+(wrong) object classes. Usable YOLO detection on the Rocket NPU would require true
+per-channel hardware requantization support, which the NVDLA-derived CNA does not have.
 
 ### Patches required for YOLO
 

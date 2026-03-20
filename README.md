@@ -119,7 +119,7 @@ $BENCH $MODEL "" 100 7
 |-------|----------|----------------------|
 | MobileNetV1 224x224 | 68ms | **10.2ms** |
 | SSD MobileNetV1 | 89ms | **19.8ms** |
-| YOLOv5s-relu 640x640 | 142ms | **1181ms** (runs, partial per-axis correction) |
+| YOLOv5s-relu 640x640 | 142ms | **1181ms** (runs, wrong detections — per-axis HW limit) |
 | YOLOv8n 640x640 | 86ms | Not tested |
 
 ### Vendor vs Open-source (same YOLOv5s-relu model, single core)
@@ -127,15 +127,17 @@ $BENCH $MODEL "" 100 7
 | | RKNN (vendor) | Rocket (open-source) | Gap |
 |--|------|--------|-----|
 | MobileNetV1 224 | 2.6ms | 10.2ms | 3.9x |
-| YOLOv5s 640 | 16.7ms | 1181ms (per-axis correction, ~210 max_diff) | — |
+| YOLOv5s 640 | 16.7ms | 1181ms (0 correct detections — HW limit) | — |
 
 **YOLOv5s-relu end-to-end status**: The model loads and runs with patches 0004–0007.
 98 of ~100 ops are delegated across 3 partitions. All 5 SW ops work correctly. All 61
-CONV operations complete without NPU timeouts. Per-axis quantization correction (patch
-0007 + 0004) transforms the output from constant values to actual detection-like
-variation. Remaining error (~210 max_diff vs CPU) is from int8 precision loss compounding
-across 61 layers, since the NPU hardware applies a single requantization scale per
-operation and the software post-correction can only approximate the per-channel result.
+CONV operations complete without NPU timeouts. Per-axis quantization correction (patches
+0004+0007) transforms raw output from constant to varied values, but the compounded int8
+precision loss across 61 layers makes detection output unusable — zero class overlap with
+CPU (NPU detects "hair drier" instead of "person" on a portrait photo). This is a
+**fundamental hardware limitation**: the NVDLA-derived CNA applies a single requantization
+scale per operation, while YOLO's per-axis weights (up to 27x scale ratio) need per-channel
+scaling that the hardware cannot provide.
 
 Patches: 0004 SW ops + per-axis CONV correction, 0005 INT8 regression fix, 0006 Teflon
 per-axis crash fix, 0007 bias rescaling + zero_point signedness fix.
