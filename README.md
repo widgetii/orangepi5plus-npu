@@ -127,7 +127,7 @@ $BENCH $MODEL "" 100 7
 | | RKNN (vendor) | Rocket (open-source) | Gap |
 |--|------|--------|-----|
 | MobileNetV1 224 | 2.6ms | 10.2ms | 3.9x |
-| YOLOv5s 640 | 16.7ms | 1181ms (0 correct detections — HW limit) | — |
+| YOLOv5s 640 | 16.7ms / **correct detections** | 1181ms / 0 correct detections | HW limit |
 
 **YOLOv5s-relu end-to-end status**: The model loads and runs with patches 0004–0007.
 98 of ~100 ops are delegated across 3 partitions. All 5 SW ops work correctly. All 61

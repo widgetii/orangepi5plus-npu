@@ -303,19 +303,25 @@ requantization would require hardware support.
 
 ### Detection accuracy comparison (grace_hopper.bmp — person in formal attire)
 
-| | CPU | NPU (per-axis corrected) |
-|---|---|---|
-| Inference time | 144ms | 1195ms |
-| Raw detections | 7384 | 12234 |
-| Top detection | **person** (0.495) — correct | **hair drier** (0.533) — wrong |
-| True positives | person, tie | none |
-| Class overlap | 0 (zero matched classes between CPU and NPU) | |
+| | CPU (TFLite) | RKNN vendor NPU | Rocket NPU (ours) |
+|---|---|---|---|
+| Kernel | 6.18 mainline | 6.1 vendor | 6.18 mainline |
+| Inference | 144ms | **40.6ms** (1 core) | 1195ms |
+| Top detection | **person** (0.495) | **person** (0.502) | hair drier (0.533) |
+| #2 detection | **person** (0.495) | **person** (0.501) | hair drier (0.533) |
+| #3 detection | **tie** (0.396) | **tie** (0.396) | hair drier (0.533) |
+| True positives | person, tie, bird | person, tie, bird | none |
+| Total classes | 27 | 35 | 14 |
+| Correct classes | yes | yes | no (0 overlap with CPU) |
 
-The per-axis correction transforms the raw tensor output from constant to varied
-values, but the compounded quantization error across 61 layers is too large for the
-detection decoder to produce meaningful results. The NPU detects entirely different
-(wrong) object classes. Usable YOLO detection on the Rocket NPU would require true
-per-channel hardware requantization support, which the NVDLA-derived CNA does not have.
+CPU and RKNN produce nearly identical detections — person and tie on a portrait
+photo, matching the image content. RKNN is 3.5x faster than CPU on a single NPU core.
+
+The Rocket NPU produces completely different (wrong) detections with zero class overlap.
+The per-axis correction improved raw tensor values from constant to varied, but the
+compounded int8 quantization error across 61 layers makes the detection decoder output
+unusable. Usable YOLO on the Rocket NPU would require true per-channel hardware
+requantization, which the NVDLA-derived CNA does not support.
 
 ### Patches required for YOLO
 
