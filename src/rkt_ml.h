@@ -134,6 +134,9 @@ struct rkt_operation {
    unsigned *group_channel_indices;  /* [group_count] original channel indices, or NULL */
    int32_t per_channel_bias;         /* Bias scalar for per-channel ops (embedded in reg) */
    unsigned weights_bo_offset;       /* Byte offset into shared weight BO for per-channel */
+   uint8_t *per_channel_weight_data; /* CPU copy of this channel's weight data (for invoke-time fill) */
+   unsigned per_channel_weight_size; /* Size of per_channel_weight_data in bytes */
+   struct pipe_resource *weights_alt; /* Second weight BO for ping-pong (different IOVA) */
 
    struct util_dynarray tasks; /* struct split_task */
 

@@ -318,9 +318,21 @@ build_execution_plan(struct rkt_ml_subgraph *subgraph)
          subgraph->cached_in_handles[hw_op_idx][1] =
             rkt_get_tensor(subgraph, op->add_tensor)->handle;
 
-      subgraph->cached_out_handles_arr[hw_op_idx] = malloc(sizeof(uint32_t));
-      subgraph->cached_out_handles_arr[hw_op_idx][0] =
-         rkt_get_tensor(subgraph, op->output_index)->handle;
+      /* For per-channel ops with shared weight BO (per_channel_weight_data != NULL),
+       * add the weight BO to out_bo_handles. This makes the DRM scheduler attach
+       * a write fence so the NEXT job waits for the current one to finish reading.
+       * Without this, the CPU overwrites the shared BO before the NPU finishes. */
+      if (op->per_channel_weight_data != NULL) {
+         subgraph->cached_out_handles_arr[hw_op_idx] = malloc(2 * sizeof(uint32_t));
+         subgraph->cached_out_handles_arr[hw_op_idx][0] =
+            rkt_get_tensor(subgraph, op->output_index)->handle;
+         subgraph->cached_out_handles_arr[hw_op_idx][1] =
+            rkt_resource(op->weights)->handle;
+      } else {
+         subgraph->cached_out_handles_arr[hw_op_idx] = malloc(sizeof(uint32_t));
+         subgraph->cached_out_handles_arr[hw_op_idx][0] =
+            rkt_get_tensor(subgraph, op->output_index)->handle;
+      }
 
       struct drm_rocket_job *job = &subgraph->cached_jobs[hw_op_idx];
       job->task_struct_size = sizeof(struct drm_rocket_task);
@@ -329,7 +341,7 @@ build_execution_plan(struct rkt_ml_subgraph *subgraph)
       job->in_bo_handles = (uint64_t)(uintptr_t)subgraph->cached_in_handles[hw_op_idx];
       job->in_bo_handle_count = num_inputs;
       job->out_bo_handles = (uint64_t)(uintptr_t)subgraph->cached_out_handles_arr[hw_op_idx];
-      job->out_bo_handle_count = 1;
+      job->out_bo_handle_count = op->per_channel_weight_data != NULL ? 2 : 1;
 
       hw_op_idx++;
    }
@@ -423,7 +435,7 @@ compare_scale_indices(const void *a, const void *b, void *ctx)
  *
  * After NPU writes, a CPU scatter step restores original channel order.
  */
-#define PER_AXIS_GROUP_SIZE 16 /* 1=per-channel (0 NPU timeouts, slow BO setup), 16=per-group */
+#define PER_AXIS_GROUP_SIZE 16 /* 1=per-channel (crashes: BO reuse issue), 16=per-group */
 
 static unsigned
 lower_convolution_per_group(struct rkt_ml_subgraph *subgraph,
@@ -443,6 +455,31 @@ lower_convolution_per_group(struct rkt_ml_subgraph *subgraph,
    if (gs > 1)
       qsort_r(sorted, full_oc, sizeof(unsigned), compare_scale_indices,
                (void *)wt->scales);
+
+   /* For per-channel (gs==1): create ONE shared weight BO and extract
+    * per-channel weight data to CPU buffers directly from the TFLite
+    * weight tensor — NO intermediate BOs created. During invoke, each
+    * channel's data is copied into the shared BO before its job. */
+   struct pipe_resource *shared_weight_bo = NULL;
+   uint8_t **per_ch_weight_bufs = NULL;
+   unsigned per_ch_weight_size = 0;
+   struct pipe_resource *shared_weight_bo_alt = NULL;
+   if (gs == 1) {
+      /* Create TWO shared weight BOs at different IOVAs for ping-pong.
+       * The NPU's CNA DMA engine caches data by address; using the same
+       * IOVA returns stale data. Alternating BOs forces cache misses. */
+      unsigned ch0 = 0;
+      shared_weight_bo = rkt_fill_weights_group(subgraph, poperation, &ch0, 1);
+      per_ch_weight_size = pipe_buffer_size(shared_weight_bo);
+      unsigned ch1 = MIN2(1, full_oc - 1);
+      shared_weight_bo_alt = rkt_fill_weights_group(subgraph, poperation, &ch1, 1);
+
+      /* Extract all channels' weight data to CPU memory in bulk.
+       * rkt_extract_all_channel_weights reads the TFLite weight tensor
+       * once and packs per-channel NPU-format data without creating BOs. */
+      per_ch_weight_bufs = rkt_extract_all_channel_weights(
+         subgraph, poperation, per_ch_weight_size);
+   }
 
    for (unsigned g = 0; g < num_groups; g++) {
       struct rkt_operation group_op = {0};
@@ -477,23 +514,39 @@ lower_convolution_per_group(struct rkt_ml_subgraph *subgraph,
                wt->scales[sorted[group_start + i]] / group_max;
       }
 
-      group_op.weights = rkt_fill_weights_group(subgraph, poperation,
-                                                 sorted + group_start,
-                                                 group_count);
-      if (group_count == 1) {
+      if (group_count == 1 && shared_weight_bo) {
+         /* Per-channel with ping-pong BOs: alternate between 2 IOVAs
+          * to force NPU DMA cache misses. Even channels use BO_A, odd use BO_B.
+          * The regcmd bakes BO_A's address; invoke patches odd channels to BO_B. */
+         pipe_resource_reference(&group_op.weights, shared_weight_bo);
+         pipe_resource_reference(&group_op.weights_alt, shared_weight_bo_alt);
+         group_op.per_channel_weight_data = per_ch_weight_bufs[g];
+         group_op.per_channel_weight_size = per_ch_weight_size;
          group_op.biases = NULL;
          group_op.per_channel_bias =
             rkt_compute_bias_scalar(subgraph, poperation, sorted[g]);
       } else {
-         group_op.biases = rkt_fill_biases_group(subgraph, poperation,
-                                                  sorted + group_start,
-                                                  group_count,
-                                                  &group_op.truncate_bits);
+         group_op.weights = rkt_fill_weights_group(subgraph, poperation,
+                                                    sorted + group_start,
+                                                    group_count);
+         if (group_count == 1) {
+            group_op.biases = NULL;
+            group_op.per_channel_bias =
+               rkt_compute_bias_scalar(subgraph, poperation, sorted[g]);
+         } else {
+            group_op.biases = rkt_fill_biases_group(subgraph, poperation,
+                                                     sorted + group_start,
+                                                     group_count,
+                                                     &group_op.truncate_bits);
+         }
       }
 
       util_dynarray_append(&subgraph->operations, group_op);
    }
 
+   pipe_resource_reference(&shared_weight_bo, NULL);
+   pipe_resource_reference(&shared_weight_bo_alt, NULL);
+   free(per_ch_weight_bufs); /* individual buffers freed by free_operation */
    free(sorted);
    return num_groups;
 }
@@ -1647,11 +1700,103 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
    for (unsigned s = 0; s < subgraph->exec_segment_count; s++) {
       struct rkt_exec_segment *seg = &subgraph->exec_segments[s];
       if (seg->is_hw) {
-         ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_SUBMIT, &seg->submit);
-         assert(ret == 0);
+         struct rkt_operation *ops_arr = util_dynarray_begin(&subgraph->operations);
+
+         /* Check if this segment has per-channel ops (shared weight BO) */
+         bool has_per_channel = false;
+         for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
+            if (ops_arr[j].per_channel_weight_data != NULL) {
+               has_per_channel = true;
+               break;
+            }
+         }
+
+         if (has_per_channel) {
+            /* Per-channel: submit jobs one at a time, filling the shared
+             * weight BO with each channel's data before submission. */
+            for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
+               struct rkt_operation *op = &ops_arr[j];
+
+               if (op->per_channel_weight_data != NULL) {
+                  /* Ping-pong: alternate between 2 weight BOs at different
+                   * IOVAs to defeat NPU DMA data caching. */
+                  bool use_alt = ((j - seg->first_op) & 1) && op->weights_alt;
+                  struct pipe_resource *wt_bo = use_alt ? op->weights_alt : op->weights;
+
+                  /* Fill the selected weight BO with this channel's data */
+                  struct pipe_transfer *wt_xfer;
+                  uint8_t *wt_map = pipe_buffer_map(pcontext, wt_bo,
+                                                     PIPE_MAP_WRITE, &wt_xfer);
+                  memcpy(wt_map, op->per_channel_weight_data,
+                         op->per_channel_weight_size);
+                  pipe_buffer_unmap(pcontext, wt_xfer);
+
+                  /* Flush CPU cache to RAM */
+                  struct drm_rocket_fini_bo fini = {0};
+                  fini.handle = rkt_resource(wt_bo)->handle;
+                  drmIoctl(screen->fd, DRM_IOCTL_ROCKET_FINI_BO, &fini);
+
+                  /* Patch regcmd if using alt BO (regcmd was built with primary BO addr) */
+                  if (use_alt) {
+                     struct pipe_transfer *rc_xfer;
+                     uint64_t *rc = (uint64_t *)pipe_buffer_map(pcontext,
+                        op->regcmd, PIPE_MAP_READ_WRITE, &rc_xfer);
+                     unsigned rc_count = pipe_buffer_size(op->regcmd) / sizeof(uint64_t);
+                     uint64_t alt_addr = rkt_resource(op->weights_alt)->phys_addr;
+                     uint64_t pri_addr = rkt_resource(op->weights)->phys_addr;
+                     for (unsigned r = 0; r < rc_count; r++) {
+                        if ((rc[r] & 0xFFFF) == 0x1110) { /* CNA_DCOMP_ADDR0 */
+                           rc[r] = (rc[r] & ~(0xFFFFFFFFULL << 16)) | (alt_addr << 16);
+                           break;
+                        }
+                     }
+                     pipe_buffer_unmap(pcontext, rc_xfer);
+                     /* Flush regcmd too */
+                     struct drm_rocket_fini_bo fini2 = {0};
+                     fini2.handle = rkt_resource(op->regcmd)->handle;
+                     drmIoctl(screen->fd, DRM_IOCTL_ROCKET_FINI_BO, &fini2);
+                  }
+               }
+
+               /* Submit this single job.
+                * The segment's jobs pointer is the first job in this segment.
+                * Job index within the segment = j - seg->first_op. */
+               struct drm_rocket_job *seg_jobs =
+                  (struct drm_rocket_job *)(uintptr_t)seg->submit.jobs;
+               struct drm_rocket_submit single_submit;
+               single_submit.job_struct_size = sizeof(struct drm_rocket_job);
+               single_submit.jobs =
+                  (uint64_t)(uintptr_t)&seg_jobs[j - seg->first_op];
+               single_submit.job_count = 1;
+               single_submit.reserved = 0;
+               ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_SUBMIT,
+                              &single_submit);
+               assert(ret == 0);
+
+               /* Restore regcmd to primary BO addr for next invocation */
+               if (op->per_channel_weight_data != NULL &&
+                   ((j - seg->first_op) & 1) && op->weights_alt) {
+                  struct pipe_transfer *rc_xfer;
+                  uint64_t *rc = (uint64_t *)pipe_buffer_map(pcontext,
+                     op->regcmd, PIPE_MAP_READ_WRITE, &rc_xfer);
+                  unsigned rc_count = pipe_buffer_size(op->regcmd) / sizeof(uint64_t);
+                  uint64_t pri_addr = rkt_resource(op->weights)->phys_addr;
+                  for (unsigned r = 0; r < rc_count; r++) {
+                     if ((rc[r] & 0xFFFF) == 0x1110) {
+                        rc[r] = (rc[r] & ~(0xFFFFFFFFULL << 16)) | (pri_addr << 16);
+                        break;
+                     }
+                  }
+                  pipe_buffer_unmap(pcontext, rc_xfer);
+               }
+            }
+         } else {
+            /* Standard batch submit for non-per-channel segments */
+            ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_SUBMIT, &seg->submit);
+            assert(ret == 0);
+         }
 
          /* Apply per-axis scale correction to CONV outputs that used per-axis weights */
-         struct rkt_operation *ops_arr = util_dynarray_begin(&subgraph->operations);
          for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++)
             apply_per_axis_correction(pcontext, subgraph, &ops_arr[j]);
 
@@ -1660,7 +1805,6 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
             if (ops_arr[j].output_tensor_channels == 0)
                continue;
-            /* Find the last group op for this output tensor */
             unsigned first_g = j;
             unsigned out_idx = ops_arr[j].output_index;
             while (j + 1 < seg->first_op + seg->op_count &&
@@ -1774,6 +1918,8 @@ free_operation(struct rkt_operation *operation)
 {
    free(operation->per_axis_correction);
    free(operation->group_channel_indices);
+   free(operation->per_channel_weight_data);
+   pipe_resource_reference(&operation->weights_alt, NULL);
    if (operation->type == RKT_OP_CONVOLUTION) {
       util_dynarray_fini(&operation->tasks);
       pipe_resource_reference(&operation->regcmd, NULL);
