@@ -130,10 +130,9 @@ $BENCH $MODEL "" 100 7
 | YOLOv5s 640 | 16.7ms | **Not functional** | — |
 
 YOLO models need 13+ ops beyond CONV_2D/ADD. Patch 0004 adds 5 software ops
-(CONCATENATION, MAX_POOL_2D, PAD, RESIZE_NEAREST, LOGISTIC) that run on the CPU in
-the NPU's native interleaved int8 format, eliminating format conversion at graph splits.
-End-to-end YOLO testing is currently blocked by an upstream Mesa INT8 regression (see
-Known Issues).
+(CONCATENATION, MAX_POOL_2D, PAD, RESIZE_NEAREST, LOGISTIC) that run on the CPU,
+eliminating format conversion at graph splits. All test models produce bit-exact output.
+Patch 0005 fixes an upstream INT8 regression in Mesa git HEAD.
 
 The Teflon delegate per-axis quantization assertion crash is fixed in patch 0003.
 
@@ -177,9 +176,8 @@ cat /sys/kernel/debug/tracing/trace
 
 ## Known Issues
 
-- **Upstream Mesa INT8 regression (FIXED)** — Mesa git HEAD per-task job splitting
-  (`reuse_weights_cbuf == false`) breaks INT8 models. Fixed by patch 0005 which batches
-  all tasks into one job per operation (matches 26.0.2 behavior).
+- **Upstream Mesa INT8 regression (FIXED by patch 0005)** — Mesa git HEAD per-task job
+  splitting breaks INT8 models. Fixed by batching all tasks per operation.
 
 - **Vendor DTB has UART2 disabled** — the original Armbian vendor DTB ships with
   `serial@feb50000` set to `status = "disabled"`. The DTB on this board has been

@@ -216,15 +216,17 @@ boundary, requiring NPU→NHWC→CPU→NHWC→NPU format conversions per split.
 
 ### Implementation
 
-Five CPU-side software ops that operate directly on the NPU's interleaved int8 format:
+Five CPU-side software ops. Two execution modes:
+- **Mixed HW/SW subgraphs** (CONV + SW ops): SW ops use NPU interleaved int8 format
+- **SW-only subgraphs** (no CONVs): bypass NPU format, use raw NHWC directly
 
-| Op | NPU format strategy | Notes |
-|----|---------------------|-------|
-| CONCATENATION | Append groups (memcpy for 16-aligned channels) | Handles unaligned via per-element remap |
-| MAX_POOL_2D | Compare raw int8 bytes directly | 0x80 bias is monotonic: `max(a-0x80,b-0x80) = max(a,b)-0x80` |
-| PAD | memset with `zero_point - 0x80` | Spatial-only; channel padding rejected at support check |
-| RESIZE_NEAREST | `floor(ox * in_w / out_w)` per pixel | General scale factors, not just 2x |
-| LOGISTIC | 256-entry LUT (dequant→sigmoid→requant) | Built once at `subgraph_create` |
+| Op | Strategy | Notes |
+|----|----------|-------|
+| CONCATENATION | Per-pixel channel append (NHWC) or group memcpy (NPU) | Fast path for 16-aligned |
+| MAX_POOL_2D | Sliding-window max with `padding_same` | NHWC int8 comparison for sw_only |
+| PAD | Spatial zero-padding | Quantization-aware fill value |
+| RESIZE_NEAREST | `floor(ox * in_w / out_w)` per pixel | General scale factors |
+| LOGISTIC | 256-entry LUT | `raw_lut` (int8→int8) for sw_only, `lut` (NPU) for mixed |
 
 ### Execution architecture
 
@@ -234,11 +236,23 @@ Mixed HW/SW execution via a segment-based plan built at `subgraph_create` time:
 3. `pipe_buffer_map`/`pipe_buffer_unmap` handles cache coherency (PREP_BO/FINI_BO)
 4. Pre-built job/task arrays avoid per-invoke allocation
 
+### SW-only subgraph bypass
+
+When a delegate partition contains no CONV ops (`sw_only=true`), NPU interleaved format
+is bypassed entirely:
+- **Input**: `memcpy` raw TFLite bytes (no 0x80 bias, no group interleaving)
+- **Output**: `memcpy` back (no deinterleaving)
+- **Spatial ops**: use flat NHWC addressing `data[(x*h+y)*C+c]`
+- **Rationale**: the NPU tensor format has an implicit spatial transpose (input x-major,
+  output y-major) and a 0x80 bias that inverts int8 sign ordering — both break spatial
+  neighbor access in SW ops when no NPU hardware is involved
+
 ### Validation
 
+- All 7 test models produce bit-exact output (max_diff=0): POOL_ONLY, CONCAT, MAXPOOL,
+  LOGISTIC, RESIZE, 2CONV_INT8, MobileNetV1
 - `is_quantized_feature_tensor()` rejects non-quantized/non-4D tensors (e.g., int32 shape
   constants from TFLite's UpSampling2D decomposition into RESHAPE/TILE/CONCATENATION ops)
-- MobileNetV1 and SSD MobileNetV1 remain bit-exact (max_diff=0) vs system Mesa
 
 ## Known issues
 
@@ -246,16 +260,6 @@ Mixed HW/SW execution via a segment-based plan built at `subgraph_create` time:
 - **NPU job timeout** can corrupt IOMMU state and cascade to kernel memory corruption. Boot with `panic=10 panic_on_oops=1`.
 - **Struct changes require clean rebuild**: `rm -rf build && meson setup ...` — stale `.o` files cause crashes.
 - **Single-job BO handles**: Intermediate tensors must not appear in both `in_bo_handles` and `out_bo_handles` of the same job, or `drm_gem_lock_reservations` returns `-EALREADY`. The upstream `rocket_ioctl_submit` silently ignores this error (fixed by our kernel patch).
-- **Upstream int8 regression (Mesa git HEAD, FIXED by patch 0005)**: The git HEAD's
-  `reuse_weights_cbuf == false` path in `rkt_ml_subgraph_invoke` splits tasks into
-  per-task jobs for multi-core spread. This breaks inter-task data dependencies within
-  operations, producing all-127 (saturated) output for INT8 models. Fix: always batch
-  all tasks into one job per operation (matches Mesa 26.0.2 behavior). UINT8 models
-  (MobileNetV1) were unaffected because they happen to have `reuse_weights_cbuf == true`
-  for all operations.
-- **MAXPOOL spatial layout mismatch in standalone subgraphs**: When MAXPOOL is the only
-  op in a delegate subgraph (common when CONVs have per-axis weights rejected), the
-  input conversion writes x-major but read_outputs reads y-major. The NPU hardware
-  implicitly transposes between input and output, which cancels out for HW ops but
-  breaks spatial-neighbor access in SW ops. CONCAT/LOGISTIC/RESIZE are unaffected
-  (pointwise or layout-agnostic). Requires NHWC-direct path for sw_only subgraphs.
+- **Upstream int8 regression (FIXED by patch 0005)**: The git HEAD's per-task job
+  splitting (`reuse_weights_cbuf == false`) breaks INT8 models. Fix: batch all tasks
+  into one job per operation (matches Mesa 26.0.2 behavior).

@@ -33,21 +33,28 @@ have inter-task data dependencies via the regcmd chain that require sequential e
 
 ### 0004: Software ML ops for YOLO (CONCAT, MAX_POOL, PAD, RESIZE, LOGISTIC)
 
-Adds 5 CPU-side software ops that execute directly on the NPU's interleaved int8 format,
-avoiding costly NPU→NHWC→CPU→NHWC→NPU format conversions at graph split points:
-- **CONCATENATION**: Channel-axis concat; fast `memcpy` path when all inputs are 16-aligned,
-  per-element path with channel remapping otherwise
-- **MAX_POOL_2D**: Sliding-window max on raw int8 bytes (0x80 bias is monotonic, so
-  `max(a,b)` on biased values is correct); `padding_same` support
-- **PAD**: Spatial zero-padding with quantization-aware fill (`zero_point - 0x80`)
-- **RESIZE_NEAREST_NEIGHBOR**: Nearest-neighbor upscale with general scale factors
-  (`floor(ox * in / out)`)
-- **LOGISTIC**: Sigmoid via 256-entry LUT built at `subgraph_create` from input/output
-  quantization parameters
-- **Execution architecture**: Mixed HW/SW segment-based execution — consecutive CONV ops
-  batched into one `DRM_IOCTL_ROCKET_SUBMIT`, each SW op runs on CPU between batches
+Adds 5 CPU-side software ops that reduce graph splits for YOLO models. All 7 test
+models produce bit-exact output (max_diff=0) vs CPU baseline.
+
+Two execution modes based on subgraph composition:
+- **Mixed HW/SW** (CONV + SW ops together): SW ops use NPU interleaved int8 format
+  (`NPU_OFFSET` addressing, 0x80 bias) to match NPU hardware input/output
+- **SW-only** (no CONVs in subgraph): bypass NPU format entirely — raw NHWC flat copy
+  in/out, standard NHWC addressing in SW ops. Avoids NPU x-major/y-major layout
+  mismatch and 0x80 bias sign inversion that would break spatial ops like MAX_POOL_2D
+
+Ops:
+- **CONCATENATION**: Channel-axis concat; fast `memcpy` for 16-aligned, per-element remap otherwise
+- **MAX_POOL_2D**: Sliding-window max with `padding_same`; NHWC path for sw_only, NPU path for mixed
+- **PAD**: Spatial zero-padding; NHWC or NPU format depending on subgraph type
+- **RESIZE_NEAREST_NEIGHBOR**: Nearest-neighbor upscale (`floor(ox * in / out)`)
+- **LOGISTIC**: 256-entry LUT; `raw_lut` (int8→int8) for sw_only, `lut` (NPU byte→NPU byte) for mixed
+
+Other features:
+- **Execution architecture**: Segment-based plan — consecutive CONV ops batched into one
+  `DRM_IOCTL_ROCKET_SUBMIT`, each SW op runs on CPU between batches
 - **Validation**: `is_quantized_feature_tensor()` rejects non-quantized/non-4D tensors
-  (prevents crash from TFLite's UpSampling2D decomposition into int32 RESHAPE/TILE ops)
+- **Multi-input fix**: CONCAT input conversion writes to `input_idxs[i]`, not first tensor
 - Files: `rkt_ml.h`, `rkt_ml.c`
 
 ### 0003: BO pool, cache sync, output reorder, NEON input, cached submit
@@ -103,10 +110,11 @@ porting to a different Mesa or kernel version:
 
 **Mesa (0004 patch):**
 - `enum rkt_op_type` in `rkt_ml.h` — new op type enum
-- `struct rkt_operation` in `rkt_ml.h` — new `type` field + `sw` union for op params
+- `struct rkt_operation` in `rkt_ml.h` — new `type` field + `sw` union (incl. `raw_lut`)
 - `struct rkt_exec_segment` in `rkt_ml.h` — segment-based execution plan
-- `struct rkt_ml_subgraph` in `rkt_ml.h` — execution segments replace cached submit
+- `struct rkt_ml_subgraph` in `rkt_ml.h` — execution segments, `sw_only` flag
 - `rkt_ml.c` — lowering/execution for 5 new ops, `build_execution_plan`,
+  sw_only NHWC bypass in input/output conversion and spatial ops,
   `is_quantized_feature_tensor` validation, segment-based invoke loop
 
 **Kernel:**
