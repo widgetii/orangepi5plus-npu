@@ -266,12 +266,31 @@ With patches 0004+0005+0006 applied (Mesa 26.1.0-devel, debugoptimized build):
 | SW ops executed | CONCAT(13), MAX_POOL_2D(6), PAD(6), RESIZE_NN(2), LOGISTIC(3) |
 | Inference time | 1120ms (vs 143ms CPU-only, vs 16.7ms RKNN single-core) |
 | Output correctness | **Incorrect** — constant values per head |
-| NPU timeouts | 2 (dmesg: "NPU job timed out") |
+| NPU timeouts | 0 (individual CONVs all succeed) |
 
-The incorrect output is caused by NPU job timeouts on 2 CONV operations. The timed-out
-jobs leave output tensors unwritten, and the error propagates through subsequent ops.
-All SW ops execute correctly — the problem is entirely in the HW CONV execution path
-(`rkt_task.c` / `rkt_regcmd.c` register programming for specific CONV configurations).
+### Root cause: per-axis quantization not supported
+
+All 61 CONV operations complete without error (verified by submitting each one
+individually with `ROCKET_DEBUG=dbg_msgs`). The incorrect output is caused by
+**per-axis quantization being silently treated as per-tensor**.
+
+YOLO weight tensors have per-axis quantization: `scale->size = N` (one per output
+channel) but `zero_point->size = 1`. The Teflon fix (patch 0006) prevents crashing
+by skipping per-axis scale storage when sizes mismatch, which causes the Rocket driver
+to accept the CONV using only the first channel's scale for all channels.
+
+The per-axis scale ratios in YOLO weights are significant — up to 27x between channels
+in some layers. Using a single scale for all channels causes massive quantization errors
+in `rkt_fill_biases()` (which precomputes `bias * input_scale * weight_scale`), producing
+overflow/saturation that propagates through 61 layers to produce constant output.
+
+This is a fundamental limitation of the Rocket driver's convolution implementation.
+Fixing it requires per-axis support in:
+- `rkt_coefs.c`: compute per-channel biases with per-channel scales
+- `rkt_regcmd.c`: program per-channel accumulator truncation (if HW supports it)
+
+All SW ops (CONCAT, MAX_POOL_2D, PAD, RESIZE, LOGISTIC) execute correctly. The
+correctness problem is entirely in the HW CONV quantization path.
 
 Patches required for YOLO:
 - **0006**: Removes per-axis quantization assertion in `tfl_device.c` (YOLO weight tensors

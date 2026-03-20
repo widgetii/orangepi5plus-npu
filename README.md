@@ -131,10 +131,11 @@ $BENCH $MODEL "" 100 7
 
 **YOLOv5s-relu end-to-end status**: The model loads and runs with patches 0004+0005+0006.
 98 of ~100 ops are delegated across 3 partitions (57+9+32 ops). All 5 SW ops (CONCAT,
-MAX_POOL_2D, PAD, RESIZE, LOGISTIC) execute correctly. However, 2 NPU job timeouts occur
-during inference on specific CONV configurations, producing incorrect (constant) output.
-This is a pre-existing Rocket kernel driver limitation — the register programming in
-`rkt_task.c`/`rkt_regcmd.c` doesn't handle certain CONV configurations that YOLO uses.
+MAX_POOL_2D, PAD, RESIZE, LOGISTIC) execute correctly. All 61 CONV operations complete
+without NPU timeouts. However, the output is incorrect (constant values per head) because
+the Rocket driver lacks **per-axis quantization** support — YOLO weights have per-channel
+scales (up to 27x variation) but the driver uses only the first channel's scale, causing
+bias overflow that propagates through all layers.
 
 Patches: 0004 adds SW ops, 0005 fixes INT8 regression, 0006 fixes Teflon per-axis
 quantization assertion crash that prevented YOLO from loading.

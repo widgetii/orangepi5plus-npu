@@ -29,7 +29,9 @@ Removes `assert(quant->scale->size == quant->zero_point->size)` in `fill_tensor(
 that crashes on YOLO models (per-axis weights have N scales but 1 zero_point). Adds
 `scale->size == zero_point->size` to the per-axis storage condition so mismatched
 per-axis tensors are treated as per-tensor (using the first scale/zero_point value).
-This allows the Rocket driver to accept per-axis convolutions without graph fragmentation.
+This allows the Rocket driver to accept per-axis convolutions without graph fragmentation,
+but the CONVs produce incorrect results because per-axis scales are not applied per-channel
+(the driver uses only the first scale — see optimization_report.md for details).
 - Files: `tfl_device.c` (2 lines changed)
 
 ### 0005: Fix INT8 regression — batch tasks per operation
