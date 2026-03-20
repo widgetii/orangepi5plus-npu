@@ -1,0 +1,17 @@
+diff --git a/src/gallium/drivers/rocket/rkt_coefs.c b/src/gallium/drivers/rocket/rkt_coefs.c
+index 0739928..bb3f461 100644
+--- a/src/gallium/drivers/rocket/rkt_coefs.c
++++ b/src/gallium/drivers/rocket/rkt_coefs.c
+@@ -101,10 +101,10 @@ calculate_bias_correction(struct rkt_ml_subgraph *subgraph,
+                           unsigned oc, void *map)
+ {
+    unsigned input_channels = poperation->input_tensors[0]->dims[3];
+-   unsigned input_zero_point = poperation->input_tensors[0]->zero_point;
++   int input_zero_point = (uint8_t)poperation->input_tensors[0]->zero_point;
+    unsigned weights_width = poperation->conv.weight_tensor->dims[1];
+    unsigned weights_height = poperation->conv.weight_tensor->dims[2];
+-   unsigned weight_zero_point = poperation->conv.weight_tensor->zero_point;
++   int weight_zero_point = (uint8_t)poperation->conv.weight_tensor->zero_point;
+    uint8_t(*weights)[weights_width][weights_height][input_channels] = map;
+ 
+    int32_t correction = 0;
