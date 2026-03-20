@@ -95,15 +95,18 @@ rkt_is_depthwise(const struct pipe_ml_operation *poperation)
 static unsigned
 calc_raw_output_size(struct rkt_operation *operation)
 {
-   /* For per-group ops, use the full channel count for tensor sizing */
-   unsigned oc = operation->output_tensor_channels > 0
-      ? operation->output_tensor_channels : operation->output_channels;
+   if (operation->output_tensor_channels > 0) {
+      /* Per-channel op: each channel uses 2 HW groups (32 ch due to alignment).
+       * Need space for all per-channel results in sparse 2x layout. */
+      unsigned full_oc = operation->output_tensor_channels;
+      unsigned num_ops = DIV_ROUND_UP(full_oc, operation->output_channels);
+      return operation->output_width * operation->output_height *
+             num_ops * 2 * FEATURE_ATOMIC_SIZE;
+   }
    unsigned output_channels_1 =
-      DIV_ROUND_UP(oc, FEATURE_ATOMIC_SIZE) * 2;
-   unsigned output_channels_2 = FEATURE_ATOMIC_SIZE;
-
+      DIV_ROUND_UP(operation->output_channels, FEATURE_ATOMIC_SIZE) * 2;
    return operation->output_width * operation->output_height *
-          output_channels_1 * output_channels_2;
+          output_channels_1 * FEATURE_ATOMIC_SIZE;
 }
 
 static unsigned
@@ -409,54 +412,56 @@ compare_scale_indices(const void *a, const void *b, void *ctx)
 /*
  * Lower a per-axis CONV into per-group operations with scale-sorted grouping.
  *
- * Channels are sorted by weight_scale so each group of 16 contains channels
- * with similar scales (minimal within-group ratio). This avoids the catastrophic
- * int8 clipping that occurs when channels with 27x different scales share a
- * group. After NPU CONV + compaction, an un-sort scatter step restores the
- * original channel order.
+ * Channels are sorted by weight_scale, then grouped into chunks of GROUP_SIZE.
+ * Each group gets the max(weight_scale) within its channels for OUT_CVT, with
+ * optional per_axis_correction for any within-group ratio.
  *
- * This mirrors the RKNN vendor driver approach (per-channel task decomposition)
- * but uses sorted groups of 16 for efficiency.
+ * GROUP_SIZE=1 gives true per-channel processing (RKNN-style, most accurate
+ * but slowest). GROUP_SIZE=16 matches FEATURE_ATOMIC_SIZE (fastest but allows
+ * some within-group ratio). The sorted grouping ensures adjacent channels in
+ * each group have similar scales regardless of GROUP_SIZE.
+ *
+ * After NPU writes, a CPU scatter step restores original channel order.
  */
+#define PER_AXIS_GROUP_SIZE 1 /* 1=per-channel, 16=per-group */
+
 static unsigned
 lower_convolution_per_group(struct rkt_ml_subgraph *subgraph,
                             const struct pipe_ml_operation *poperation)
 {
    struct pipe_tensor *wt = poperation->conv.weight_tensor;
    unsigned full_oc = poperation->output_tensors[0]->dims[3];
-   unsigned num_groups = DIV_ROUND_UP(full_oc, FEATURE_ATOMIC_SIZE);
+   unsigned gs = PER_AXIS_GROUP_SIZE;
+   unsigned num_groups = DIV_ROUND_UP(full_oc, gs);
    unsigned ow = poperation->output_tensors[0]->dims[1];
    unsigned oh = poperation->output_tensors[0]->dims[2];
 
-   /* Sort channel indices by weight_scale */
+   /* Sort channel indices by weight_scale for minimal within-group ratio */
    unsigned *sorted = malloc(full_oc * sizeof(unsigned));
    for (unsigned i = 0; i < full_oc; i++)
       sorted[i] = i;
-   qsort_r(sorted, full_oc, sizeof(unsigned), compare_scale_indices,
-            (void *)wt->scales);
+   if (gs > 1)
+      qsort_r(sorted, full_oc, sizeof(unsigned), compare_scale_indices,
+               (void *)wt->scales);
 
    for (unsigned g = 0; g < num_groups; g++) {
       struct rkt_operation group_op = {0};
       group_op.add_tensor = -1;
       fill_conv_common(&group_op, poperation);
 
-      unsigned group_start = g * FEATURE_ATOMIC_SIZE;
-      unsigned group_count = MIN2(FEATURE_ATOMIC_SIZE, full_oc - group_start);
+      unsigned group_start = g * gs;
+      unsigned group_count = MIN2(gs, full_oc - group_start);
 
       group_op.output_channels = group_count;
       group_op.output_tensor_channels = full_oc;
-      /* Each per-group op writes 32 channels (16 real + 16 padding due to
-       * the hardware minimum alignment). So hardware groups are spaced 2x
-       * apart: group g occupies hardware groups 2g and 2g+1. */
       group_op.per_channel_group_offset =
          g * 2 * oh * ow * FEATURE_ATOMIC_SIZE;
 
-      /* Store the original channel indices for this group (for un-sort) */
       group_op.group_channel_indices = malloc(group_count * sizeof(unsigned));
       for (unsigned i = 0; i < group_count; i++)
          group_op.group_channel_indices[i] = sorted[group_start + i];
 
-      /* Max scale within this sorted group — ratio is now minimal */
+      /* Max scale within this group */
       float group_max = wt->scales[sorted[group_start]];
       for (unsigned i = 1; i < group_count; i++) {
          float s = wt->scales[sorted[group_start + i]];
@@ -464,11 +469,13 @@ lower_convolution_per_group(struct rkt_ml_subgraph *subgraph,
       }
       group_op.weights_scale = group_max;
 
-      /* Within-group correction factors (very close to 1.0 after sorting) */
-      group_op.per_axis_correction = calloc(group_count, sizeof(float));
-      for (unsigned i = 0; i < group_count; i++)
-         group_op.per_axis_correction[i] =
-            wt->scales[sorted[group_start + i]] / group_max;
+      /* Within-group correction (NULL if group_count==1 → exact scale) */
+      if (group_count > 1) {
+         group_op.per_axis_correction = calloc(group_count, sizeof(float));
+         for (unsigned i = 0; i < group_count; i++)
+            group_op.per_axis_correction[i] =
+               wt->scales[sorted[group_start + i]] / group_max;
+      }
 
       group_op.weights = rkt_fill_weights_group(subgraph, poperation,
                                                  sorted + group_start,
@@ -1128,35 +1135,36 @@ compact_and_unsort_per_group_output(struct pipe_context *pcontext,
                                    PIPE_MAP_READ_WRITE, &transfer);
 
    /* Step 1: Compact — move from 2x-spaced to contiguous.
-    * Source at 2*g*group_plane, dest at g*group_plane. Forward safe. */
-   for (unsigned g = 1; g < num_groups; g++)
+    * Source at 2*g*group_plane, dest at g*group_plane. Forward safe.
+    * num_group_ops = number of operations (1 per channel or per group). */
+   for (unsigned g = 1; g < num_group_ops; g++)
       memmove(data + g * group_plane, data + 2 * g * group_plane, group_plane);
 
    /* Step 2: Un-sort — scatter channels from sorted to original order.
-    * Build a temporary copy of the sorted data, then scatter. */
-   unsigned sorted_size = num_groups * group_plane;
-   uint8_t *sorted_copy = malloc(sorted_size);
-   memcpy(sorted_copy, data, sorted_size);
+    * After compact, each operation's data occupies one contiguous group
+    * (group index = operation index within this tensor). */
+   unsigned compacted_size = num_group_ops * group_plane;
+   uint8_t *sorted_copy = malloc(compacted_size);
+   memcpy(sorted_copy, data, compacted_size);
 
-   /* For each sorted channel, copy its data to the original channel position */
-   unsigned sorted_ch = 0;
+   /* Clear destination so padding channels are zero */
+   memset(data, 0, num_groups * group_plane);
+
    for (unsigned gop = 0; gop < num_group_ops; gop++) {
       struct rkt_operation *op = &ops_arr[first_group_op + gop];
       unsigned gc = op->output_channels;
 
       for (unsigned c = 0; c < gc; c++) {
          unsigned orig_ch = op->group_channel_indices[c];
-         unsigned src_g = sorted_ch / FEATURE_ATOMIC_SIZE;
-         unsigned src_c = sorted_ch % FEATURE_ATOMIC_SIZE;
+         unsigned src_g = gop;  /* each op is one compacted group */
+         unsigned src_c = c;    /* sub-channel within the group */
          unsigned dst_g = orig_ch / FEATURE_ATOMIC_SIZE;
          unsigned dst_c = orig_ch % FEATURE_ATOMIC_SIZE;
 
-         /* Copy this channel's data across all spatial positions */
          for (unsigned p = 0; p < pixel_count; p++) {
             data[dst_g * group_plane + p * FEATURE_ATOMIC_SIZE + dst_c] =
                sorted_copy[src_g * group_plane + p * FEATURE_ATOMIC_SIZE + src_c];
          }
-         sorted_ch++;
       }
    }
 
