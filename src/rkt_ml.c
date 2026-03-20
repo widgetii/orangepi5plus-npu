@@ -423,7 +423,7 @@ compare_scale_indices(const void *a, const void *b, void *ctx)
  *
  * After NPU writes, a CPU scatter step restores original channel order.
  */
-#define PER_AXIS_GROUP_SIZE 16 /* 1=per-channel (timeout-prone), 16=per-group */
+#define PER_AXIS_GROUP_SIZE 16 /* 1=per-channel (needs kernel fixes), 16=per-group */
 
 static unsigned
 lower_convolution_per_group(struct rkt_ml_subgraph *subgraph,
@@ -480,10 +480,19 @@ lower_convolution_per_group(struct rkt_ml_subgraph *subgraph,
       group_op.weights = rkt_fill_weights_group(subgraph, poperation,
                                                  sorted + group_start,
                                                  group_count);
-      group_op.biases = rkt_fill_biases_group(subgraph, poperation,
-                                               sorted + group_start,
-                                               group_count,
-                                               &group_op.truncate_bits);
+      if (group_count == 1) {
+         /* Per-channel: compute bias as scalar (embedded in register).
+          * No bias BO needed — RKNN uses BS_ALU_CFG register for this. */
+         group_op.biases = NULL;
+         group_op.per_channel_bias =
+            rkt_compute_bias_scalar(subgraph, poperation,
+                                    sorted[group_start]);
+      } else {
+         group_op.biases = rkt_fill_biases_group(subgraph, poperation,
+                                                  sorted + group_start,
+                                                  group_count,
+                                                  &group_op.truncate_bits);
+      }
 
       util_dynarray_append(&subgraph->operations, group_op);
    }

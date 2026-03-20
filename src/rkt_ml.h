@@ -132,6 +132,7 @@ struct rkt_operation {
    unsigned output_tensor_channels; /* Full OC for output tensor sizing, 0=normal */
    unsigned per_channel_group_offset; /* Byte offset added to DST_BASE_ADDR */
    unsigned *group_channel_indices;  /* [group_count] original channel indices, or NULL */
+   int32_t per_channel_bias;         /* Bias scalar for per-channel ops (embedded in reg) */
 
    struct util_dynarray tasks; /* struct split_task */
 
