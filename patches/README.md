@@ -12,27 +12,36 @@ delegate crash (per-axis quantization assertion) that prevented loading YOLO mod
 
 ## Mesa patches
 
-Apply 0006+0005 first (fix YOLO crash + INT8 regression), then 0004 for SW ops, and
-optionally 0003 for performance:
+Apply in order: 0007+0006+0005 for YOLO CONV correctness, 0004 for SW ops, optionally
+0003 for performance:
 
 ```sh
 cd mesa
+git apply 0007-rkt-coefs-fix-int8-zero-point-signedness.patch
 git apply 0006-teflon-fix-per-axis-quant-assertion-for-yolo.patch
 git apply 0005-rocket-fix-int8-regression-batch-tasks-per-operation.patch
 git apply 0004-rocket-add-sw-ops-concat-maxpool-pad-resize-logistic.patch
 git apply 0003-rocket-bo-pool-cache-sync-output-reorder-neon-input-cached-submit.patch  # optional perf
 ```
 
-### 0006: Fix Teflon per-axis quantization assertion for YOLO
+### 0007: Per-axis bias rescaling + int8 zero_point signedness fix
 
-Removes `assert(quant->scale->size == quant->zero_point->size)` in `fill_tensor()`
-that crashes on YOLO models (per-axis weights have N scales but 1 zero_point). Adds
-`scale->size == zero_point->size` to the per-axis storage condition so mismatched
-per-axis tensors are treated as per-tensor (using the first scale/zero_point value).
-This allows the Rocket driver to accept per-axis convolutions without graph fragmentation,
-but the CONVs produce incorrect results because per-axis scales are not applied per-channel
-(the driver uses only the first scale — see optimization_report.md for details).
-- Files: `tfl_device.c` (2 lines changed)
+Two fixes in `rkt_coefs.c` for per-axis quantized CONV correctness:
+- **Bias rescaling**: Use `max(weight_scale[])` as the NPU's single scale. Rescale each
+  TFLite per-channel bias: `bias_npu[oc] = bias_tflite[oc] * weight_scale[oc] / max_scale`.
+  Using the max prevents int8 saturation on channels with large scales.
+- **Signedness fix**: Cast `input_zero_point` and `weight_zero_point` to `(uint8_t)` before
+  arithmetic. The original `unsigned` type wraps int8 `zp=-128` to 4B+, corrupting
+  the bias correction for all INT8 models.
+- Files: `rkt_coefs.c`
+
+### 0006: Teflon per-axis scale storage for YOLO
+
+Removes `assert(quant->scale->size == quant->zero_point->size)` crash, and stores
+per-axis `tensor->scales` even when `scale->size != zero_point->size` (YOLO has N
+scales but 1 zero_point). This makes per-channel weight scales available to the driver
+for the post-CONV correction in patch 0004.
+- Files: `tfl_device.c`
 
 ### 0005: Fix INT8 regression — batch tasks per operation
 
@@ -63,6 +72,9 @@ Ops:
 - **LOGISTIC**: 256-entry LUT; `raw_lut` (int8→int8) for sw_only, `lut` (NPU byte→NPU byte) for mixed
 
 Other features:
+- **Per-axis CONV correction**: After each NPU CONV with per-axis weights, apply per-channel
+  scale correction `correct[oc] = round((npu[oc]-ozp) * weight_scale[oc]/max_scale) + ozp`.
+  Precomputed correction factors in `rkt_operation.per_axis_correction`.
 - **Execution architecture**: Segment-based plan — consecutive CONV ops batched into one
   `DRM_IOCTL_ROCKET_SUBMIT`, each SW op runs on CPU between batches
 - **Validation**: `is_quantized_feature_tensor()` rejects non-quantized/non-4D tensors
@@ -122,12 +134,18 @@ porting to a different Mesa or kernel version:
 
 **Mesa (0004 patch):**
 - `enum rkt_op_type` in `rkt_ml.h` — new op type enum
-- `struct rkt_operation` in `rkt_ml.h` — new `type` field + `sw` union (incl. `raw_lut`)
+- `struct rkt_operation` in `rkt_ml.h` — new `type` field + `sw` union (incl. `raw_lut`),
+  `per_axis_correction` float array for per-channel post-CONV scaling
 - `struct rkt_exec_segment` in `rkt_ml.h` — segment-based execution plan
 - `struct rkt_ml_subgraph` in `rkt_ml.h` — execution segments, `sw_only` flag
 - `rkt_ml.c` — lowering/execution for 5 new ops, `build_execution_plan`,
+  `apply_per_axis_correction` post-CONV per-channel rescaling,
   sw_only NHWC bypass in input/output conversion and spatial ops,
   `is_quantized_feature_tensor` validation, segment-based invoke loop
+
+**Mesa (0007 patch):**
+- `rkt_coefs.c` — `calculate_bias_correction` uses `(uint8_t)` cast for int8 zero_point;
+  `rkt_fill_biases` rescales per-channel biases to `max(weight_scale)`
 
 **Kernel:**
 - `struct rocket_core` in `rocket_core.h` — new field: `attached_domain`

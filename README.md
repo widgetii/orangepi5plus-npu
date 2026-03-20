@@ -119,7 +119,7 @@ $BENCH $MODEL "" 100 7
 |-------|----------|----------------------|
 | MobileNetV1 224x224 | 68ms | **10.2ms** |
 | SSD MobileNetV1 | 89ms | **19.8ms** |
-| YOLOv5s-relu 640x640 | 142ms | **1120ms** (runs, wrong output — NPU timeouts) |
+| YOLOv5s-relu 640x640 | 142ms | **1181ms** (runs, partial per-axis correction) |
 | YOLOv8n 640x640 | 86ms | Not tested |
 
 ### Vendor vs Open-source (same YOLOv5s-relu model, single core)
@@ -127,18 +127,18 @@ $BENCH $MODEL "" 100 7
 | | RKNN (vendor) | Rocket (open-source) | Gap |
 |--|------|--------|-----|
 | MobileNetV1 224 | 2.6ms | 10.2ms | 3.9x |
-| YOLOv5s 640 | 16.7ms | 1120ms (output incorrect) | — |
+| YOLOv5s 640 | 16.7ms | 1181ms (per-axis correction, ~210 max_diff) | — |
 
-**YOLOv5s-relu end-to-end status**: The model loads and runs with patches 0004+0005+0006.
-98 of ~100 ops are delegated across 3 partitions (57+9+32 ops). All 5 SW ops (CONCAT,
-MAX_POOL_2D, PAD, RESIZE, LOGISTIC) execute correctly. All 61 CONV operations complete
-without NPU timeouts. However, the output is incorrect (constant values per head) because
-the Rocket driver lacks **per-axis quantization** support — YOLO weights have per-channel
-scales (up to 27x variation) but the driver uses only the first channel's scale, causing
-bias overflow that propagates through all layers.
+**YOLOv5s-relu end-to-end status**: The model loads and runs with patches 0004–0007.
+98 of ~100 ops are delegated across 3 partitions. All 5 SW ops work correctly. All 61
+CONV operations complete without NPU timeouts. Per-axis quantization correction (patch
+0007 + 0004) transforms the output from constant values to actual detection-like
+variation. Remaining error (~210 max_diff vs CPU) is from int8 precision loss compounding
+across 61 layers, since the NPU hardware applies a single requantization scale per
+operation and the software post-correction can only approximate the per-channel result.
 
-Patches: 0004 adds SW ops, 0005 fixes INT8 regression, 0006 fixes Teflon per-axis
-quantization assertion crash that prevented YOLO from loading.
+Patches: 0004 SW ops + per-axis CONV correction, 0005 INT8 regression fix, 0006 Teflon
+per-axis crash fix, 0007 bias rescaling + zero_point signedness fix.
 
 ## NPU Hardware Architecture
 

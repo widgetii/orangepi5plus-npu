@@ -256,7 +256,7 @@ is bypassed entirely:
 
 ## YOLOv5s-relu end-to-end results
 
-With patches 0004+0005+0006 applied (Mesa 26.1.0-devel, debugoptimized build):
+With patches 0004+0005+0006+0007 applied (Mesa 26.1.0-devel):
 
 | Metric | Value |
 |--------|-------|
@@ -264,41 +264,50 @@ With patches 0004+0005+0006 applied (Mesa 26.1.0-devel, debugoptimized build):
 | Delegate partitions | 3 (57 + 9 + 32 ops) |
 | Total delegated ops | 98 / ~100 |
 | SW ops executed | CONCAT(13), MAX_POOL_2D(6), PAD(6), RESIZE_NN(2), LOGISTIC(3) |
-| Inference time | 1120ms (vs 143ms CPU-only, vs 16.7ms RKNN single-core) |
-| Output correctness | **Incorrect** — constant values per head |
-| NPU timeouts | 0 (individual CONVs all succeed) |
+| Inference time | 1181ms (vs 143ms CPU-only, vs 16.7ms RKNN single-core) |
+| Output correctness | Partially correct — varied output, ~210 max_diff vs CPU |
+| NPU timeouts | 0 (all 61 CONVs succeed individually) |
 
-### Root cause: per-axis quantization not supported
-
-All 61 CONV operations complete without error (verified by submitting each one
-individually with `ROCKET_DEBUG=dbg_msgs`). The incorrect output is caused by
-**per-axis quantization being silently treated as per-tensor**.
+### Per-axis quantization: problem and workaround
 
 YOLO weight tensors have per-axis quantization: `scale->size = N` (one per output
-channel) but `zero_point->size = 1`. The Teflon fix (patch 0006) prevents crashing
-by skipping per-axis scale storage when sizes mismatch, which causes the Rocket driver
-to accept the CONV using only the first channel's scale for all channels.
+channel) but `zero_point->size = 1`. The NPU hardware applies a single requantization
+scale (`DPU_OUT_CVT_SCALE`) to all output channels — it cannot do per-channel scaling.
 
-The per-axis scale ratios in YOLO weights are significant — up to 27x between channels
-in some layers. Using a single scale for all channels causes massive quantization errors
-in `rkt_fill_biases()` (which precomputes `bias * input_scale * weight_scale`), producing
-overflow/saturation that propagates through 61 layers to produce constant output.
+**Three-part workaround (patches 0004+0006+0007):**
 
-This is a fundamental limitation of the Rocket driver's convolution implementation.
-Fixing it requires per-axis support in:
-- `rkt_coefs.c`: compute per-channel biases with per-channel scales
-- `rkt_regcmd.c`: program per-channel accumulator truncation (if HW supports it)
+1. **Teflon (0006)**: Store per-axis `tensor->scales` even when `scale->size !=
+   zero_point->size`. Accept per-axis CONVs (input/output must still be per-tensor).
 
-All SW ops (CONCAT, MAX_POOL_2D, PAD, RESIZE, LOGISTIC) execute correctly. The
-correctness problem is entirely in the HW CONV quantization path.
+2. **Bias rescaling (0007)**: Use `max(weight_scale[])` as the NPU's single scale.
+   Rescale each per-channel TFLite bias: `bias_npu[oc] = tflite_bias[oc] *
+   weight_scale[oc] / max_scale`. Using the max prevents saturation on large-scale
+   channels. Also fixes `unsigned` zero_point signedness bug in `rkt_coefs.c`.
 
-Patches required for YOLO:
-- **0006**: Removes per-axis quantization assertion in `tfl_device.c` (YOLO weight tensors
-  have `scale->size != zero_point->size`). Without this, the delegate crashes on load.
-- **0005**: Fixes INT8 regression (per-task job splitting). Without this, all INT8 CONVs
-  produce wrong output.
-- **0004**: Adds SW ops. Without this, the graph splits at every non-CONV op, requiring
-  costly format conversions at each boundary.
+3. **Post-CONV correction (0004)**: After each NPU CONV, apply per-channel correction:
+   `correct[oc] = round((npu[oc] - ozp) * weight_scale[oc] / max_scale) + ozp`.
+   Precomputed correction factors stored in `rkt_operation.per_axis_correction`.
+
+**Results:**
+
+| Head | Before (constant) | After (corrected) | CPU reference |
+|------|-------------------|-------------------|---------------|
+| 0 | [-125, -125] | [-124, -65] | [-128, 99] |
+| 1 | [-117, -117] | [-116, -24] | [-128, 109] |
+| 2 | [-121, -121] | [-120, -29] | [-128, 117] |
+
+**Remaining error** (~210 max_diff): The NPU applies one scale and then we correct
+per-channel, but each layer loses int8 precision in the process. Over 61 layers,
+the rounding error compounds. This is inherent to the software workaround — true
+per-channel requantization would require hardware support.
+
+### Patches required for YOLO
+
+- **0007**: Per-axis bias rescaling + zero_point signedness fix in `rkt_coefs.c`.
+  Uses max weight scale, rescales per-channel biases, fixes unsigned int8 zp bug.
+- **0006**: Stores per-axis scales in Teflon `fill_tensor()`, removes assertion crash.
+- **0005**: Fixes INT8 regression (per-task job splitting).
+- **0004**: SW ops + per-axis post-CONV correction.
 
 ## Known issues
 
