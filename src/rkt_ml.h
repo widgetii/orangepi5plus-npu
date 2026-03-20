@@ -143,7 +143,8 @@ struct rkt_operation {
          unsigned pad_after_h;
       } pad;
       struct {
-         uint8_t lut[256];
+         uint8_t lut[256];     /* NPU byte → NPU byte (for mixed HW/SW) */
+         uint8_t raw_lut[256]; /* raw int8 byte → raw int8 byte (for sw_only) */
       } logistic;
    } sw;
 };
@@ -173,6 +174,7 @@ struct rkt_ml_subgraph {
    unsigned cached_job_count;
    unsigned cached_task_count;
    unsigned graph_input_index;
+   bool sw_only; /* No HW ops — use flat NHWC instead of NPU interleaved */
 };
 
 bool

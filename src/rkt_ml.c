@@ -22,9 +22,11 @@
 #include <arm_neon.h>
 #endif
 
-/* NPU tensor memory offset for interleaved format:
- * Layout: [group][width][height][FEATURE_ATOMIC_SIZE]
- * where width = dims[1], height = dims[2], group = channel/16
+/* NPU tensor interleaved format offset (x-major, matching input conversion).
+ * w = dims[1], h = dims[2], x ranges over w, y ranges over h.
+ * Note: NPU HW output is y-major; read_outputs handles this. SW ops use
+ * x-major for NPU-format tensors. For sw_only subgraphs, flat NHWC is used
+ * instead (no interleaving, no NPU_OFFSET).
  */
 #define NPU_OFFSET(g, x, y, w, h) \
    ((g) * (w) * (h) * FEATURE_ATOMIC_SIZE + \
@@ -354,9 +356,10 @@ build_execution_plan(struct rkt_ml_subgraph *subgraph)
       }
    }
 
-   /* Save graph input index */
+   /* Save graph input index and sw_only flag */
    struct rkt_operation *first_op = util_dynarray_begin(&subgraph->operations);
    subgraph->graph_input_index = first_op->input_index;
+   subgraph->sw_only = (total_hw_ops == 0);
 }
 
 static void
@@ -539,6 +542,16 @@ lower_logistic(const struct pipe_ml_operation *poperation,
       /* Convert back to NPU format: npu = (uint8_t)tfl_int8 - 0x80 */
       operation->sw.logistic.lut[i] = (uint8_t)((int8_t)(int)out_tfl_val - 0x80);
    }
+
+   /* Build raw LUT for sw_only: raw int8 byte → raw int8 byte */
+   for (int i = 0; i < 256; i++) {
+      int tfl_val = (int)(int8_t)(uint8_t)i;
+      float real_val = (tfl_val - in_zp) * in_scale;
+      float sigmoid = 1.0f / (1.0f + expf(-real_val));
+      float out_val = sigmoid / out_scale + out_zp;
+      out_val = fmaxf(-128.0f, fminf(127.0f, roundf(out_val)));
+      operation->sw.logistic.raw_lut[i] = (uint8_t)(int8_t)(int)out_val;
+   }
 }
 
 /* ======== Software op execution ======== */
@@ -560,15 +573,39 @@ execute_concatenation(struct pipe_context *pcontext,
    uint8_t *out_data = pipe_buffer_map(pcontext, &out_res->base,
                                        PIPE_MAP_WRITE, &out_transfer);
 
-   /* Check if fast path is possible: all inputs 16-aligned and same quantization */
-   bool all_aligned = true;
-   bool all_same_quant = true;
-   for (unsigned i = 0; i < op->sw.concat.input_count; i++) {
-      if (op->sw.concat.input_channels_arr[i] % FEATURE_ATOMIC_SIZE != 0)
-         all_aligned = false;
-   }
+   if (subgraph->sw_only) {
+      /* Flat NHWC concat: for each pixel, append channels from each input */
+      unsigned num_pixels = w * h;
+      for (unsigned i = 0; i < op->sw.concat.input_count; i++) {
+         unsigned in_idx = op->sw.concat.input_indices[i];
+         unsigned in_ch = op->sw.concat.input_channels_arr[i];
 
-   if (all_aligned) {
+         struct pipe_transfer *in_transfer = NULL;
+         struct rkt_resource *in_res = rkt_get_tensor(subgraph, in_idx);
+         uint8_t *in_data = pipe_buffer_map(pcontext, &in_res->base,
+                                            PIPE_MAP_READ, &in_transfer);
+
+         /* Compute channel offset in output for this input */
+         unsigned ch_off = 0;
+         for (unsigned j = 0; j < i; j++)
+            ch_off += op->sw.concat.input_channels_arr[j];
+
+         for (unsigned p = 0; p < num_pixels; p++) {
+            memcpy(out_data + p * out_channels + ch_off,
+                   in_data + p * in_ch,
+                   in_ch);
+         }
+
+         pipe_buffer_unmap(pcontext, in_transfer);
+      }
+   } else {
+      /* NPU interleaved format paths */
+      bool all_aligned = true;
+      for (unsigned i = 0; i < op->sw.concat.input_count; i++) {
+         if (op->sw.concat.input_channels_arr[i] % FEATURE_ATOMIC_SIZE != 0)
+            all_aligned = false;
+      }
+      if (all_aligned) {
       /* Fast path: memcpy whole groups from each input */
       unsigned out_group_offset = 0;
       unsigned group_plane_size = w * h * FEATURE_ATOMIC_SIZE;
@@ -620,6 +657,7 @@ execute_concatenation(struct pipe_context *pcontext,
          pipe_buffer_unmap(pcontext, in_transfer);
          channel_offset += in_ch;
       }
+      }
    }
 
    pipe_buffer_unmap(pcontext, out_transfer);
@@ -642,13 +680,22 @@ execute_max_pool(struct pipe_context *pcontext,
    unsigned sx = op->sw.pool.stride_x;
    unsigned sy = op->sw.pool.stride_y;
 
-   /* Compute padding for padding_same */
+   /* Compute padding for padding_same.
+    * For sw_only (flat NHWC): ox=H-axis uses fh/sy, oy=W-axis uses fw/sx.
+    * For NPU format: ox uses fw/sx, oy uses fh/sy. */
    unsigned pad_w_before = 0, pad_h_before = 0;
    if (op->sw.pool.padding_same) {
-      unsigned pad_w_total = (out_w - 1) * sx + fw - in_w;
-      unsigned pad_h_total = (out_h - 1) * sy + fh - in_h;
-      pad_w_before = pad_w_total / 2;
-      pad_h_before = pad_h_total / 2;
+      if (subgraph->sw_only) {
+         unsigned pad_w_total = (out_w - 1) * sy + fh - in_w;
+         unsigned pad_h_total = (out_h - 1) * sx + fw - in_h;
+         pad_w_before = pad_w_total / 2;
+         pad_h_before = pad_h_total / 2;
+      } else {
+         unsigned pad_w_total = (out_w - 1) * sx + fw - in_w;
+         unsigned pad_h_total = (out_h - 1) * sy + fh - in_h;
+         pad_w_before = pad_w_total / 2;
+         pad_h_before = pad_h_total / 2;
+      }
    }
 
    struct pipe_transfer *in_transfer = NULL;
@@ -661,28 +708,58 @@ execute_max_pool(struct pipe_context *pcontext,
    uint8_t *out_data = pipe_buffer_map(pcontext, &out_res->base,
                                        PIPE_MAP_WRITE, &out_transfer);
 
-   for (unsigned g = 0; g < groups; g++) {
-      unsigned real_c = MIN2(FEATURE_ATOMIC_SIZE, channels - g * FEATURE_ATOMIC_SIZE);
-
+   if (subgraph->sw_only) {
+      /* Flat NHWC with raw TFLite values (no 0x80 bias).
+       * data[x * in_h * C + y * C + c] where x=dims[1]=TFLite H,
+       * y=dims[2]=TFLite W. Use fh/sy for ox-axis (TFLite H). */
       for (unsigned ox = 0; ox < out_w; ox++) {
          for (unsigned oy = 0; oy < out_h; oy++) {
-            uint8_t *dst = out_data + NPU_OFFSET(g, ox, oy, out_w, out_h);
+            uint8_t *dst = out_data + (ox * out_h + oy) * channels;
+            /* Init with minimum int8 value for max pooling */
+            memset(dst, 0x80, channels);
 
-            /* Initialize with minimum possible NPU value */
-            memset(dst, 0x80, FEATURE_ATOMIC_SIZE);
-
-            for (unsigned fx = 0; fx < fw; fx++) {
-               for (unsigned fy = 0; fy < fh; fy++) {
-                  int ix = (int)(ox * sx) - (int)pad_w_before + (int)fx;
-                  int iy = (int)(oy * sy) - (int)pad_h_before + (int)fy;
+            for (unsigned fx = 0; fx < fh; fx++) {
+               for (unsigned fy = 0; fy < fw; fy++) {
+                  int ix = (int)(ox * sy) - (int)pad_w_before + (int)fx;
+                  int iy = (int)(oy * sx) - (int)pad_h_before + (int)fy;
 
                   if (ix < 0 || ix >= (int)in_w || iy < 0 || iy >= (int)in_h)
                      continue;
 
-                  uint8_t *src = in_data + NPU_OFFSET(g, ix, iy, in_w, in_h);
-                  for (unsigned c = 0; c < real_c; c++) {
+                  uint8_t *src = in_data + (ix * in_h + iy) * channels;
+                  for (unsigned c = 0; c < channels; c++) {
+                     /* Raw int8 comparison — no bias inversion */
                      if ((int8_t)src[c] > (int8_t)dst[c])
                         dst[c] = src[c];
+                  }
+               }
+            }
+         }
+      }
+   } else {
+      /* NPU interleaved format (for mixed HW/SW subgraphs) */
+      for (unsigned g = 0; g < groups; g++) {
+         unsigned real_c = MIN2(FEATURE_ATOMIC_SIZE, channels - g * FEATURE_ATOMIC_SIZE);
+
+         for (unsigned ox = 0; ox < out_w; ox++) {
+            for (unsigned oy = 0; oy < out_h; oy++) {
+               uint8_t *dst = out_data + NPU_OFFSET(g, ox, oy, out_w, out_h);
+
+               memset(dst, 0x80, FEATURE_ATOMIC_SIZE);
+
+               for (unsigned fx = 0; fx < fw; fx++) {
+                  for (unsigned fy = 0; fy < fh; fy++) {
+                     int ix = (int)(ox * sx) - (int)pad_w_before + (int)fx;
+                     int iy = (int)(oy * sy) - (int)pad_h_before + (int)fy;
+
+                     if (ix < 0 || ix >= (int)in_w || iy < 0 || iy >= (int)in_h)
+                        continue;
+
+                     uint8_t *src = in_data + NPU_OFFSET(g, ix, iy, in_w, in_h);
+                     for (unsigned c = 0; c < real_c; c++) {
+                        if ((int8_t)src[c] > (int8_t)dst[c])
+                           dst[c] = src[c];
+                     }
                   }
                }
             }
@@ -722,19 +799,35 @@ execute_pad(struct pipe_context *pcontext,
    uint8_t *out_data = pipe_buffer_map(pcontext, &out_res->base,
                                        PIPE_MAP_WRITE, &out_transfer);
 
-   for (unsigned g = 0; g < groups; g++) {
+   /* Read x-major, write y-major (see execute_max_pool comment) */
+   if (subgraph->sw_only) {
+      /* Flat NHWC */
       for (unsigned ox = 0; ox < out_w; ox++) {
          for (unsigned oy = 0; oy < out_h; oy++) {
             int ix = (int)ox - (int)pb_w;
             int iy = (int)oy - (int)pb_h;
-
-            uint8_t *dst = out_data + NPU_OFFSET(g, ox, oy, out_w, out_h);
-
+            uint8_t *dst = out_data + (ox * out_h + oy) * channels;
             if (ix >= 0 && ix < (int)in_w && iy >= 0 && iy < (int)in_h) {
-               uint8_t *src = in_data + NPU_OFFSET(g, ix, iy, in_w, in_h);
-               memcpy(dst, src, FEATURE_ATOMIC_SIZE);
+               uint8_t *src = in_data + (ix * in_h + iy) * channels;
+               memcpy(dst, src, channels);
             } else {
-               memset(dst, pad_val, FEATURE_ATOMIC_SIZE);
+               memset(dst, pad_val, channels);
+            }
+         }
+      }
+   } else {
+      for (unsigned g = 0; g < groups; g++) {
+         for (unsigned ox = 0; ox < out_w; ox++) {
+            for (unsigned oy = 0; oy < out_h; oy++) {
+               int ix = (int)ox - (int)pb_w;
+               int iy = (int)oy - (int)pb_h;
+               uint8_t *dst = out_data + NPU_OFFSET(g, ox, oy, out_w, out_h);
+               if (ix >= 0 && ix < (int)in_w && iy >= 0 && iy < (int)in_h) {
+                  uint8_t *src = in_data + NPU_OFFSET(g, ix, iy, in_w, in_h);
+                  memcpy(dst, src, FEATURE_ATOMIC_SIZE);
+               } else {
+                  memset(dst, pad_val, FEATURE_ATOMIC_SIZE);
+               }
             }
          }
       }
@@ -766,16 +859,27 @@ execute_resize_nearest(struct pipe_context *pcontext,
    uint8_t *out_data = pipe_buffer_map(pcontext, &out_res->base,
                                        PIPE_MAP_WRITE, &out_transfer);
 
-   for (unsigned g = 0; g < groups; g++) {
+   if (subgraph->sw_only) {
+      /* Flat NHWC */
       for (unsigned ox = 0; ox < out_w; ox++) {
          for (unsigned oy = 0; oy < out_h; oy++) {
-            /* Nearest neighbor: floor(ox * in_w / out_w) */
             unsigned ix = ox * in_w / out_w;
             unsigned iy = oy * in_h / out_h;
-
-            uint8_t *src = in_data + NPU_OFFSET(g, ix, iy, in_w, in_h);
-            uint8_t *dst = out_data + NPU_OFFSET(g, ox, oy, out_w, out_h);
-            memcpy(dst, src, FEATURE_ATOMIC_SIZE);
+            uint8_t *src = in_data + (ix * in_h + iy) * channels;
+            uint8_t *dst = out_data + (ox * out_h + oy) * channels;
+            memcpy(dst, src, channels);
+         }
+      }
+   } else {
+      for (unsigned g = 0; g < groups; g++) {
+         for (unsigned ox = 0; ox < out_w; ox++) {
+            for (unsigned oy = 0; oy < out_h; oy++) {
+               unsigned ix = ox * in_w / out_w;
+               unsigned iy = oy * in_h / out_h;
+               uint8_t *src = in_data + NPU_OFFSET(g, ix, iy, in_w, in_h);
+               uint8_t *dst = out_data + NPU_OFFSET(g, ox, oy, out_w, out_h);
+               memcpy(dst, src, FEATURE_ATOMIC_SIZE);
+            }
          }
       }
    }
@@ -805,9 +909,12 @@ execute_logistic(struct pipe_context *pcontext,
    uint8_t *out_data = pipe_buffer_map(pcontext, &out_res->base,
                                        PIPE_MAP_WRITE, &out_transfer);
 
-   const uint8_t *lut = op->sw.logistic.lut;
+   const uint8_t *lut = subgraph->sw_only ?
+      op->sw.logistic.raw_lut : op->sw.logistic.lut;
+   unsigned count = subgraph->sw_only ?
+      w * h * channels : total_size;
 
-   for (unsigned i = 0; i < total_size; i++)
+   for (unsigned i = 0; i < count; i++)
       out_data[i] = lut[in_data[i]];
 
    pipe_buffer_unmap(pcontext, in_transfer);
@@ -1169,7 +1276,17 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
        * like CONCAT where each graph input maps to a different tensor) */
       struct rkt_resource *input_tensor =
          rkt_get_tensor(subgraph, input_idxs[i]);
-      if (output_channels == 1 && input_channels == 1 &&
+      if (subgraph->sw_only) {
+         /* SW-only subgraph: copy flat NHWC bytes as-is, no bias, no
+          * interleaving. SW ops work on raw TFLite values directly. */
+         struct pipe_transfer *transfer_out;
+         uint8_t *map = pipe_buffer_map(pcontext, &input_tensor->base,
+                                        PIPE_MAP_WRITE, &transfer_out);
+         unsigned total = input_channels * operation->input_width *
+                          operation->input_height;
+         memcpy(map, inputs[i], total);
+         pipe_buffer_unmap(pcontext, transfer_out);
+      } else if (output_channels == 1 && input_channels == 1 &&
           !operation->addition_input && (operation->add_tensor == -1)) {
          pipe_buffer_copy(pcontext, &input_tensor->base, input, 0, 0,
                           pipe_buffer_size(input));
@@ -1311,12 +1428,10 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
 
       uint8_t(*output_out)[ow][oc_total] = (void *)outputs[i];
 
-      /*
-       * Reordered output conversion: iterate in (g, y, x, c) order
-       * for sequential reads from NPU's interleaved format.
-       * NPU layout: [group][height][width][FEATURE_ATOMIC_SIZE]
-       */
-      if (groups == 1) {
+      if (subgraph->sw_only) {
+         /* SW-only: data is flat NHWC, no bias — just copy */
+         memcpy(outputs[i], raw_output, ow * oh * oc_total);
+      } else if (groups == 1) {
          /* Common case: output_channels <= 16 (final classification layer).
           * NPU layout is [1][oh][ow][16], output is [oh][ow][oc_total].
           */
