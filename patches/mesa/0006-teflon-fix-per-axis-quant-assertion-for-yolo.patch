@@ -1,0 +1,15 @@
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index 4a082d0..94fd5f0 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -334,8 +334,9 @@ fill_tensor(struct teflon_delegate *delegate, TfLiteContext *tf_context, struct
+       tensor->scale = quant->scale->data[0];
+       tensor->zero_point = quant->zero_point->data[0];
+ 
+-      assert(quant->scale->size == quant->zero_point->size);
++      
+       if (quant->scale->size > 1 &&
++          quant->scale->size == quant->zero_point->size &&
+           (!all_scales_equal(quant) || !all_zero_points_equal(quant))) {
+          tensor->scales = calloc(quant->scale->size, sizeof(*tensor->scales));
+          memcpy(tensor->scales, quant->scale->data, quant->scale->size * sizeof(*tensor->scales));
