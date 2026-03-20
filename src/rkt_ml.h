@@ -133,6 +133,7 @@ struct rkt_operation {
    unsigned per_channel_group_offset; /* Byte offset added to DST_BASE_ADDR */
    unsigned *group_channel_indices;  /* [group_count] original channel indices, or NULL */
    int32_t per_channel_bias;         /* Bias scalar for per-channel ops (embedded in reg) */
+   unsigned weights_bo_offset;       /* Byte offset into shared weight BO for per-channel */
 
    struct util_dynarray tasks; /* struct split_task */
 
