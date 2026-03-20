@@ -12,14 +12,24 @@ delegate crash (per-axis quantization assertion) that prevented loading YOLO mod
 
 ## Mesa patches
 
-Four generations of patches exist. Apply 0003 for performance, and 0004 for new ML op
-support. 0004 applies independently on top of stock Mesa (does not require 0003):
+Apply 0005 first (fixes upstream INT8 regression), then 0004 for SW ops, and optionally
+0003 for performance. 0004 and 0005 apply independently on stock Mesa; 0003 is standalone:
 
 ```sh
 cd mesa
-git apply 0003-rocket-bo-pool-cache-sync-output-reorder-neon-input-cached-submit.patch
+git apply 0005-rocket-fix-int8-regression-batch-tasks-per-operation.patch
 git apply 0004-rocket-add-sw-ops-concat-maxpool-pad-resize-logistic.patch
+git apply 0003-rocket-bo-pool-cache-sync-output-reorder-neon-input-cached-submit.patch  # optional perf
 ```
+
+### 0005: Fix INT8 regression — batch tasks per operation
+
+Fixes an upstream regression in Mesa git HEAD where per-task job splitting
+(`reuse_weights_cbuf == false`) produces incorrect output for INT8 quantized models.
+The per-task split distributes tasks across NPU cores, but tasks within an operation
+have inter-task data dependencies via the regcmd chain that require sequential execution.
+- **Fix**: Always batch all tasks into one job per operation (matching Mesa 26.0.2 behavior)
+- Files: `rkt_ml.c` (submit loop only, ~30 lines changed)
 
 ### 0004: Software ML ops for YOLO (CONCAT, MAX_POOL, PAD, RESIZE, LOGISTIC)
 

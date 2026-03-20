@@ -246,9 +246,16 @@ Mixed HW/SW execution via a segment-based plan built at `subgraph_create` time:
 - **NPU job timeout** can corrupt IOMMU state and cascade to kernel memory corruption. Boot with `panic=10 panic_on_oops=1`.
 - **Struct changes require clean rebuild**: `rm -rf build && meson setup ...` — stale `.o` files cause crashes.
 - **Single-job BO handles**: Intermediate tensors must not appear in both `in_bo_handles` and `out_bo_handles` of the same job, or `drm_gem_lock_reservations` returns `-EALREADY`. The upstream `rocket_ioctl_submit` silently ignores this error (fixed by our kernel patch).
-- **Upstream int8 regression (Mesa git HEAD)**: Mesa 26.1.0-devel (commit `384d128`)
-  produces all-127 (saturated) output for INT8 quantized models. System-packaged Mesa
-  26.0.2 works correctly. The regression affects all INT8 models regardless of our patches
-  (reproduces with fully reverted `git checkout`). UINT8 models (MobileNetV1, SSD) are
-  unaffected. YOLO end-to-end testing is blocked by this regression since YOLO models use
-  INT8 internal quantization.
+- **Upstream int8 regression (Mesa git HEAD, FIXED by patch 0005)**: The git HEAD's
+  `reuse_weights_cbuf == false` path in `rkt_ml_subgraph_invoke` splits tasks into
+  per-task jobs for multi-core spread. This breaks inter-task data dependencies within
+  operations, producing all-127 (saturated) output for INT8 models. Fix: always batch
+  all tasks into one job per operation (matches Mesa 26.0.2 behavior). UINT8 models
+  (MobileNetV1) were unaffected because they happen to have `reuse_weights_cbuf == true`
+  for all operations.
+- **MAXPOOL spatial layout mismatch in standalone subgraphs**: When MAXPOOL is the only
+  op in a delegate subgraph (common when CONVs have per-axis weights rejected), the
+  input conversion writes x-major but read_outputs reads y-major. The NPU hardware
+  implicitly transposes between input and output, which cancels out for HW ops but
+  breaks spatial-neighbor access in SW ops. CONCAT/LOGISTIC/RESIZE are unaffected
+  (pointwise or layout-agnostic). Requires NHWC-direct path for sw_only subgraphs.

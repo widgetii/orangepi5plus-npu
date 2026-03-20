@@ -1,0 +1,72 @@
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index 8da2a58..3035965 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -490,44 +490,30 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+       out_bo_handles[0] =
+          rkt_get_tensor(subgraph, operation->output_index)->handle;
+ 
+-      if (operation->reuse_weights_cbuf) {
+-         /* Submit all tasks to the same core, so weights can be reused */
+-         unsigned num_tasks =
+-            util_dynarray_num_elements(&operation->tasks, struct split_task);
+-         struct drm_rocket_task *tasks = calloc(num_tasks, sizeof(*tasks));
+-         unsigned task_count = 0;
+-         util_dynarray_foreach (&operation->tasks, struct split_task, task) {
+-            tasks[task_count].regcmd = task->regcfg_addr;
+-            tasks[task_count].regcmd_count = task->regcfg_amount;
+-            task_count++;
+-         }
+-         struct drm_rocket_job job = {0};
+-         job.task_struct_size = sizeof(struct drm_rocket_task);
+-         job.in_bo_handles = (uint64_t)(uintptr_t)in_bo_handles;
+-         job.in_bo_handle_count = num_inputs;
+-         job.out_bo_handles = (uint64_t)(uintptr_t)out_bo_handles;
+-         job.out_bo_handle_count = 1;
+-         job.tasks = (uint64_t)tasks;
+-         job.task_count = task_count;
+-         util_dynarray_append(&jobs, job);
+-      } else {
+-         /* Spread tasks among cores, for parallelism */
+-         util_dynarray_foreach (&operation->tasks, struct split_task, task) {
+-            struct drm_rocket_task *ktask = calloc(1, sizeof(*ktask));
+-            ktask->regcmd = task->regcfg_addr;
+-            ktask->regcmd_count = task->regcfg_amount;
+-
+-            struct drm_rocket_job job = {0};
+-            job.task_struct_size = sizeof(struct drm_rocket_task);
+-            job.in_bo_handles = (uint64_t)(uintptr_t)in_bo_handles;
+-            job.in_bo_handle_count = num_inputs;
+-            job.out_bo_handles = (uint64_t)(uintptr_t)out_bo_handles;
+-            job.out_bo_handle_count = 1;
+-            job.tasks = (uint64_t)ktask;
+-            job.task_count = 1;
+-            util_dynarray_append(&jobs, job);
+-         }
++      /* Always batch all tasks into one job per operation.
++       * Per-task splitting (one job per task for multi-core spread) produces
++       * incorrect results for INT8 models because tasks within an operation
++       * have inter-task data dependencies via the regcmd chain that require
++       * sequential execution on a single core.
++       */
++      unsigned num_tasks =
++         util_dynarray_num_elements(&operation->tasks, struct split_task);
++      struct drm_rocket_task *tasks = calloc(num_tasks, sizeof(*tasks));
++      unsigned task_count = 0;
++      util_dynarray_foreach (&operation->tasks, struct split_task, task) {
++         tasks[task_count].regcmd = task->regcfg_addr;
++         tasks[task_count].regcmd_count = task->regcfg_amount;
++         task_count++;
+       }
++      struct drm_rocket_job job = {0};
++      job.task_struct_size = sizeof(struct drm_rocket_task);
++      job.in_bo_handles = (uint64_t)(uintptr_t)in_bo_handles;
++      job.in_bo_handle_count = num_inputs;
++      job.out_bo_handles = (uint64_t)(uintptr_t)out_bo_handles;
++      job.out_bo_handle_count = 1;
++      job.tasks = (uint64_t)tasks;
++      job.task_count = task_count;
++      util_dynarray_append(&jobs, job);
+    }
+ 
+    struct drm_rocket_submit submit = {0};

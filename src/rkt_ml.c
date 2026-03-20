@@ -529,15 +529,15 @@ lower_logistic(const struct pipe_ml_operation *poperation,
    int out_zp = poperation->output_tensors[0]->zero_point;
 
    for (int i = 0; i < 256; i++) {
-      /* i is the raw NPU byte (uint8_t cast of int8_t).
-       * NPU value = TFLite_uint8 - 0x80, so TFLite_uint8 = (int8_t)i + 0x80 */
-      int tfl_uint8 = (int)(int8_t)i + 0x80;
-      float real_val = (tfl_uint8 - in_zp) * in_scale;
+      /* i is the raw NPU byte. Convert to TFLite int8 value:
+       * npu_byte = (uint8_t)tfl_int8 - 0x80, so tfl_int8 = (int8_t)(i + 0x80) */
+      int tfl_val = (int)(int8_t)((uint8_t)i + 0x80);
+      float real_val = (tfl_val - in_zp) * in_scale;
       float sigmoid = 1.0f / (1.0f + expf(-real_val));
-      float out_tfl = sigmoid / out_scale + out_zp;
-      out_tfl = fmaxf(0.0f, fminf(255.0f, roundf(out_tfl)));
-      /* Convert back to NPU format */
-      operation->sw.logistic.lut[i] = (uint8_t)((int)out_tfl - 0x80);
+      float out_tfl_val = sigmoid / out_scale + out_zp;
+      out_tfl_val = fmaxf(-128.0f, fminf(127.0f, roundf(out_tfl_val)));
+      /* Convert back to NPU format: npu = (uint8_t)tfl_int8 - 0x80 */
+      operation->sw.logistic.lut[i] = (uint8_t)((int8_t)(int)out_tfl_val - 0x80);
    }
 }
 
@@ -1164,8 +1164,11 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
       unsigned input_channels = operation->input_channels;
       unsigned output_channels = operation->output_channels;
 
+      /* Write to the actual tensor being provided, not necessarily
+       * operation->input_index (which may differ for multi-input ops
+       * like CONCAT where each graph input maps to a different tensor) */
       struct rkt_resource *input_tensor =
-         rkt_get_tensor(subgraph, operation->input_index);
+         rkt_get_tensor(subgraph, input_idxs[i]);
       if (output_channels == 1 && input_channels == 1 &&
           !operation->addition_input && (operation->add_tensor == -1)) {
          pipe_buffer_copy(pcontext, &input_tensor->base, input, 0, 0,

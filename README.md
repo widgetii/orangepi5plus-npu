@@ -177,11 +177,9 @@ cat /sys/kernel/debug/tracing/trace
 
 ## Known Issues
 
-- **Upstream Mesa INT8 regression** — Mesa git HEAD (26.1.0-devel, commit `384d128`)
-  produces all-127 (saturated) output for INT8 quantized models. System-packaged Mesa
-  26.0.2 works correctly for both INT8 and UINT8. This blocks YOLO end-to-end testing
-  since YOLO models use INT8 internal quantization. UINT8 models (MobileNetV1, SSD)
-  are unaffected. The regression is in the upstream code, not in our patches.
+- **Upstream Mesa INT8 regression (FIXED)** — Mesa git HEAD per-task job splitting
+  (`reuse_weights_cbuf == false`) breaks INT8 models. Fixed by patch 0005 which batches
+  all tasks into one job per operation (matches 26.0.2 behavior).
 
 - **Vendor DTB has UART2 disabled** — the original Armbian vendor DTB ships with
   `serial@feb50000` set to `status = "disabled"`. The DTB on this board has been
