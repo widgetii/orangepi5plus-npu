@@ -1,15 +1,26 @@
 diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
-index 4a082d0..94fd5f0 100644
+index 4a082d0..9f033d5 100644
 --- a/src/gallium/frontends/teflon/tfl_device.c
 +++ b/src/gallium/frontends/teflon/tfl_device.c
-@@ -334,8 +334,9 @@ fill_tensor(struct teflon_delegate *delegate, TfLiteContext *tf_context, struct
+@@ -334,12 +334,17 @@ fill_tensor(struct teflon_delegate *delegate, TfLiteContext *tf_context, struct
        tensor->scale = quant->scale->data[0];
        tensor->zero_point = quant->zero_point->data[0];
  
 -      assert(quant->scale->size == quant->zero_point->size);
-+      
-       if (quant->scale->size > 1 &&
-+          quant->scale->size == quant->zero_point->size &&
-           (!all_scales_equal(quant) || !all_zero_points_equal(quant))) {
+-      if (quant->scale->size > 1 &&
+-          (!all_scales_equal(quant) || !all_zero_points_equal(quant))) {
++      /* Store per-axis scales if they differ across channels.
++       * Always store scales (even when sizes mismatch with zero_points) so the
++       * driver can apply per-channel correction for per-axis quantized weights.
++       * Only store zero_points when sizes match. */
++      if (quant->scale->size > 1 && !all_scales_equal(quant)) {
           tensor->scales = calloc(quant->scale->size, sizeof(*tensor->scales));
           memcpy(tensor->scales, quant->scale->data, quant->scale->size * sizeof(*tensor->scales));
+-
++      }
++      if (quant->zero_point->size > 1 &&
++          quant->scale->size == quant->zero_point->size &&
++          !all_zero_points_equal(quant)) {
+          tensor->zero_points = calloc(quant->zero_point->size, sizeof(*tensor->zero_points));
+          memcpy(tensor->zero_points, quant->zero_point->data, quant->zero_point->size * sizeof(*tensor->zero_points));
+       }

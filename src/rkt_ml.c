@@ -391,7 +391,24 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
    operation->weights_width = poperation->conv.weight_tensor->dims[1];
    operation->weights_height = poperation->conv.weight_tensor->dims[2];
    operation->weights_zero_point = poperation->conv.weight_tensor->zero_point;
-   operation->weights_scale = poperation->conv.weight_tensor->scale;
+   /* For per-axis weights, use the maximum weight scale so no channel clips.
+    * The per-axis correction then downscales each channel to its correct value.
+    * This preserves precision that would otherwise be lost to int8 saturation. */
+   struct pipe_tensor *wt = poperation->conv.weight_tensor;
+   if (wt->scales != NULL) {
+      unsigned oc = operation->output_channels;
+      float max_scale = wt->scales[0];
+      for (unsigned i = 1; i < oc; i++)
+         if (wt->scales[i] > max_scale)
+            max_scale = wt->scales[i];
+      operation->weights_scale = max_scale;
+
+      operation->per_axis_correction = calloc(oc, sizeof(float));
+      for (unsigned i = 0; i < oc; i++)
+         operation->per_axis_correction[i] = wt->scales[i] / max_scale;
+   } else {
+      operation->weights_scale = poperation->conv.weight_tensor->scale;
+   }
 
    operation->weights = rkt_fill_weights(subgraph, poperation);
    operation->biases =
@@ -921,6 +938,67 @@ execute_logistic(struct pipe_context *pcontext,
    pipe_buffer_unmap(pcontext, out_transfer);
 }
 
+/*
+ * Apply per-channel scale correction after NPU CONV for per-axis quantized weights.
+ *
+ * The NPU computes: npu_out = round(acc * S0/So) + ozp
+ *   where S0 = input_scale * weight_scale[0] (first channel's scale)
+ * The correct result: correct = round(acc * Sc/So) + ozp
+ *   where Sc = input_scale * weight_scale[oc]
+ *
+ * Correction: correct = round((npu_out - ozp) * weight_scale[oc]/weight_scale[0]) + ozp
+ *
+ * The output tensor is in NPU interleaved format:
+ *   [group][y=height][x=width][FEATURE_ATOMIC_SIZE=16]
+ * Each group of 16 channels gets the same correction factor applied to all
+ * spatial positions within that channel.
+ */
+static void
+apply_per_axis_correction(struct pipe_context *pcontext,
+                          struct rkt_ml_subgraph *subgraph,
+                          struct rkt_operation *op)
+{
+   if (op->per_axis_correction == NULL)
+      return;
+
+   unsigned w = op->output_width;
+   unsigned h = op->output_height;
+   unsigned oc = op->output_channels;
+   int ozp_npu = (int)(uint8_t)op->output_zero_point - 0x80;
+
+   struct pipe_transfer *transfer = NULL;
+   struct rkt_resource *res = rkt_get_tensor(subgraph, op->output_index);
+   uint8_t *data = pipe_buffer_map(pcontext, &res->base,
+                                   PIPE_MAP_READ_WRITE, &transfer);
+
+   /* Iterate in the NPU output layout order (y-major, matching read_outputs) */
+   unsigned groups = DIV_ROUND_UP(oc, FEATURE_ATOMIC_SIZE);
+   for (unsigned g = 0; g < groups; g++) {
+      unsigned base_c = g * FEATURE_ATOMIC_SIZE;
+      unsigned real_c = MIN2(FEATURE_ATOMIC_SIZE, oc - base_c);
+      unsigned group_off = g * h * w * FEATURE_ATOMIC_SIZE;
+
+      for (unsigned y = 0; y < h; y++) {
+         for (unsigned x = 0; x < w; x++) {
+            uint8_t *pixel = data + group_off +
+               y * w * FEATURE_ATOMIC_SIZE + x * FEATURE_ATOMIC_SIZE;
+            for (unsigned c = 0; c < real_c; c++) {
+               float corr = op->per_axis_correction[base_c + c];
+               if (corr == 1.0f)
+                  continue;
+               int val = (int)(int8_t)pixel[c] - ozp_npu;
+               val = (int)roundf(val * corr) + ozp_npu;
+               if (val < -128) val = -128;
+               if (val > 127) val = 127;
+               pixel[c] = (uint8_t)(int8_t)val;
+            }
+         }
+      }
+   }
+
+   pipe_buffer_unmap(pcontext, transfer);
+}
+
 static void
 execute_sw_op(struct pipe_context *pcontext,
               struct rkt_ml_subgraph *subgraph,
@@ -1052,10 +1130,9 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
       struct pipe_tensor *bias_tensor = operation->conv.bias_tensor;
       struct pipe_tensor *output_tensor = operation->output_tensors[0];
 
-      // Dilation and per-axis quantization not yet implemented
+      /* Per-axis weights are supported via post-CONV scale correction.
+       * Only require per-tensor quantization on input/output tensors. */
       if (tensor_quantization_supported(input_tensor) &&
-          tensor_quantization_supported(weight_tensor) &&
-          tensor_quantization_supported(bias_tensor) &&
           tensor_quantization_supported(output_tensor) &&
           operation->conv.dilation_width_factor == 1 &&
           operation->conv.dilation_height_factor == 1)
@@ -1387,6 +1464,11 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
       if (seg->is_hw) {
          ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_SUBMIT, &seg->submit);
          assert(ret == 0);
+
+         /* Apply per-axis scale correction to CONV outputs that used per-axis weights */
+         struct rkt_operation *ops_arr = util_dynarray_begin(&subgraph->operations);
+         for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++)
+            apply_per_axis_correction(pcontext, subgraph, &ops_arr[j]);
       } else {
          execute_sw_op(pcontext, subgraph, seg->first_op);
       }
@@ -1489,6 +1571,7 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
 static void
 free_operation(struct rkt_operation *operation)
 {
+   free(operation->per_axis_correction);
    if (operation->type == RKT_OP_CONVOLUTION) {
       util_dynarray_fini(&operation->tasks);
       pipe_resource_reference(&operation->regcmd, NULL);

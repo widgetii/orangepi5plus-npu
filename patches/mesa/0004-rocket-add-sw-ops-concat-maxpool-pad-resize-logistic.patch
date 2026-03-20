@@ -1,5 +1,5 @@
 diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
-index 8da2a58..9a7ad6f 100644
+index 8da2a58..d1a8873 100644
 --- a/src/gallium/drivers/rocket/rkt_ml.c
 +++ b/src/gallium/drivers/rocket/rkt_ml.c
 @@ -9,6 +9,7 @@
@@ -237,7 +237,32 @@ index 8da2a58..9a7ad6f 100644
     operation->tasks = UTIL_DYNARRAY_INIT;
  
     operation->depthwise = rkt_is_depthwise(poperation);
-@@ -198,6 +398,563 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
+@@ -191,13 +391,648 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
+    operation->weights_width = poperation->conv.weight_tensor->dims[1];
+    operation->weights_height = poperation->conv.weight_tensor->dims[2];
+    operation->weights_zero_point = poperation->conv.weight_tensor->zero_point;
+-   operation->weights_scale = poperation->conv.weight_tensor->scale;
++   /* For per-axis weights, use the maximum weight scale so no channel clips.
++    * The per-axis correction then downscales each channel to its correct value.
++    * This preserves precision that would otherwise be lost to int8 saturation. */
++   struct pipe_tensor *wt = poperation->conv.weight_tensor;
++   if (wt->scales != NULL) {
++      unsigned oc = operation->output_channels;
++      float max_scale = wt->scales[0];
++      for (unsigned i = 1; i < oc; i++)
++         if (wt->scales[i] > max_scale)
++            max_scale = wt->scales[i];
++      operation->weights_scale = max_scale;
++
++      operation->per_axis_correction = calloc(oc, sizeof(float));
++      for (unsigned i = 0; i < oc; i++)
++         operation->per_axis_correction[i] = wt->scales[i] / max_scale;
++   } else {
++      operation->weights_scale = poperation->conv.weight_tensor->scale;
++   }
+ 
+    operation->weights = rkt_fill_weights(subgraph, poperation);
+    operation->biases =
        rkt_fill_biases(subgraph, poperation, &operation->truncate_bits);
  }
  
@@ -764,6 +789,67 @@ index 8da2a58..9a7ad6f 100644
 +   pipe_buffer_unmap(pcontext, out_transfer);
 +}
 +
++/*
++ * Apply per-channel scale correction after NPU CONV for per-axis quantized weights.
++ *
++ * The NPU computes: npu_out = round(acc * S0/So) + ozp
++ *   where S0 = input_scale * weight_scale[0] (first channel's scale)
++ * The correct result: correct = round(acc * Sc/So) + ozp
++ *   where Sc = input_scale * weight_scale[oc]
++ *
++ * Correction: correct = round((npu_out - ozp) * weight_scale[oc]/weight_scale[0]) + ozp
++ *
++ * The output tensor is in NPU interleaved format:
++ *   [group][y=height][x=width][FEATURE_ATOMIC_SIZE=16]
++ * Each group of 16 channels gets the same correction factor applied to all
++ * spatial positions within that channel.
++ */
++static void
++apply_per_axis_correction(struct pipe_context *pcontext,
++                          struct rkt_ml_subgraph *subgraph,
++                          struct rkt_operation *op)
++{
++   if (op->per_axis_correction == NULL)
++      return;
++
++   unsigned w = op->output_width;
++   unsigned h = op->output_height;
++   unsigned oc = op->output_channels;
++   int ozp_npu = (int)(uint8_t)op->output_zero_point - 0x80;
++
++   struct pipe_transfer *transfer = NULL;
++   struct rkt_resource *res = rkt_get_tensor(subgraph, op->output_index);
++   uint8_t *data = pipe_buffer_map(pcontext, &res->base,
++                                   PIPE_MAP_READ_WRITE, &transfer);
++
++   /* Iterate in the NPU output layout order (y-major, matching read_outputs) */
++   unsigned groups = DIV_ROUND_UP(oc, FEATURE_ATOMIC_SIZE);
++   for (unsigned g = 0; g < groups; g++) {
++      unsigned base_c = g * FEATURE_ATOMIC_SIZE;
++      unsigned real_c = MIN2(FEATURE_ATOMIC_SIZE, oc - base_c);
++      unsigned group_off = g * h * w * FEATURE_ATOMIC_SIZE;
++
++      for (unsigned y = 0; y < h; y++) {
++         for (unsigned x = 0; x < w; x++) {
++            uint8_t *pixel = data + group_off +
++               y * w * FEATURE_ATOMIC_SIZE + x * FEATURE_ATOMIC_SIZE;
++            for (unsigned c = 0; c < real_c; c++) {
++               float corr = op->per_axis_correction[base_c + c];
++               if (corr == 1.0f)
++                  continue;
++               int val = (int)(int8_t)pixel[c] - ozp_npu;
++               val = (int)roundf(val * corr) + ozp_npu;
++               if (val < -128) val = -128;
++               if (val > 127) val = 127;
++               pixel[c] = (uint8_t)(int8_t)val;
++            }
++         }
++      }
++   }
++
++   pipe_buffer_unmap(pcontext, transfer);
++}
++
 +static void
 +execute_sw_op(struct pipe_context *pcontext,
 +              struct rkt_ml_subgraph *subgraph,
@@ -801,7 +887,7 @@ index 8da2a58..9a7ad6f 100644
  static struct rkt_operation *
  find_first_consumer(struct rkt_ml_subgraph *subgraph, unsigned tensor_index)
  {
-@@ -205,6 +962,12 @@ find_first_consumer(struct rkt_ml_subgraph *subgraph, unsigned tensor_index)
+@@ -205,6 +1040,12 @@ find_first_consumer(struct rkt_ml_subgraph *subgraph, unsigned tensor_index)
                            operation) {
        if (operation->input_index == tensor_index)
           return operation;
@@ -814,7 +900,7 @@ index 8da2a58..9a7ad6f 100644
     }
  
     return NULL;
-@@ -241,6 +1004,15 @@ count_tensors(const struct pipe_ml_operation *poperations,
+@@ -241,6 +1082,15 @@ count_tensors(const struct pipe_ml_operation *poperations,
        case PIPE_ML_OPERATION_TYPE_ADD:
           tensor_count = MAX2(tensor_count, poperation->input_tensors[1]->index);
           break;
@@ -830,7 +916,7 @@ index 8da2a58..9a7ad6f 100644
        default:
           DBG("poperation->type %d\n", poperation->type);
           UNREACHABLE("Unsupported ML operation type");
-@@ -260,6 +1032,13 @@ tensor_quantization_supported(struct pipe_tensor *tensor)
+@@ -260,6 +1110,13 @@ tensor_quantization_supported(struct pipe_tensor *tensor)
     return tensor->scales == NULL && tensor->zero_points == NULL;
  }
  
@@ -844,7 +930,20 @@ index 8da2a58..9a7ad6f 100644
  bool
  rkt_ml_operation_supported(struct pipe_context *pcontext,
                             const struct pipe_ml_operation *operation)
-@@ -288,6 +1067,45 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
+@@ -273,10 +1130,9 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
+       struct pipe_tensor *bias_tensor = operation->conv.bias_tensor;
+       struct pipe_tensor *output_tensor = operation->output_tensors[0];
+ 
+-      // Dilation and per-axis quantization not yet implemented
++      /* Per-axis weights are supported via post-CONV scale correction.
++       * Only require per-tensor quantization on input/output tensors. */
+       if (tensor_quantization_supported(input_tensor) &&
+-          tensor_quantization_supported(weight_tensor) &&
+-          tensor_quantization_supported(bias_tensor) &&
+           tensor_quantization_supported(output_tensor) &&
+           operation->conv.dilation_width_factor == 1 &&
+           operation->conv.dilation_height_factor == 1)
+@@ -288,6 +1144,45 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
        supported = operation->input_tensors[0]->resource == NULL &&
                    operation->input_tensors[1]->resource == NULL;
        break;
@@ -890,7 +989,7 @@ index 8da2a58..9a7ad6f 100644
     default:
        supported = false;
     }
-@@ -349,6 +1167,26 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+@@ -349,6 +1244,26 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
  
           break;
        }
@@ -917,7 +1016,7 @@ index 8da2a58..9a7ad6f 100644
        default:
           DBG("poperation->type %d\n", poperations[i].type);
           UNREACHABLE("Unsupported ML operation type");
-@@ -365,6 +1203,17 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+@@ -365,6 +1280,17 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
                              input_channels_1 * input_channels_2;
  
        create_tensor(subgraph, operation->input_index, input_size);
@@ -935,22 +1034,22 @@ index 8da2a58..9a7ad6f 100644
     }
  
     /* Create output tensors */
-@@ -379,13 +1228,26 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+@@ -379,13 +1305,26 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
                      calc_raw_output_size(operation));
     }
  
 -   /* Compile */
 +   /* Mark intermediate and output tensors as device-resident (written by NPU) */
-    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
-                           operation) {
++   util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
++                          operation) {
 +      /* Don't mark graph input tensor - CPU writes it every invoke */
 +   }
 +
 +   struct rkt_operation *first_op = util_dynarray_begin(&subgraph->operations);
 +
 +   /* Compile HW ops only */
-+   util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
-+                          operation) {
+    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+                           operation) {
 +      if (operation->type != RKT_OP_CONVOLUTION)
 +         continue;
        rkt_split_tasks(subgraph, operation);
@@ -963,7 +1062,7 @@ index 8da2a58..9a7ad6f 100644
     return &subgraph->base;
  }
  
-@@ -409,9 +1271,22 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+@@ -409,9 +1348,22 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
        unsigned input_channels = operation->input_channels;
        unsigned output_channels = operation->output_channels;
  
@@ -988,7 +1087,7 @@ index 8da2a58..9a7ad6f 100644
            !operation->addition_input && (operation->add_tensor == -1)) {
           pipe_buffer_copy(pcontext, &input_tensor->base, input, 0, 0,
                            pipe_buffer_size(input));
-@@ -426,12 +1301,6 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+@@ -426,12 +1378,6 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
  
           DBG("Converting data\n");
  
@@ -1001,7 +1100,7 @@ index 8da2a58..9a7ad6f 100644
           if (input_channels == 1) {
              unsigned n = 0;
              for (int x = 0; x < input_width; x++) {
-@@ -442,18 +1311,57 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+@@ -442,18 +1388,57 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
                       map[n++] = zero_point;
                 }
              }
@@ -1065,7 +1164,7 @@ index 8da2a58..9a7ad6f 100644
                       }
                    }
                 }
-@@ -473,78 +1381,17 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+@@ -473,78 +1458,22 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
  
     DBG("Submitting graph\n");
  
@@ -1112,6 +1211,11 @@ index 8da2a58..9a7ad6f 100644
 +      if (seg->is_hw) {
 +         ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_SUBMIT, &seg->submit);
 +         assert(ret == 0);
++
++         /* Apply per-axis scale correction to CONV outputs that used per-axis weights */
++         struct rkt_operation *ops_arr = util_dynarray_begin(&subgraph->operations);
++         for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++)
++            apply_per_axis_correction(pcontext, subgraph, &ops_arr[j]);
        } else {
 -         /* Spread tasks among cores, for parallelism */
 -         util_dynarray_foreach (&operation->tasks, struct split_task, task) {
@@ -1151,7 +1255,7 @@ index 8da2a58..9a7ad6f 100644
     DBG("Submitted graph\n");
  }
  
-@@ -566,9 +1413,6 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
+@@ -566,9 +1495,6 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
           rkt_get_tensor(subgraph, output_idxs[i]);
        struct pipe_transfer *transfer = NULL;
        uint8_t *raw_output;
@@ -1161,7 +1265,7 @@ index 8da2a58..9a7ad6f 100644
  
        DBG("Before pipe_buffer_map\n");
        raw_output = pipe_buffer_map(pcontext, &output_tensor->base, PIPE_MAP_READ,
-@@ -577,22 +1421,63 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
+@@ -577,22 +1503,63 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
  
        DBG("Converting data\n");
  
@@ -1235,7 +1339,7 @@ index 8da2a58..9a7ad6f 100644
        DBG("Converted data\n");
  
        pipe_buffer_unmap(pcontext, transfer);
-@@ -604,10 +1489,15 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
+@@ -604,10 +1571,16 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
  static void
  free_operation(struct rkt_operation *operation)
  {
@@ -1243,6 +1347,7 @@ index 8da2a58..9a7ad6f 100644
 -   pipe_resource_reference(&operation->regcmd, NULL);
 -   pipe_resource_reference(&operation->weights, NULL);
 -   pipe_resource_reference(&operation->biases, NULL);
++   free(operation->per_axis_correction);
 +   if (operation->type == RKT_OP_CONVOLUTION) {
 +      util_dynarray_fini(&operation->tasks);
 +      pipe_resource_reference(&operation->regcmd, NULL);
@@ -1255,7 +1360,7 @@ index 8da2a58..9a7ad6f 100644
  }
  
  void
-@@ -616,6 +1506,16 @@ rkt_ml_subgraph_destroy(struct pipe_context *context,
+@@ -616,6 +1589,16 @@ rkt_ml_subgraph_destroy(struct pipe_context *context,
  {
     struct rkt_ml_subgraph *subgraph = (struct rkt_ml_subgraph *)(psubgraph);
  
@@ -1273,7 +1378,7 @@ index 8da2a58..9a7ad6f 100644
        free_operation(operation);
     util_dynarray_fini(&subgraph->operations);
 diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
-index 04dea3d..d513703 100644
+index 04dea3d..2318da1 100644
 --- a/src/gallium/drivers/rocket/rkt_ml.h
 +++ b/src/gallium/drivers/rocket/rkt_ml.h
 @@ -9,6 +9,7 @@
@@ -1309,9 +1414,14 @@ index 04dea3d..d513703 100644
     struct pipe_resource *regcmd;
     struct pipe_resource *weights;
     struct pipe_resource *biases;
-@@ -109,6 +121,39 @@ struct rkt_operation {
+@@ -108,7 +120,44 @@ struct rkt_operation {
+ 
     int add_tensor;
  
++   /* Per-axis scale correction: weight_scale[oc] / weight_scale[0].
++    * NULL for per-tensor quantized weights (no correction needed). */
++   float *per_axis_correction;
++
     struct util_dynarray tasks; /* struct split_task */
 +
 +   /* Software op parameters */
@@ -1349,7 +1459,7 @@ index 04dea3d..d513703 100644
  };
  
  struct rkt_ml_subgraph {
-@@ -116,6 +161,20 @@ struct rkt_ml_subgraph {
+@@ -116,6 +165,20 @@ struct rkt_ml_subgraph {
  
     struct util_dynarray operations; /* rkt_operation */
     struct util_dynarray tensors;    /* pipe_resource* */

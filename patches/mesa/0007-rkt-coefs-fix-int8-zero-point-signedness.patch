@@ -1,8 +1,16 @@
 diff --git a/src/gallium/drivers/rocket/rkt_coefs.c b/src/gallium/drivers/rocket/rkt_coefs.c
-index 0739928..bb3f461 100644
+index 0739928..736a95b 100644
 --- a/src/gallium/drivers/rocket/rkt_coefs.c
 +++ b/src/gallium/drivers/rocket/rkt_coefs.c
-@@ -101,10 +101,10 @@ calculate_bias_correction(struct rkt_ml_subgraph *subgraph,
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "util/u_inlines.h"
++#include <math.h>
+ 
+ #include "rkt_coefs.h"
+ #include "rkt_ml.h"
+@@ -101,10 +102,10 @@ calculate_bias_correction(struct rkt_ml_subgraph *subgraph,
                            unsigned oc, void *map)
  {
     unsigned input_channels = poperation->input_tensors[0]->dims[3];
@@ -15,3 +23,39 @@ index 0739928..bb3f461 100644
     uint8_t(*weights)[weights_width][weights_height][input_channels] = map;
  
     int32_t correction = 0;
+@@ -183,6 +184,23 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
+    else
+       *truncate_bits = 0;
+ 
++   /* Per-axis bias rescaling: TFLite biases are scaled per-channel as
++    * bias[oc] = real_bias / (input_scale * weight_scale[oc]).
++    * The NPU uses weight_scale[0] for all channels, so we need to
++    * rescale: bias_npu[oc] = bias_tflite[oc] * weight_scale[oc] / weight_scale[0]. */
++   /* For per-axis weights, the NPU uses the max weight scale (set in lower_convolution).
++    * Biases must be rescaled from per-channel to this max scale. */
++   float *w_scales = poperation->conv.weight_tensor->scales;
++   float w_base_scale;
++   if (w_scales != NULL) {
++      w_base_scale = w_scales[0];
++      for (int i = 1; i < output_channels; i++)
++         if (w_scales[i] > w_base_scale)
++            w_base_scale = w_scales[i];
++   } else {
++      w_base_scale = poperation->conv.weight_tensor->scale;
++   }
++
+    int32_t max_bias = 0;
+    int32_t max_corr = 0;
+    unsigned max_num_bits = 0;
+@@ -191,7 +209,10 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
+       for (int oc = 0; oc < output_channels; oc++) {
+          int32_t corr =
+             calculate_bias_correction(subgraph, poperation, oc, weights);
+-         biases[oc] = (biases_in[oc] - corr) / (1 << *truncate_bits);
++         int32_t bias_val = biases_in[oc];
++         if (w_scales != NULL && w_base_scale != 0.0f)
++            bias_val = (int32_t)roundf(bias_val * (w_scales[oc] / w_base_scale));
++         biases[oc] = (bias_val - corr) / (1 << *truncate_bits);
+ 
+          int64_t max_val =
+             (biases_in[oc] - corr + 255 * 255 * weights_size * weights_size) /

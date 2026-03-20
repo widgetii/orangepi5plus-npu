@@ -120,6 +120,10 @@ struct rkt_operation {
 
    int add_tensor;
 
+   /* Per-axis scale correction: weight_scale[oc] / weight_scale[0].
+    * NULL for per-tensor quantized weights (no correction needed). */
+   float *per_axis_correction;
+
    struct util_dynarray tasks; /* struct split_task */
 
    /* Software op parameters */
