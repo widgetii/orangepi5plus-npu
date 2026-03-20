@@ -205,9 +205,50 @@ the hardware auto-chains tasks via the regcmd linkage and only interrupts after 
 completions. This works correctly but is only beneficial when all tasks run on the
 same core (no multi-core parallelism).
 
+## Software ML ops for YOLO (patch 0004)
+
+### Motivation
+
+The Rocket NPU driver only supports CONV_2D and ADD operations. YOLO models need
+13+ additional ops (CONCATENATION, MAX_POOL_2D, PAD, RESIZE_NEAREST_NEIGHBOR,
+LOGISTIC, etc.). When unsupported, the Teflon delegate splits the graph at each
+boundary, requiring NPU→NHWC→CPU→NHWC→NPU format conversions per split.
+
+### Implementation
+
+Five CPU-side software ops that operate directly on the NPU's interleaved int8 format:
+
+| Op | NPU format strategy | Notes |
+|----|---------------------|-------|
+| CONCATENATION | Append groups (memcpy for 16-aligned channels) | Handles unaligned via per-element remap |
+| MAX_POOL_2D | Compare raw int8 bytes directly | 0x80 bias is monotonic: `max(a-0x80,b-0x80) = max(a,b)-0x80` |
+| PAD | memset with `zero_point - 0x80` | Spatial-only; channel padding rejected at support check |
+| RESIZE_NEAREST | `floor(ox * in_w / out_w)` per pixel | General scale factors, not just 2x |
+| LOGISTIC | 256-entry LUT (dequant→sigmoid→requant) | Built once at `subgraph_create` |
+
+### Execution architecture
+
+Mixed HW/SW execution via a segment-based plan built at `subgraph_create` time:
+1. Consecutive CONV ops are grouped into one HW segment → single `DRM_IOCTL_ROCKET_SUBMIT`
+2. Each SW op is its own segment → executed on CPU between HW batches
+3. `pipe_buffer_map`/`pipe_buffer_unmap` handles cache coherency (PREP_BO/FINI_BO)
+4. Pre-built job/task arrays avoid per-invoke allocation
+
+### Validation
+
+- `is_quantized_feature_tensor()` rejects non-quantized/non-4D tensors (e.g., int32 shape
+  constants from TFLite's UpSampling2D decomposition into RESHAPE/TILE/CONCATENATION ops)
+- MobileNetV1 and SSD MobileNetV1 remain bit-exact (max_diff=0) vs system Mesa
+
 ## Known issues
 
 - **EfficientNet-Lite0 INT8** crashes the Rocket driver (unsupported ops trigger kernel panic). Do not test with NPU.
 - **NPU job timeout** can corrupt IOMMU state and cascade to kernel memory corruption. Boot with `panic=10 panic_on_oops=1`.
 - **Struct changes require clean rebuild**: `rm -rf build && meson setup ...` — stale `.o` files cause crashes.
 - **Single-job BO handles**: Intermediate tensors must not appear in both `in_bo_handles` and `out_bo_handles` of the same job, or `drm_gem_lock_reservations` returns `-EALREADY`. The upstream `rocket_ioctl_submit` silently ignores this error (fixed by our kernel patch).
+- **Upstream int8 regression (Mesa git HEAD)**: Mesa 26.1.0-devel (commit `384d128`)
+  produces all-127 (saturated) output for INT8 quantized models. System-packaged Mesa
+  26.0.2 works correctly. The regression affects all INT8 models regardless of our patches
+  (reproduces with fully reverted `git checkout`). UINT8 models (MobileNetV1, SSD) are
+  unaffected. YOLO end-to-end testing is blocked by this regression since YOLO models use
+  INT8 internal quantization.

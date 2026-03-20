@@ -129,10 +129,13 @@ $BENCH $MODEL "" 100 7
 | MobileNetV1 224 | 2.6ms | 10.2ms | 3.9x |
 | YOLOv5s 640 | 16.7ms | **Not functional** | — |
 
-YOLO models hit Rocket driver limitations: certain convolution configurations (from YOLOv5/v8
-feature pyramid and detection head layers) cause NPU job timeouts. The Teflon delegate splits
-the graph correctly (fixed per-axis quantization assertion crash in this patch set), but the
-NPU hardware rejects some of the resulting convolution subgraphs.
+YOLO models need 13+ ops beyond CONV_2D/ADD. Patch 0004 adds 5 software ops
+(CONCATENATION, MAX_POOL_2D, PAD, RESIZE_NEAREST, LOGISTIC) that run on the CPU in
+the NPU's native interleaved int8 format, eliminating format conversion at graph splits.
+End-to-end YOLO testing is currently blocked by an upstream Mesa INT8 regression (see
+Known Issues).
+
+The Teflon delegate per-axis quantization assertion crash is fixed in patch 0003.
 
 ## NPU Hardware Architecture
 
@@ -174,6 +177,12 @@ cat /sys/kernel/debug/tracing/trace
 
 ## Known Issues
 
+- **Upstream Mesa INT8 regression** — Mesa git HEAD (26.1.0-devel, commit `384d128`)
+  produces all-127 (saturated) output for INT8 quantized models. System-packaged Mesa
+  26.0.2 works correctly for both INT8 and UINT8. This blocks YOLO end-to-end testing
+  since YOLO models use INT8 internal quantization. UINT8 models (MobileNetV1, SSD)
+  are unaffected. The regression is in the upstream code, not in our patches.
+
 - **Vendor DTB has UART2 disabled** — the original Armbian vendor DTB ships with
   `serial@feb50000` set to `status = "disabled"`. The DTB on this board has been
   patched (`status = "okay"` + `chosen/stdout-path`). Mainline DTB is fine.
@@ -186,8 +195,8 @@ cat /sys/kernel/debug/tracing/trace
 
 ## Research Documents
 
-- [`optimization_report.md`](optimization_report.md) — Detailed analysis of all Rocket driver optimizations (12% latency reduction)
-- [`patches/README.md`](patches/README.md) — How to apply the optimization patches
+- [`optimization_report.md`](optimization_report.md) — Detailed analysis of all Rocket driver optimizations (12% latency reduction) and SW ML ops
+- [`patches/README.md`](patches/README.md) — How to apply the optimization patches (0003 perf + 0004 ML ops)
 - [`rocket_ioctl_analysis.md`](rocket_ioctl_analysis.md) — Decoded IOCTL protocols for both Rocket and RKNPU drivers
 - [`npu_research_report.md`](npu_research_report.md) — Full research report: architecture, ftrace analysis, driver comparison
 
