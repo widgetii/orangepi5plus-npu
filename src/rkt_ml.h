@@ -120,9 +120,17 @@ struct rkt_operation {
 
    int add_tensor;
 
-   /* Per-axis scale correction: weight_scale[oc] / weight_scale[0].
-    * NULL for per-tensor quantized weights (no correction needed). */
+   /* Per-axis scale correction: weight_scale[oc] / group_max_scale.
+    * NULL for per-tensor quantized weights (no correction needed).
+    * For per-group ops, has group_count entries (up to 16). */
    float *per_axis_correction;
+
+   /* Per-group decomposition for per-axis quantization.
+    * When output_tensor_channels > 0, this op handles one group of channels
+    * from a larger per-axis CONV. RKNN uses per-channel task decomposition;
+    * we use per-group-of-16 for efficiency. */
+   unsigned output_tensor_channels; /* Full OC for output tensor sizing, 0=normal */
+   unsigned per_channel_group_offset; /* Byte offset added to DST_BASE_ADDR */
 
    struct util_dynarray tasks; /* struct split_task */
 

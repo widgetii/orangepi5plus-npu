@@ -65,7 +65,8 @@ create_tensor(struct rkt_ml_subgraph *subgraph, unsigned idx,
    struct pipe_resource *res = tensors[idx];
 
    if (res != NULL) {
-      assert(size == pipe_buffer_size(res));
+      /* Per-group ops may request smaller size than the full tensor */
+      assert(size <= pipe_buffer_size(res));
       return;
    }
 
@@ -94,8 +95,11 @@ rkt_is_depthwise(const struct pipe_ml_operation *poperation)
 static unsigned
 calc_raw_output_size(struct rkt_operation *operation)
 {
+   /* For per-group ops, use the full channel count for tensor sizing */
+   unsigned oc = operation->output_tensor_channels > 0
+      ? operation->output_tensor_channels : operation->output_channels;
    unsigned output_channels_1 =
-      DIV_ROUND_UP(operation->output_channels, FEATURE_ATOMIC_SIZE) * 2;
+      DIV_ROUND_UP(oc, FEATURE_ATOMIC_SIZE) * 2;
    unsigned output_channels_2 = FEATURE_ATOMIC_SIZE;
 
    return operation->output_width * operation->output_height *
@@ -363,9 +367,8 @@ build_execution_plan(struct rkt_ml_subgraph *subgraph)
 }
 
 static void
-lower_convolution(struct rkt_ml_subgraph *subgraph,
-                  const struct pipe_ml_operation *poperation,
-                  struct rkt_operation *operation)
+fill_conv_common(struct rkt_operation *operation,
+                 const struct pipe_ml_operation *poperation)
 {
    operation->type = RKT_OP_CONVOLUTION;
    operation->tasks = UTIL_DYNARRAY_INIT;
@@ -384,32 +387,90 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
    operation->output_index = poperation->output_tensors[0]->index;
    operation->output_width = poperation->output_tensors[0]->dims[1];
    operation->output_height = poperation->output_tensors[0]->dims[2];
-   operation->output_channels = poperation->output_tensors[0]->dims[3];
    operation->output_zero_point = poperation->output_tensors[0]->zero_point;
    operation->output_scale = poperation->output_tensors[0]->scale;
 
    operation->weights_width = poperation->conv.weight_tensor->dims[1];
    operation->weights_height = poperation->conv.weight_tensor->dims[2];
    operation->weights_zero_point = poperation->conv.weight_tensor->zero_point;
-   /* For per-axis weights, use the maximum weight scale so no channel clips.
-    * The per-axis correction then downscales each channel to its correct value.
-    * This preserves precision that would otherwise be lost to int8 saturation. */
-   struct pipe_tensor *wt = poperation->conv.weight_tensor;
-   if (wt->scales != NULL) {
-      unsigned oc = operation->output_channels;
-      float max_scale = wt->scales[0];
-      for (unsigned i = 1; i < oc; i++)
-         if (wt->scales[i] > max_scale)
-            max_scale = wt->scales[i];
-      operation->weights_scale = max_scale;
+}
 
-      operation->per_axis_correction = calloc(oc, sizeof(float));
-      for (unsigned i = 0; i < oc; i++)
-         operation->per_axis_correction[i] = wt->scales[i] / max_scale;
-   } else {
-      operation->weights_scale = poperation->conv.weight_tensor->scale;
+/*
+ * Lower a per-axis CONV into per-group operations, one per 16-channel group.
+ * Each group uses max(weight_scale) within its 16 channels, keeping the
+ * within-group ratio small (typically < 2x). Returns the number of operations
+ * appended to subgraph->operations.
+ *
+ * This mirrors the RKNN vendor driver approach (per-channel task decomposition)
+ * but uses groups of 16 for efficiency since that matches FEATURE_ATOMIC_SIZE.
+ */
+static unsigned
+lower_convolution_per_group(struct rkt_ml_subgraph *subgraph,
+                            const struct pipe_ml_operation *poperation)
+{
+   struct pipe_tensor *wt = poperation->conv.weight_tensor;
+   unsigned full_oc = poperation->output_tensors[0]->dims[3];
+   unsigned num_groups = DIV_ROUND_UP(full_oc, FEATURE_ATOMIC_SIZE);
+   unsigned ow = poperation->output_tensors[0]->dims[1];
+   unsigned oh = poperation->output_tensors[0]->dims[2];
+
+   for (unsigned g = 0; g < num_groups; g++) {
+      struct rkt_operation group_op = {0};
+      group_op.add_tensor = -1;
+      fill_conv_common(&group_op, poperation);
+
+      unsigned group_start = g * FEATURE_ATOMIC_SIZE;
+      unsigned group_count = MIN2(FEATURE_ATOMIC_SIZE, full_oc - group_start);
+
+      group_op.output_channels = group_count;
+      group_op.output_tensor_channels = full_oc;
+      /* Each per-group op writes 32 channels (16 real + 16 padding due to
+       * the hardware minimum alignment). So hardware groups are spaced 2x
+       * apart: group g occupies hardware groups 2g and 2g+1. */
+      group_op.per_channel_group_offset =
+         g * 2 * oh * ow * FEATURE_ATOMIC_SIZE;
+
+      /* Use max scale within this group — keeps within-group ratio small */
+      float group_max = wt->scales[group_start];
+      for (unsigned i = 1; i < group_count; i++)
+         if (wt->scales[group_start + i] > group_max)
+            group_max = wt->scales[group_start + i];
+      group_op.weights_scale = group_max;
+
+      /* Within-group correction factors (all close to 1.0) */
+      group_op.per_axis_correction = calloc(group_count, sizeof(float));
+      for (unsigned i = 0; i < group_count; i++)
+         group_op.per_axis_correction[i] =
+            wt->scales[group_start + i] / group_max;
+
+      group_op.weights = rkt_fill_weights_group(subgraph, poperation,
+                                                 group_start, group_count);
+      group_op.biases = rkt_fill_biases_group(subgraph, poperation,
+                                               group_start, group_count,
+                                               &group_op.truncate_bits);
+
+      util_dynarray_append(&subgraph->operations, group_op);
    }
 
+   return num_groups;
+}
+
+static void
+lower_convolution(struct rkt_ml_subgraph *subgraph,
+                  const struct pipe_ml_operation *poperation,
+                  struct rkt_operation *operation)
+{
+   fill_conv_common(operation, poperation);
+   operation->output_channels = poperation->output_tensors[0]->dims[3];
+
+   struct pipe_tensor *wt = poperation->conv.weight_tensor;
+   if (wt->scales != NULL) {
+      /* Per-axis weights: handled by lower_convolution_per_group instead.
+       * This path should not be reached for per-axis ops. */
+      assert(!"per-axis should use lower_convolution_per_group");
+   }
+
+   operation->weights_scale = poperation->conv.weight_tensor->scale;
    operation->weights = rkt_fill_weights(subgraph, poperation);
    operation->biases =
       rkt_fill_biases(subgraph, poperation, &operation->truncate_bits);
@@ -971,12 +1032,15 @@ apply_per_axis_correction(struct pipe_context *pcontext,
    uint8_t *data = pipe_buffer_map(pcontext, &res->base,
                                    PIPE_MAP_READ_WRITE, &transfer);
 
-   /* Iterate in the NPU output layout order (y-major, matching read_outputs) */
+   /* Iterate in the NPU output layout order (y-major, matching read_outputs).
+    * For per-group ops, per_channel_group_offset positions us at the right
+    * group within the full output tensor. */
    unsigned groups = DIV_ROUND_UP(oc, FEATURE_ATOMIC_SIZE);
    for (unsigned g = 0; g < groups; g++) {
       unsigned base_c = g * FEATURE_ATOMIC_SIZE;
       unsigned real_c = MIN2(FEATURE_ATOMIC_SIZE, oc - base_c);
-      unsigned group_off = g * h * w * FEATURE_ATOMIC_SIZE;
+      unsigned group_off = g * h * w * FEATURE_ATOMIC_SIZE +
+                           op->per_channel_group_offset;
 
       for (unsigned y = 0; y < h; y++) {
          for (unsigned x = 0; x < w; x++) {
@@ -994,6 +1058,40 @@ apply_per_axis_correction(struct pipe_context *pcontext,
             }
          }
       }
+   }
+
+   pipe_buffer_unmap(pcontext, transfer);
+}
+
+/*
+ * Compact per-group output: move data from sparse 2x-spaced hardware groups
+ * to consecutive groups. After per-group CONV ops, each group's real data is
+ * at hardware group 2*g. This moves it to hardware group g so read_outputs
+ * sees the standard contiguous layout.
+ */
+static void
+compact_per_group_output(struct pipe_context *pcontext,
+                         struct rkt_ml_subgraph *subgraph,
+                         struct rkt_operation *op)
+{
+   if (op->output_tensor_channels == 0)
+      return;
+
+   unsigned w = op->output_width;
+   unsigned h = op->output_height;
+   unsigned full_oc = op->output_tensor_channels;
+   unsigned num_groups = DIV_ROUND_UP(full_oc, FEATURE_ATOMIC_SIZE);
+   unsigned group_size = h * w * FEATURE_ATOMIC_SIZE;
+
+   struct pipe_transfer *transfer = NULL;
+   struct rkt_resource *res = rkt_get_tensor(subgraph, op->output_index);
+   uint8_t *data = pipe_buffer_map(pcontext, &res->base,
+                                   PIPE_MAP_READ_WRITE, &transfer);
+
+   /* Group g's data is at offset 2*g*group_size, needs to move to g*group_size.
+    * Process forward — source is always ahead of destination so no overlap. */
+   for (unsigned g = 1; g < num_groups; g++) {
+      memmove(data + g * group_size, data + 2 * g * group_size, group_size);
    }
 
    pipe_buffer_unmap(pcontext, transfer);
@@ -1216,8 +1314,14 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
 
       switch (poperations[i].type) {
       case PIPE_ML_OPERATION_TYPE_CONVOLUTION:
-         lower_convolution(subgraph, &poperations[i], &operation);
-         util_dynarray_append(&subgraph->operations, operation);
+         if (poperations[i].conv.weight_tensor->scales != NULL) {
+            /* Per-axis weights: decompose into per-group operations */
+            lower_convolution_per_group(subgraph, &poperations[i]);
+            /* Don't append 'operation' — per_group already appended N ops */
+         } else {
+            lower_convolution(subgraph, &poperations[i], &operation);
+            util_dynarray_append(&subgraph->operations, operation);
+         }
          break;
       case PIPE_ML_OPERATION_TYPE_ADD: {
          /* Fuse tensor addition into convolution*/
@@ -1469,6 +1573,20 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          struct rkt_operation *ops_arr = util_dynarray_begin(&subgraph->operations);
          for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++)
             apply_per_axis_correction(pcontext, subgraph, &ops_arr[j]);
+
+         /* Compact per-group outputs: move from sparse 2x-spaced layout
+          * to contiguous layout. Only run once per output tensor (on the
+          * last group for each tensor). */
+         for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
+            struct rkt_operation *op = &ops_arr[j];
+            if (op->output_tensor_channels == 0)
+               continue;
+            /* Check if this is the last group for this output tensor */
+            bool is_last = (j + 1 >= seg->first_op + seg->op_count) ||
+                           ops_arr[j + 1].output_index != op->output_index;
+            if (is_last)
+               compact_per_group_output(pcontext, subgraph, op);
+         }
       } else {
          execute_sw_op(pcontext, subgraph, seg->first_op);
       }
