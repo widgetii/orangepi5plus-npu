@@ -423,7 +423,7 @@ compare_scale_indices(const void *a, const void *b, void *ctx)
  *
  * After NPU writes, a CPU scatter step restores original channel order.
  */
-#define PER_AXIS_GROUP_SIZE 1 /* 1=per-channel, 16=per-group */
+#define PER_AXIS_GROUP_SIZE 16 /* 1=per-channel (timeout-prone), 16=per-group */
 
 static unsigned
 lower_convolution_per_group(struct rkt_ml_subgraph *subgraph,
