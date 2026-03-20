@@ -119,22 +119,25 @@ $BENCH $MODEL "" 100 7
 |-------|----------|----------------------|
 | MobileNetV1 224x224 | 68ms | **10.2ms** |
 | SSD MobileNetV1 | 89ms | **19.8ms** |
-| YOLOv5s-relu 640x640 | 142ms | NPU timeout (unsupported conv configs) |
-| YOLOv8n 640x640 | 86ms | NPU timeout (unsupported conv configs) |
+| YOLOv5s-relu 640x640 | 142ms | **1120ms** (runs, wrong output — NPU timeouts) |
+| YOLOv8n 640x640 | 86ms | Not tested |
 
 ### Vendor vs Open-source (same YOLOv5s-relu model, single core)
 
 | | RKNN (vendor) | Rocket (open-source) | Gap |
 |--|------|--------|-----|
 | MobileNetV1 224 | 2.6ms | 10.2ms | 3.9x |
-| YOLOv5s 640 | 16.7ms | **Not functional** | — |
+| YOLOv5s 640 | 16.7ms | 1120ms (output incorrect) | — |
 
-YOLO models need 13+ ops beyond CONV_2D/ADD. Patch 0004 adds 5 software ops
-(CONCATENATION, MAX_POOL_2D, PAD, RESIZE_NEAREST, LOGISTIC) that run on the CPU,
-eliminating format conversion at graph splits. All test models produce bit-exact output.
-Patch 0005 fixes an upstream INT8 regression in Mesa git HEAD.
+**YOLOv5s-relu end-to-end status**: The model loads and runs with patches 0004+0005+0006.
+98 of ~100 ops are delegated across 3 partitions (57+9+32 ops). All 5 SW ops (CONCAT,
+MAX_POOL_2D, PAD, RESIZE, LOGISTIC) execute correctly. However, 2 NPU job timeouts occur
+during inference on specific CONV configurations, producing incorrect (constant) output.
+This is a pre-existing Rocket kernel driver limitation — the register programming in
+`rkt_task.c`/`rkt_regcmd.c` doesn't handle certain CONV configurations that YOLO uses.
 
-The Teflon delegate per-axis quantization assertion crash is fixed in patch 0003.
+Patches: 0004 adds SW ops, 0005 fixes INT8 regression, 0006 fixes Teflon per-axis
+quantization assertion crash that prevented YOLO from loading.
 
 ## NPU Hardware Architecture
 

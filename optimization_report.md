@@ -254,6 +254,33 @@ is bypassed entirely:
 - `is_quantized_feature_tensor()` rejects non-quantized/non-4D tensors (e.g., int32 shape
   constants from TFLite's UpSampling2D decomposition into RESHAPE/TILE/CONCATENATION ops)
 
+## YOLOv5s-relu end-to-end results
+
+With patches 0004+0005+0006 applied (Mesa 26.1.0-devel, debugoptimized build):
+
+| Metric | Value |
+|--------|-------|
+| Model | YOLOv5s-relu INT8, 640x640x3 input, 3 detection heads |
+| Delegate partitions | 3 (57 + 9 + 32 ops) |
+| Total delegated ops | 98 / ~100 |
+| SW ops executed | CONCAT(13), MAX_POOL_2D(6), PAD(6), RESIZE_NN(2), LOGISTIC(3) |
+| Inference time | 1120ms (vs 143ms CPU-only, vs 16.7ms RKNN single-core) |
+| Output correctness | **Incorrect** — constant values per head |
+| NPU timeouts | 2 (dmesg: "NPU job timed out") |
+
+The incorrect output is caused by NPU job timeouts on 2 CONV operations. The timed-out
+jobs leave output tensors unwritten, and the error propagates through subsequent ops.
+All SW ops execute correctly — the problem is entirely in the HW CONV execution path
+(`rkt_task.c` / `rkt_regcmd.c` register programming for specific CONV configurations).
+
+Patches required for YOLO:
+- **0006**: Removes per-axis quantization assertion in `tfl_device.c` (YOLO weight tensors
+  have `scale->size != zero_point->size`). Without this, the delegate crashes on load.
+- **0005**: Fixes INT8 regression (per-task job splitting). Without this, all INT8 CONVs
+  produce wrong output.
+- **0004**: Adds SW ops. Without this, the graph splits at every non-CONV op, requiring
+  costly format conversions at each boundary.
+
 ## Known issues
 
 - **EfficientNet-Lite0 INT8** crashes the Rocket driver (unsupported ops trigger kernel panic). Do not test with NPU.

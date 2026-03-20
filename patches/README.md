@@ -12,15 +12,25 @@ delegate crash (per-axis quantization assertion) that prevented loading YOLO mod
 
 ## Mesa patches
 
-Apply 0005 first (fixes upstream INT8 regression), then 0004 for SW ops, and optionally
-0003 for performance. 0004 and 0005 apply independently on stock Mesa; 0003 is standalone:
+Apply 0006+0005 first (fix YOLO crash + INT8 regression), then 0004 for SW ops, and
+optionally 0003 for performance:
 
 ```sh
 cd mesa
+git apply 0006-teflon-fix-per-axis-quant-assertion-for-yolo.patch
 git apply 0005-rocket-fix-int8-regression-batch-tasks-per-operation.patch
 git apply 0004-rocket-add-sw-ops-concat-maxpool-pad-resize-logistic.patch
 git apply 0003-rocket-bo-pool-cache-sync-output-reorder-neon-input-cached-submit.patch  # optional perf
 ```
+
+### 0006: Fix Teflon per-axis quantization assertion for YOLO
+
+Removes `assert(quant->scale->size == quant->zero_point->size)` in `fill_tensor()`
+that crashes on YOLO models (per-axis weights have N scales but 1 zero_point). Adds
+`scale->size == zero_point->size` to the per-axis storage condition so mismatched
+per-axis tensors are treated as per-tensor (using the first scale/zero_point value).
+This allows the Rocket driver to accept per-axis convolutions without graph fragmentation.
+- Files: `tfl_device.c` (2 lines changed)
 
 ### 0005: Fix INT8 regression — batch tasks per operation
 
