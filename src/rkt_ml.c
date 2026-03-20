@@ -395,14 +395,28 @@ fill_conv_common(struct rkt_operation *operation,
    operation->weights_zero_point = poperation->conv.weight_tensor->zero_point;
 }
 
+static int
+compare_scale_indices(const void *a, const void *b, void *ctx)
+{
+   const float *scales = ctx;
+   unsigned ia = *(const unsigned *)a;
+   unsigned ib = *(const unsigned *)b;
+   if (scales[ia] < scales[ib]) return -1;
+   if (scales[ia] > scales[ib]) return 1;
+   return 0;
+}
+
 /*
- * Lower a per-axis CONV into per-group operations, one per 16-channel group.
- * Each group uses max(weight_scale) within its 16 channels, keeping the
- * within-group ratio small (typically < 2x). Returns the number of operations
- * appended to subgraph->operations.
+ * Lower a per-axis CONV into per-group operations with scale-sorted grouping.
+ *
+ * Channels are sorted by weight_scale so each group of 16 contains channels
+ * with similar scales (minimal within-group ratio). This avoids the catastrophic
+ * int8 clipping that occurs when channels with 27x different scales share a
+ * group. After NPU CONV + compaction, an un-sort scatter step restores the
+ * original channel order.
  *
  * This mirrors the RKNN vendor driver approach (per-channel task decomposition)
- * but uses groups of 16 for efficiency since that matches FEATURE_ATOMIC_SIZE.
+ * but uses sorted groups of 16 for efficiency.
  */
 static unsigned
 lower_convolution_per_group(struct rkt_ml_subgraph *subgraph,
@@ -413,6 +427,13 @@ lower_convolution_per_group(struct rkt_ml_subgraph *subgraph,
    unsigned num_groups = DIV_ROUND_UP(full_oc, FEATURE_ATOMIC_SIZE);
    unsigned ow = poperation->output_tensors[0]->dims[1];
    unsigned oh = poperation->output_tensors[0]->dims[2];
+
+   /* Sort channel indices by weight_scale */
+   unsigned *sorted = malloc(full_oc * sizeof(unsigned));
+   for (unsigned i = 0; i < full_oc; i++)
+      sorted[i] = i;
+   qsort_r(sorted, full_oc, sizeof(unsigned), compare_scale_indices,
+            (void *)wt->scales);
 
    for (unsigned g = 0; g < num_groups; g++) {
       struct rkt_operation group_op = {0};
@@ -430,28 +451,37 @@ lower_convolution_per_group(struct rkt_ml_subgraph *subgraph,
       group_op.per_channel_group_offset =
          g * 2 * oh * ow * FEATURE_ATOMIC_SIZE;
 
-      /* Use max scale within this group — keeps within-group ratio small */
-      float group_max = wt->scales[group_start];
-      for (unsigned i = 1; i < group_count; i++)
-         if (wt->scales[group_start + i] > group_max)
-            group_max = wt->scales[group_start + i];
+      /* Store the original channel indices for this group (for un-sort) */
+      group_op.group_channel_indices = malloc(group_count * sizeof(unsigned));
+      for (unsigned i = 0; i < group_count; i++)
+         group_op.group_channel_indices[i] = sorted[group_start + i];
+
+      /* Max scale within this sorted group — ratio is now minimal */
+      float group_max = wt->scales[sorted[group_start]];
+      for (unsigned i = 1; i < group_count; i++) {
+         float s = wt->scales[sorted[group_start + i]];
+         if (s > group_max) group_max = s;
+      }
       group_op.weights_scale = group_max;
 
-      /* Within-group correction factors (all close to 1.0) */
+      /* Within-group correction factors (very close to 1.0 after sorting) */
       group_op.per_axis_correction = calloc(group_count, sizeof(float));
       for (unsigned i = 0; i < group_count; i++)
          group_op.per_axis_correction[i] =
-            wt->scales[group_start + i] / group_max;
+            wt->scales[sorted[group_start + i]] / group_max;
 
       group_op.weights = rkt_fill_weights_group(subgraph, poperation,
-                                                 group_start, group_count);
+                                                 sorted + group_start,
+                                                 group_count);
       group_op.biases = rkt_fill_biases_group(subgraph, poperation,
-                                               group_start, group_count,
+                                               sorted + group_start,
+                                               group_count,
                                                &group_op.truncate_bits);
 
       util_dynarray_append(&subgraph->operations, group_op);
    }
 
+   free(sorted);
    return num_groups;
 }
 
@@ -1064,36 +1094,73 @@ apply_per_axis_correction(struct pipe_context *pcontext,
 }
 
 /*
- * Compact per-group output: move data from sparse 2x-spaced hardware groups
- * to consecutive groups. After per-group CONV ops, each group's real data is
- * at hardware group 2*g. This moves it to hardware group g so read_outputs
- * sees the standard contiguous layout.
+ * Compact and un-sort per-group output.
+ *
+ * After per-group CONV ops, the output tensor has:
+ *   - Sparse layout: group g's data at hardware group 2*g (2x spacing)
+ *   - Sorted channel order: channels sorted by weight_scale, not original order
+ *
+ * This function:
+ *   1. Compacts: moves data from 2x-spaced to contiguous groups
+ *   2. Un-sorts: scatters channels from sorted order to original order
+ *
+ * Called once per output tensor after all its per-group ops complete.
+ * Uses the group_channel_indices from each per-group op to know the mapping.
  */
 static void
-compact_per_group_output(struct pipe_context *pcontext,
-                         struct rkt_ml_subgraph *subgraph,
-                         struct rkt_operation *op)
+compact_and_unsort_per_group_output(struct pipe_context *pcontext,
+                                    struct rkt_ml_subgraph *subgraph,
+                                    struct rkt_operation *ops_arr,
+                                    unsigned first_group_op,
+                                    unsigned num_group_ops)
 {
-   if (op->output_tensor_channels == 0)
-      return;
-
-   unsigned w = op->output_width;
-   unsigned h = op->output_height;
-   unsigned full_oc = op->output_tensor_channels;
+   struct rkt_operation *op0 = &ops_arr[first_group_op];
+   unsigned w = op0->output_width;
+   unsigned h = op0->output_height;
+   unsigned full_oc = op0->output_tensor_channels;
    unsigned num_groups = DIV_ROUND_UP(full_oc, FEATURE_ATOMIC_SIZE);
-   unsigned group_size = h * w * FEATURE_ATOMIC_SIZE;
+   unsigned group_plane = h * w * FEATURE_ATOMIC_SIZE;
+   unsigned pixel_count = h * w;
 
    struct pipe_transfer *transfer = NULL;
-   struct rkt_resource *res = rkt_get_tensor(subgraph, op->output_index);
+   struct rkt_resource *res = rkt_get_tensor(subgraph, op0->output_index);
    uint8_t *data = pipe_buffer_map(pcontext, &res->base,
                                    PIPE_MAP_READ_WRITE, &transfer);
 
-   /* Group g's data is at offset 2*g*group_size, needs to move to g*group_size.
-    * Process forward — source is always ahead of destination so no overlap. */
-   for (unsigned g = 1; g < num_groups; g++) {
-      memmove(data + g * group_size, data + 2 * g * group_size, group_size);
+   /* Step 1: Compact — move from 2x-spaced to contiguous.
+    * Source at 2*g*group_plane, dest at g*group_plane. Forward safe. */
+   for (unsigned g = 1; g < num_groups; g++)
+      memmove(data + g * group_plane, data + 2 * g * group_plane, group_plane);
+
+   /* Step 2: Un-sort — scatter channels from sorted to original order.
+    * Build a temporary copy of the sorted data, then scatter. */
+   unsigned sorted_size = num_groups * group_plane;
+   uint8_t *sorted_copy = malloc(sorted_size);
+   memcpy(sorted_copy, data, sorted_size);
+
+   /* For each sorted channel, copy its data to the original channel position */
+   unsigned sorted_ch = 0;
+   for (unsigned gop = 0; gop < num_group_ops; gop++) {
+      struct rkt_operation *op = &ops_arr[first_group_op + gop];
+      unsigned gc = op->output_channels;
+
+      for (unsigned c = 0; c < gc; c++) {
+         unsigned orig_ch = op->group_channel_indices[c];
+         unsigned src_g = sorted_ch / FEATURE_ATOMIC_SIZE;
+         unsigned src_c = sorted_ch % FEATURE_ATOMIC_SIZE;
+         unsigned dst_g = orig_ch / FEATURE_ATOMIC_SIZE;
+         unsigned dst_c = orig_ch % FEATURE_ATOMIC_SIZE;
+
+         /* Copy this channel's data across all spatial positions */
+         for (unsigned p = 0; p < pixel_count; p++) {
+            data[dst_g * group_plane + p * FEATURE_ATOMIC_SIZE + dst_c] =
+               sorted_copy[src_g * group_plane + p * FEATURE_ATOMIC_SIZE + src_c];
+         }
+         sorted_ch++;
+      }
    }
 
+   free(sorted_copy);
    pipe_buffer_unmap(pcontext, transfer);
 }
 
@@ -1574,18 +1641,20 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++)
             apply_per_axis_correction(pcontext, subgraph, &ops_arr[j]);
 
-         /* Compact per-group outputs: move from sparse 2x-spaced layout
-          * to contiguous layout. Only run once per output tensor (on the
-          * last group for each tensor). */
+         /* Compact and un-sort per-group outputs. Find contiguous runs of
+          * per-group ops sharing the same output tensor. */
          for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
-            struct rkt_operation *op = &ops_arr[j];
-            if (op->output_tensor_channels == 0)
+            if (ops_arr[j].output_tensor_channels == 0)
                continue;
-            /* Check if this is the last group for this output tensor */
-            bool is_last = (j + 1 >= seg->first_op + seg->op_count) ||
-                           ops_arr[j + 1].output_index != op->output_index;
-            if (is_last)
-               compact_per_group_output(pcontext, subgraph, op);
+            /* Find the last group op for this output tensor */
+            unsigned first_g = j;
+            unsigned out_idx = ops_arr[j].output_index;
+            while (j + 1 < seg->first_op + seg->op_count &&
+                   ops_arr[j + 1].output_index == out_idx &&
+                   ops_arr[j + 1].output_tensor_channels > 0)
+               j++;
+            compact_and_unsort_per_group_output(pcontext, subgraph, ops_arr,
+                                                first_g, j - first_g + 1);
          }
       } else {
          execute_sw_op(pcontext, subgraph, seg->first_op);
@@ -1690,6 +1759,7 @@ static void
 free_operation(struct rkt_operation *operation)
 {
    free(operation->per_axis_correction);
+   free(operation->group_channel_indices);
    if (operation->type == RKT_OP_CONVOLUTION) {
       util_dynarray_fini(&operation->tasks);
       pipe_resource_reference(&operation->regcmd, NULL);

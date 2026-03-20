@@ -127,10 +127,11 @@ struct rkt_operation {
 
    /* Per-group decomposition for per-axis quantization.
     * When output_tensor_channels > 0, this op handles one group of channels
-    * from a larger per-axis CONV. RKNN uses per-channel task decomposition;
-    * we use per-group-of-16 for efficiency. */
+    * from a larger per-axis CONV. Channels are sorted by weight_scale so
+    * each group has minimal within-group scale ratio. */
    unsigned output_tensor_channels; /* Full OC for output tensor sizing, 0=normal */
    unsigned per_channel_group_offset; /* Byte offset added to DST_BASE_ADDR */
+   unsigned *group_channel_indices;  /* [group_count] original channel indices, or NULL */
 
    struct util_dynarray tasks; /* struct split_task */
 
