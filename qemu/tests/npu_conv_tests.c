@@ -1066,18 +1066,24 @@ int main(void)
         test_depthwise3x3, test_bias_dma, test_bn_relu,
     };
 
-    /* Detect driver type with the first open */
-    int fd = npu_open_device();
-    if (fd < 0) {
+    /* Detect driver type with a probe open */
+    int probe_fd = npu_open_device();
+    if (probe_fd < 0) {
         perror("open NPU device");
         return 1;
     }
     printf("  Using %s driver\n", g_driver == DRIVER_ROCKET ? "Rocket" : "RKNPU");
-    enum npu_driver driver = g_driver;
+    close(probe_fd);
 
-    for (int i = 0; i < total; i++)
+    for (int i = 0; i < total; i++) {
+        int fd = npu_open_device();
+        if (fd < 0) {
+            printf("  test %d: FAIL (open device)\n", i);
+            continue;
+        }
         passed += tests[i](fd);
-    close(fd);
+        close(fd);
+    }
 
     printf("=== CONV TESTS: %d/%d passed ===\n", passed, total);
     return (passed == total) ? 0 : 1;

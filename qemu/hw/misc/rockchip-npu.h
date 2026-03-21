@@ -218,6 +218,11 @@ typedef struct RocketNPUCore {
     qemu_irq irq;
     unsigned core_id;
 
+    /* Deferred IRQ: convolution runs immediately in MMIO handler, but IRQ
+     * is raised after a short timer delay so the DRM scheduler's SUBMIT
+     * ioctl return path completes before the fence signals. */
+    struct QEMUTimer *irq_timer;
+
     /* PC registers (directly written by MMIO) */
     uint32_t pc_version;
     uint32_t pc_base_addr;
