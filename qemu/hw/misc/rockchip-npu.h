@@ -244,6 +244,8 @@ typedef struct RocketIOMMUEntry {
 struct RockchipNPUState {
     SysBusDevice parent_obj;
 
+    uint32_t num_cores;  /* configurable via property, default 1 */
+
     RocketNPUCore cores[3];
 
     /* Guest physical address space for DMA reads/writes */

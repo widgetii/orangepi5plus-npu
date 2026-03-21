@@ -1085,7 +1085,7 @@ static void rockchip_npu_realize(DeviceState *dev, Error **errp)
 
     s->dma_as = &address_space_memory;
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < s->num_cores; i++) {
         RocketNPUCore *core = &s->cores[i];
         core->core_id = i;
         core->pc_irq_mask = 0;
@@ -1107,7 +1107,7 @@ static void rockchip_npu_reset(DeviceState *dev)
 {
     RockchipNPUState *s = ROCKCHIP_NPU(dev);
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < s->num_cores; i++) {
         RocketNPUCore *core = &s->cores[i];
         core->pc_base_addr = 0;
         core->pc_reg_amounts = 0;
@@ -1146,6 +1146,10 @@ static const VMStateDescription vmstate_rockchip_npu = {
     }
 };
 
+static const Property rockchip_npu_properties[] = {
+    DEFINE_PROP_UINT32("num-cores", RockchipNPUState, num_cores, 1),
+};
+
 static void rockchip_npu_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1153,7 +1157,8 @@ static void rockchip_npu_class_init(ObjectClass *klass, const void *data)
     dc->realize = rockchip_npu_realize;
     device_class_set_legacy_reset(dc, rockchip_npu_reset);
     dc->vmsd = &vmstate_rockchip_npu;
-    dc->desc = "Rockchip RK3588 Rocket NPU (3 cores, INT8 convolution)";
+    dc->desc = "Rockchip RK3588 Rocket NPU (configurable cores, INT8 convolution)";
+    device_class_set_props(dc, rockchip_npu_properties);
 }
 
 static const TypeInfo rockchip_npu_info = {

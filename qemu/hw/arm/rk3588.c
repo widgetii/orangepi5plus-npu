@@ -28,12 +28,13 @@
 #include "target/arm/cpu.h"
 #include "target/arm/gtimer.h"
 
-/* NPU device type (defined in rockchip-npu.c) */
-#define TYPE_ROCKCHIP_NPU "rockchip-npu"
+/* NPU device model */
+#include "hw/misc/rockchip-npu.h"
 
 #define GIC_NUM_SPI 192
 
 static struct arm_boot_info rk3588_binfo;
+static int rk3588_npu_num_cores = 1; /* set from NPU device property */
 
 /*
  * Generate a minimal device tree for the RK3588 machine.
@@ -187,7 +188,7 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
     qemu_fdt_setprop_cell(fdt, "/npu-reset", "phandle", rst_phandle);
 
     /* NPU cores */
-    for (int i = 0; i < RK3588_NPU_NUM_CORES; i++) {
+    for (int i = 0; i < rk3588_npu_num_cores; i++) {
         snprintf(node, sizeof(node), "/npu@%" PRIx64,
                  (uint64_t)npu_bases[i]);
         qemu_fdt_add_subnode(fdt, node);
@@ -363,13 +364,16 @@ static void rk3588_init(MachineState *ms)
         SysBusDevice *npubus = SYS_BUS_DEVICE(npu);
         sysbus_realize_and_unref(npubus, &error_fatal);
 
-        for (int i = 0; i < RK3588_NPU_NUM_CORES; i++) {
+        RockchipNPUState *npu_s = ROCKCHIP_NPU(npu);
+        rk3588_npu_num_cores = npu_s->num_cores;
+
+        for (int i = 0; i < rk3588_npu_num_cores; i++) {
             sysbus_mmio_map(npubus, i, npu_bases[i]);
             sysbus_connect_irq(npubus, i,
                                qdev_get_gpio_in(gicdev, npu_irqs[i]));
         }
-        /* IOMMU mailbox at mmio index 3 (after 3 cores) */
-        sysbus_mmio_map(npubus, 3, NPU_IOMMU_BASE);
+        /* IOMMU mailbox — index follows the core regions */
+        sysbus_mmio_map(npubus, rk3588_npu_num_cores, NPU_IOMMU_BASE);
     }
 
     /* Boot */

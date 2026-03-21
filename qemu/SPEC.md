@@ -374,7 +374,15 @@ cd rootfs && find . | cpio -o -H newc | gzip > ../initrd.gz
 ### Run
 
 ```bash
+# Default: 1 NPU core (avoids multi-core timeouts in TCG mode)
 qemu-system-aarch64 -M orangepi5plus -smp 4 -m 1G \
+  -kernel Image-6.18 -initrd initrd.gz \
+  -append "console=ttyS0 earlycon rdinit=/init iommu.passthrough=1" \
+  -nographic
+
+# Optional: 3 NPU cores (realistic but causes DRM scheduler timeouts)
+qemu-system-aarch64 -M orangepi5plus -smp 4 -m 1G \
+  -global rockchip-npu.num-cores=3 \
   -kernel Image-6.18 -initrd initrd.gz \
   -append "console=ttyS0 earlycon rdinit=/init iommu.passthrough=1" \
   -nographic
@@ -412,4 +420,4 @@ The kernel encodes the regcmd entry count as `PC_DATA_AMOUNT = (regcmd_count + 1
 
 5. **IOMMU as module**: Requires `iommu.passthrough=1` kernel cmdline. A built-in IOMMU driver would remove this requirement but needs kernel recompilation.
 
-6. **Single-threaded**: NPU execution is synchronous in the MMIO write handler. Multi-core parallelism (kernel distributing jobs across 3 cores) works but executes sequentially in QEMU.
+6. **Multi-core timeouts**: NPU execution is synchronous in the MMIO write handler. With 3 cores, the kernel DRM scheduler dispatches jobs across all cores, but QEMU's single-threaded TCG executes them sequentially. While core 0's handler blocks the vCPU computing convolutions, the wall clock advances and the 500ms DRM scheduler timeout fires for jobs on cores 1/2. **Workaround**: the `num-cores` device property defaults to 1, serializing all jobs on a single core. Use `-global rockchip-npu.num-cores=3` to test 3-core mode (with expected timeouts).
