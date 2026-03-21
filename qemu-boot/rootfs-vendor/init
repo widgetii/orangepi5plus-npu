@@ -38,11 +38,18 @@ echo "=== Checking DRM devices ==="
 ls -la /dev/dri/ 2>/dev/null || echo "No /dev/dri/"
 echo ""
 
-# Run test if available
+# Run tests if available
 if [ -f /bin/rknpu_test ]; then
     echo "=== Running RKNPU test ==="
     /bin/rknpu_test
-    echo "Test exit code: $?"
+    echo "RKNPU test exit code: $?"
+fi
+
+if [ -f /bin/npu_conv_tests ]; then
+    echo ""
+    echo "=== Running NPU conv tests ==="
+    /bin/npu_conv_tests
+    echo "Conv tests exit code: $?"
 fi
 
 echo ""

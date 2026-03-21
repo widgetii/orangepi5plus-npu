@@ -328,7 +328,9 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
      * We include both but disable the rknpu node by default since the
      * Rocket driver needs reg-names and per-core IOMMU groups.
      */
-    qemu_fdt_setprop_string(fdt, "/npu@fdab0000", "status", "disabled");
+    /* Both rknpu and per-core nodes are enabled. The vendor kernel matches
+     * the rknpu node; the Rocket driver matches the per-core nodes. Region
+     * overlaps cause non-fatal "can't request region" warnings. */
 
     for (int i = 0; i < RK3588_NPU_NUM_CORES; i++) {
         snprintf(node, sizeof(node), "/npu-core@%" PRIx64,

@@ -688,8 +688,14 @@ static void rockchip_npu_write(void *opaque, hwaddr addr, uint64_t val,
 
     if (is_iommu_offset(addr) && s->rk_iommu) {
         unsigned inst = iommu_instance_for_offset(addr, core->core_id);
+        hwaddr iommu_reg = addr & 0xFF;
         rk_iommu_instance_write(&s->rk_iommu->instances[inst],
-                                 addr & 0xFF, val, size);
+                                 iommu_reg, val, size);
+        /* Track the most recent ENABLE_PAGING globally */
+        if (iommu_reg == RK_IOMMU_COMMAND && val == RK_IOMMU_CMD_ENABLE_PAGING) {
+            s->rk_iommu->last_active_dte =
+                s->rk_iommu->instances[inst].active_dte_addr;
+        }
         return;
     }
 

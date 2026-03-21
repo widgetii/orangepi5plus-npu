@@ -66,6 +66,9 @@ struct RockchipIOMMUState {
     RkIOMMUInstance instances[RK_IOMMU_NUM_INSTANCES];
     qemu_irq irq[3];
 
+    /* Most recently latched DTE — updated on every ENABLE_PAGING */
+    uint32_t last_active_dte;
+
     /* Guest physical address space for page table reads */
     AddressSpace *dma_as;
 };

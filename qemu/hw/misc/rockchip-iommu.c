@@ -45,31 +45,22 @@
  */
 static hwaddr rk_iommu_decode_dte(uint32_t entry)
 {
+    /* v1: pt_addr = entry & 0xFFFFFC00 (1KB-aligned, covers <4GB) */
     return (hwaddr)(entry & 0xFFFFFC00ULL);
 }
 
 static hwaddr rk_iommu_decode_pte(uint32_t entry)
 {
+    /* v1: page_addr = entry & 0xFFFFF000
+     * v2: page_addr = (entry & 0xFFFFF000) | ((entry >> 4) & 0xFF) << 32
+     * Both equivalent for <4GB */
     return (hwaddr)(entry & 0xFFFFF000ULL);
 }
 
 hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova)
 {
-    /*
-     * Find the most recently activated page table.
-     * The kernel programs all instances with the same DTE, but may
-     * transiently enable a default domain before the real one.
-     * Use the last instance (highest index) since the kernel writes
-     * all 4 instances sequentially — the last one has the final DTE.
-     */
-    uint32_t dte_addr = 0;
-    for (int i = RK_IOMMU_NUM_INSTANCES - 1; i >= 0; i--) {
-        if (s->instances[i].active_dte_addr) {
-            dte_addr = s->instances[i].active_dte_addr;
-            break;
-        }
-    }
-
+    /* Use the most recently enabled DTE across all instances */
+    uint32_t dte_addr = s->last_active_dte;
     if (!dte_addr) {
         return (hwaddr)iova;
     }
@@ -283,6 +274,7 @@ static void rk_iommu_reset(DeviceState *dev)
         inst->auto_gating = 0;
         inst->paging_enabled = false;
     }
+    s->last_active_dte = 0;
 }
 
 static const VMStateDescription vmstate_rk_iommu_instance = {

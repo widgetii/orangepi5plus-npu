@@ -3,28 +3,6 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 
-# Disable the vendor rknpu node and enable per-core Rocket nodes.
-# The DTB has both node types; we activate the ones matching our driver.
-# dtoverlay isn't available, so we use the configfs interface.
-mount -t configfs configfs /sys/kernel/config 2>/dev/null
-
-# The Rocket driver needs the per-core nodes enabled. Since the kernel's
-# OF code reads status at probe time (not at boot), and our nodes are
-# already "disabled" in the DTB, we modify the live DT via a module
-# parameter or simply rely on the kernel probing all OF_DECLARE-matched
-# nodes regardless of status. The Rocket driver uses of_match_device()
-# which respects status — so we need to patch the FDT before driver load.
-#
-# Simpler approach: use /proc/device-tree overrides if available, or
-# just use the DTB's disabled nodes and let the init script update them.
-#
-# Actually, the simplest approach for QEMU testing: use a custom DTB
-# passed via -dtb that only has the per-core nodes. But for the default
-# DTB (shared with vendor), we need a different strategy.
-#
-# For now: just load the modules. The disabled nodes won't probe.
-# Instead, we'll fix this properly in the DTB generation.
-
 echo "Loading kernel modules..."
 insmod /lib/modules/qemu_reset.ko
 insmod /lib/modules/drm_shmem_helper.ko
