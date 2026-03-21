@@ -1,0 +1,4 @@
+# Add this block to hw/misc/Kconfig
+
+config ROCKCHIP_NPU
+    bool

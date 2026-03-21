@@ -1,0 +1,2 @@
+# Add this line to hw/misc/meson.build
+system_ss.add(when: 'CONFIG_ROCKCHIP_NPU', if_true: files('rockchip-npu.c'))

@@ -1,0 +1,10 @@
+# Add this block to hw/arm/Kconfig
+
+config ORANGEPI5PLUS
+    bool
+    default y
+    depends on TCG && AARCH64
+    select ARM_GICV3
+    select SERIAL
+    select UNIMP
+    select ROCKCHIP_NPU
