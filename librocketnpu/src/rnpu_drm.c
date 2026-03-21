@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 
 #include <drm/drm.h>
 
@@ -100,9 +101,12 @@ int rnpu_bo_create(int fd, uint32_t size, struct rnpu_bo *bo)
 
 int rnpu_bo_prep(int fd, struct rnpu_bo *bo)
 {
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   int64_t abs_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec + 5000000000LL;
    struct drm_rocket_prep_bo req = {
       .handle = bo->handle,
-      .timeout_ns = 5000000000LL, /* 5s */
+      .timeout_ns = abs_ns, /* absolute: now + 5s */
    };
    int ret = ioctl(fd, DRM_IOCTL_ROCKET_PREP_BO, &req);
    /* Kernel returns remaining jiffies (>0) on success, -1 on error */

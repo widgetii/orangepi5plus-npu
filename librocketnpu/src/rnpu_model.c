@@ -348,7 +348,7 @@ static void compile_regcmds(struct rnpu_model *m)
       if (op->type != RNPU_OP_CONV) continue;
       rnpu_split_tasks(op);
       /* Each task generates ~110 uint64_t regs, padded to 64 bytes */
-      unsigned per_task = ALIGN_UP(120 * sizeof(uint64_t), 64);
+      unsigned per_task = ALIGN_UP(140 * sizeof(uint64_t), 64);
       op->regcmd_offset = total_regcmd;
       op->regcmd_size = per_task * op->task_count;
       total_regcmd += op->regcmd_size;
@@ -400,6 +400,8 @@ static void compile_regcmds(struct rnpu_model *m)
          rc_offset += ALIGN_UP(count * sizeof(uint64_t), 64);
       }
    }
+
+
 
    /* Note: do NOT chain regcmds across operations. The kernel submits
     * each task individually to the PC DMA engine. Cross-op chaining
