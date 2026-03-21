@@ -52,6 +52,13 @@ if [ -f /bin/npu_conv_tests ]; then
     echo "Conv tests exit code: $?"
 fi
 
+if [ -f /bin/test_mobilenet ] && [ -f /model.tflite ]; then
+    echo ""
+    echo "=== Running MobileNetV1 ==="
+    /bin/test_mobilenet /model.tflite 1 /golden.bin
+    echo "MobileNetV1 exit code: $?"
+fi
+
 echo ""
 echo "--- QEMU RKNPU TEST COMPLETE ---"
 exec /bin/sh < /dev/ttyS0

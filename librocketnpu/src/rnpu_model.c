@@ -568,12 +568,42 @@ static void build_execution_plan(struct rnpu_model *m)
 
 int rnpu_open(const char *device)
 {
-   const char *dev = device ? device : "/dev/accel/accel0";
-   int fd = open(dev, O_RDWR);
-   if (fd < 0) {
-      fprintf(stderr, "rnpu: cannot open %s\n", dev);
-      return -1;
+   int fd;
+   if (device) {
+      fd = open(device, O_RDWR);
+      if (fd < 0) {
+         fprintf(stderr, "rnpu: cannot open %s\n", device);
+         return -1;
+      }
+      if (strstr(device, "accel"))
+         rnpu_active_driver = RNPU_DRIVER_ROCKET;
+      else
+         rnpu_active_driver = RNPU_DRIVER_RKNPU;
+      goto found;
    }
+
+   /* Auto-detect: try Rocket first, then RKNPU */
+   fd = open("/dev/accel/accel0", O_RDWR);
+   if (fd >= 0) {
+      rnpu_active_driver = RNPU_DRIVER_ROCKET;
+      goto found;
+   }
+   fd = open("/dev/dri/card0", O_RDWR);
+   if (fd >= 0) {
+      rnpu_active_driver = RNPU_DRIVER_RKNPU;
+      goto found;
+   }
+   fd = open("/dev/dri/card1", O_RDWR);
+   if (fd >= 0) {
+      rnpu_active_driver = RNPU_DRIVER_RKNPU;
+      goto found;
+   }
+   fprintf(stderr, "rnpu: no NPU device found\n");
+   return -1;
+
+found:
+   fprintf(stderr, "rnpu: using %s driver\n",
+           rnpu_active_driver == RNPU_DRIVER_ROCKET ? "Rocket" : "RKNPU");
    return fd;
 }
 
