@@ -145,8 +145,8 @@ Constraints:
 - **Encode quality** — Hantro H2 hardware encoders produce lower quality-per-bit
   than x265/x264 software. Acceptable for cost-effective mass transcoding
   (IPTV, budget streaming), not for premium VOD (Netflix-quality)
-- **B-frame support** — Hantro H2 likely has limited B-frame support vs software
-  encoders, reducing compression efficiency
+- **B-frame support** — MPP exposes B-frames via GOP parameter (`-bf` in
+  ffmpeg-rockchip), but practical quality vs software encoders is unclear
 - **Software stack** — requires vendor kernel + MPP; no mainline encoder driver.
   FFmpeg + MPP integration exists but isn't upstream
 
@@ -155,6 +155,65 @@ H.264 + H.265 ABR ladders in roughly realtime for 4K content, or 3-4x realtime
 for 1080p. A rack of these could compete with a single Xeon for bulk
 transcoding at a fraction of the power budget, trading encode quality for
 power efficiency.
+
+### Hantro H2 / VC8000E IP vs Rockchip VEPU580 — Capability Analysis
+
+The VEPU580 is Rockchip's **customized derivative** of the VeriSilicon Hantro
+H2/VC8000E lineage, not a drop-in instance. Rockchip added some features and
+may have removed others depending on the licensed silicon configuration.
+
+#### VeriSilicon VC8000E IP capabilities (from datasheets, NXP i.MX8MP driver)
+
+- H.265 Main & Main10, H.264 Baseline/Main/High/High10, level up to 6.2
+- B-frames for higher compression
+- SAO (Sample Adaptive Offset) — hardcoded enabled in NXP driver
+- CABAC entropy coding (CAVLC fallback for H.264 baseline)
+- RDO (Rate-Distortion Optimization) at level 1
+- SSIM computation in hardware
+- Long-term reference frames (LTR)
+- Cyclic intra refresh (CIR)
+- Reference frame compression (60% bus bandwidth savings)
+- Built-in preprocessor: crop, rotation, scaling, stabilization, CSC
+- ROI encoding via QP map
+- Rate control: CBR, VBR, CQP
+- Multi-core: 2-core = 8K@30, 4-core = 8K@60
+- 10-bit encoding supported by IP spec, but NXP **disabled it** on i.MX8MP
+  ("the VC8000E does not, at least not the version in the imx8m plus")
+
+#### What Rockchip MPP exposes on RK3588 (VEPU580)
+
+- H.265 Main profile, H.264 Baseline/Main/High
+- B-frames: supported via GOP parameter
+- ROI: full support with direct buffer tunnel for per-CTU/MB QP maps
+- Rate control: CBR, VBR, CQP, **AVBR** (Rockchip addition beyond VC8000E)
+- **Smart encoding**: content-adaptive quality, VMAF optimization, motion detection
+- QP map: per-CTU/MB quantization control
+- OSD: hardware on-screen display overlay (Rockchip addition)
+- Intra refresh: row or column-based
+- Performance: 4K@120fps / 8K@30fps / 1080p@480fps / 16-ch 1080p@30fps
+
+#### Gap analysis — HW IP vs exposed features
+
+| Feature | VC8000E IP supports | MPP exposes | Status |
+|---|---|---|---|
+| 10-bit / Main10 encode | Yes (spec) | Not confirmed | NXP disabled it too; silicon revision may lack it |
+| SSIM computation | Yes (NXP hardcoded) | Not documented | May be active internally |
+| Reference frame compression | Yes (60% BW savings) | Not documented | Likely active for bandwidth |
+| Tiles / Slices / WPP | Standard HEVC tools | Not in FFmpeg API | May be used internally for multi-core |
+| Built-in scaler/preprocessor | Yes (H2 spec) | Not exposed | RGA used instead |
+| Lookahead / scene change | Software in MPP | Partial ("smart encoding") | MPP does motion detection, not HW lookahead |
+| VP9 encoding | H2 announced as "HEVC+VP9" | Not exposed | Unclear if VEPU580 retained VP9 |
+| AVBR rate control | Not in VC8000E | Yes | Rockchip addition |
+| Smart encoding / VMAF opt | Not in VC8000E | Yes | Rockchip addition |
+| OSD overlay | Not in VC8000E | Yes | Rockchip addition |
+
+#### VEPU721 — unknown
+
+No public source code or documentation exists for VEPU721. The MPP codebase
+references VEPU541, VEPU580, VEPU540c, and VEPU510 but not VEPU721. It may be
+Rockchip's H.264-specific encoder variant or a newer unreleased revision.
+Further investigation needed (possibly by examining the vendor kernel driver
+or intercepting MPP ioctls on hardware).
 
 ### Encode — NOT upstream
 
