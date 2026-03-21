@@ -27,29 +27,56 @@
 #define RK_IOMMU_DTE_COUNT   1024  /* 10-bit DTE index: IOVA[31:22] */
 #define RK_IOMMU_PTE_COUNT   1024  /* 10-bit PTE index: IOVA[21:12] */
 
-/* v2 entry: present bit is bit 0 */
+/* Page table entry: bit 0 = present */
 #define RK_IOMMU_ENTRY_PRESENT  (1 << 0)
 
 /*
- * Decode a v2 page table entry to a physical address.
- * v2 format: phys[31:12] = entry[31:12], phys[39:32] = entry[11:4]
+ * Decode a page table entry to a physical address.
+ *
+ * Rockchip IOMMU has two formats:
+ *   v1 DTE: phys = entry & 0xFFFFFC00  (1KB-aligned page table base)
+ *   v1 PTE: phys = entry & 0xFFFFF000  (4KB page)
+ *   v2 DTE: phys = (entry & 0xFFFFF000) | ((entry >> 4) & 0xFF) << 32
+ *   v2 PTE: same as v2 DTE
+ *
+ * For systems with <=4GB RAM (our case), bits 39:32 are always 0, so
+ * v2 high-bit encoding is irrelevant. We use v1 masks which are wider
+ * and correctly decode both v1 and v2 entries in the <4GB range.
  */
-static hwaddr rk_iommu_v2_decode(uint32_t entry)
+static hwaddr rk_iommu_decode_dte(uint32_t entry)
 {
-    hwaddr phys = (hwaddr)(entry & 0xFFFFF000ULL);
-    phys |= (hwaddr)((entry >> 4) & 0xFF) << 32;
-    return phys;
+    return (hwaddr)(entry & 0xFFFFFC00ULL);
+}
+
+static hwaddr rk_iommu_decode_pte(uint32_t entry)
+{
+    return (hwaddr)(entry & 0xFFFFF000ULL);
 }
 
 hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova)
 {
-    /* Use the first instance's DTE (all instances share the same page table) */
-    uint32_t dte_addr = s->instances[0].dte_addr;
+    /*
+     * Find the most recently activated page table.
+     * The kernel programs all instances with the same DTE, but may
+     * transiently enable a default domain before the real one.
+     * Use the last instance (highest index) since the kernel writes
+     * all 4 instances sequentially — the last one has the final DTE.
+     */
+    uint32_t dte_addr = 0;
+    for (int i = RK_IOMMU_NUM_INSTANCES - 1; i >= 0; i--) {
+        if (s->instances[i].paging_enabled && s->instances[i].active_dte_addr) {
+            dte_addr = s->instances[i].active_dte_addr;
+            break;
+        }
+    }
 
-    if (!dte_addr || !s->instances[0].paging_enabled) {
-        /* No page table configured — identity mapping */
+    if (!dte_addr) {
         return (hwaddr)iova;
     }
+
+    /* Strip valid/present bit from DTE_ADDR register value.
+     * DTE_ADDR is page-aligned with bit 0 = valid flag. */
+    hwaddr dt_base = (hwaddr)(dte_addr & ~1U);
 
     /* DTE index from IOVA[31:22] */
     uint32_t dte_idx = (iova >> 22) & 0x3FF;
@@ -57,7 +84,7 @@ hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova)
 
     /* Read DTE */
     uint32_t dte;
-    address_space_read(s->dma_as, (hwaddr)dte_addr + dte_idx * 4,
+    address_space_read(s->dma_as, dt_base + dte_idx * 4,
                        MEMTXATTRS_UNSPECIFIED, &dte, sizeof(dte));
     dte = le32_to_cpu(dte);
 
@@ -68,8 +95,8 @@ hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova)
         return (hwaddr)iova;
     }
 
-    /* Decode page table base from DTE */
-    hwaddr pt_base = rk_iommu_v2_decode(dte);
+    /* Decode page table base from DTE (v1: 1KB-aligned) */
+    hwaddr pt_base = rk_iommu_decode_dte(dte);
 
     /* PTE index from IOVA[21:12] */
     uint32_t pte_idx = (iova >> 12) & 0x3FF;
@@ -88,8 +115,8 @@ hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova)
         return (hwaddr)iova;
     }
 
-    /* Decode page physical address from PTE */
-    hwaddr page_phys = rk_iommu_v2_decode(pte);
+    /* Decode page physical address from PTE (4KB page) */
+    hwaddr page_phys = rk_iommu_decode_pte(pte);
     return page_phys + offset;
 }
 
@@ -137,11 +164,15 @@ void rk_iommu_instance_write(RkIOMMUInstance *inst, hwaddr addr,
         switch ((uint32_t)val) {
         case RK_IOMMU_CMD_ENABLE_PAGING:
             inst->paging_enabled = true;
+            inst->active_dte_addr = inst->dte_addr;
             inst->status |= RK_IOMMU_STATUS_PAGING_ENABLED;
-            qemu_log_mask(LOG_UNIMP, "rockchip-iommu: ENABLE_PAGING\n");
+            qemu_log_mask(LOG_UNIMP,
+                          "rockchip-iommu: ENABLE_PAGING (DTE=0x%08x)\n",
+                          inst->active_dte_addr);
             break;
         case RK_IOMMU_CMD_DISABLE_PAGING:
             inst->paging_enabled = false;
+            inst->active_dte_addr = 0;
             inst->status &= ~RK_IOMMU_STATUS_PAGING_ENABLED;
             break;
         case RK_IOMMU_CMD_ENABLE_STALL:
@@ -157,6 +188,7 @@ void rk_iommu_instance_write(RkIOMMUInstance *inst, hwaddr addr,
             break;
         case RK_IOMMU_CMD_FORCE_RESET:
             inst->dte_addr = 0;
+            inst->active_dte_addr = 0;
             inst->paging_enabled = false;
             inst->status = RK_IOMMU_STATUS_IDLE |
                            RK_IOMMU_STATUS_STALL_NOT_ACTIVE |
@@ -239,6 +271,7 @@ static void rk_iommu_reset(DeviceState *dev)
     for (int i = 0; i < RK_IOMMU_NUM_INSTANCES; i++) {
         RkIOMMUInstance *inst = &s->instances[i];
         inst->dte_addr = 0;
+        inst->active_dte_addr = 0;
         inst->status = RK_IOMMU_STATUS_IDLE |
                        RK_IOMMU_STATUS_STALL_NOT_ACTIVE |
                        RK_IOMMU_STATUS_STALL_ACTIVE;
@@ -255,6 +288,7 @@ static const VMStateDescription vmstate_rk_iommu_instance = {
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(dte_addr, RkIOMMUInstance),
+        VMSTATE_UINT32(active_dte_addr, RkIOMMUInstance),
         VMSTATE_UINT32(status, RkIOMMUInstance),
         VMSTATE_UINT32(int_mask, RkIOMMUInstance),
         VMSTATE_UINT32(int_rawstat, RkIOMMUInstance),

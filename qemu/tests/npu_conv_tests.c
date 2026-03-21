@@ -74,6 +74,12 @@ struct drm_rocket_submit {
 #define DRM_IOCTL_ROCKET_PREP_BO   _IOW(DRM_IOCTL_BASE, DRM_COMMAND_BASE + DRM_ROCKET_PREP_BO, struct drm_rocket_prep_bo)
 #define DRM_IOCTL_ROCKET_FINI_BO   _IOW(DRM_IOCTL_BASE, DRM_COMMAND_BASE + DRM_ROCKET_FINI_BO, struct drm_rocket_fini_bo)
 
+struct drm_gem_close {
+    uint32_t handle;
+    uint32_t pad;
+};
+#define DRM_IOCTL_GEM_CLOSE _IOW(DRM_IOCTL_BASE, 0x09, struct drm_gem_close)
+
 /* ======================================================================
  * NPU constants and helpers
  * ====================================================================== */

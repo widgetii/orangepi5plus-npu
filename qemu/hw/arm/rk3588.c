@@ -216,7 +216,7 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
     {
         char *iommu_compat[] = {
             (char *)"rockchip,iommu-v2",
-            (char *)"qemu,iommu-dummy",
+            (char *)"rockchip,iommu",
         };
         qemu_fdt_setprop_string_array(fdt, "/iommu@fdab9000", "compatible",
                                       iommu_compat, 2);

@@ -1,8 +1,9 @@
 /*
- * Rockchip IOMMU v2 model for QEMU
+ * Rockchip IOMMU model for QEMU
  *
- * Minimal emulation of the Rockchip IOMMU used by the vendor rknpu driver.
- * Implements DTE_ADDR-based page table walk for IOVA->GPA translation.
+ * Emulates the Rockchip IOMMU used by the RK3588 NPU. Supports both
+ * v1 (rockchip,iommu — mainline) and v2 (rockchip,iommu-v2 — vendor)
+ * page table formats via DTE_ADDR-based page table walk.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -50,7 +51,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RockchipIOMMUState, ROCKCHIP_IOMMU)
 /* Per-instance register state */
 typedef struct RkIOMMUInstance {
     MemoryRegion iomem;
-    uint32_t dte_addr;
+    uint32_t dte_addr;         /* staging register (written by MMIO) */
+    uint32_t active_dte_addr;  /* latched on ENABLE_PAGING */
     uint32_t status;
     uint32_t int_mask;
     uint32_t int_rawstat;
@@ -69,7 +71,8 @@ struct RockchipIOMMUState {
 };
 
 /*
- * Translate an IOVA to a guest physical address using the v2 page table.
+ * Translate an IOVA to a guest physical address using the page table.
+ * Supports both v1 and v2 entry formats (auto-detected from entry bits).
  * Returns the GPA, or falls back to identity mapping if translation fails.
  */
 hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova);
