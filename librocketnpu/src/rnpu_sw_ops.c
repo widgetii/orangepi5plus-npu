@@ -300,9 +300,9 @@ static void exec_softmax(struct rnpu_model *m, struct rnpu_operation *op)
       }
    } else {
       unsigned groups = DIV_ROUND_UP(ch, FEATURE_ATOMIC_SIZE);
-      /* NPU format: stored value = TFLite_int8 - 0x80
-       * To read:  tflite_val = (int)(int8_t)(stored + 0x80)
-       * To write: stored = (uint8_t)((int8_t)tflite_val - 0x80) */
+      /* NPU format: stored value = TFLite_uint8 - 0x80
+       * To read:  tflite_val = (uint8_t)(stored + 0x80)  [unsigned]
+       * To write: stored = tflite_val - 0x80 */
 
       /* First pass: find max for numerical stability */
       for (unsigned g = 0; g < groups; g++) {
@@ -311,7 +311,7 @@ static void exec_softmax(struct rnpu_model *m, struct rnpu_operation *op)
             for (unsigned y = 0; y < h; y++) {
                uint8_t *p = in + NPU_OFFSET(g, x, y, w, h);
                for (unsigned c = 0; c < rc; c++) {
-                  int tv = (int)(int8_t)((uint8_t)(p[c] + 0x80));
+                  int tv = (int)(uint8_t)(p[c] + 0x80);
                   float v = (tv - in_zp) * in_scale;
                   if (v > max_val) max_val = v;
                }
@@ -326,7 +326,7 @@ static void exec_softmax(struct rnpu_model *m, struct rnpu_operation *op)
             for (unsigned y = 0; y < h; y++) {
                uint8_t *p = in + NPU_OFFSET(g, x, y, w, h);
                for (unsigned c = 0; c < rc; c++) {
-                  int tv = (int)(int8_t)((uint8_t)(p[c] + 0x80));
+                  int tv = (int)(uint8_t)(p[c] + 0x80);
                   float v = (tv - in_zp) * in_scale;
                   float e = expf(v - max_val);
                   exp_vals[idx++] = e;
@@ -344,12 +344,12 @@ static void exec_softmax(struct rnpu_model *m, struct rnpu_operation *op)
                for (unsigned c = 0; c < rc; c++) {
                   float prob = exp_vals[idx++] / sum;
                   int q = (int)roundf(prob / out_scale) + out_zp;
-                  if (q < -128) q = -128;
-                  if (q > 127) q = 127;
-                  p[c] = (uint8_t)((int8_t)q - 0x80);
+                  if (q < 0) q = 0;
+                  if (q > 255) q = 255;
+                  p[c] = (uint8_t)(q - 0x80);
                }
                for (unsigned c = rc; c < FEATURE_ATOMIC_SIZE; c++)
-                  p[c] = (uint8_t)((int8_t)out_zp - 0x80);
+                  p[c] = (uint8_t)(out_zp - 0x80);
             }
       }
    }
