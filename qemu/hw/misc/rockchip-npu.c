@@ -23,6 +23,7 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "hw/misc/rockchip-npu.h"
+#include "hw/misc/rockchip-iommu.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "system/address-spaces.h"
@@ -355,6 +356,12 @@ static int8_t read_weight(const uint8_t *weights, unsigned oc, unsigned ic,
 
 static hwaddr npu_iova_to_gpa(RockchipNPUState *s, uint32_t iova)
 {
+    /* In rknpu mode, use Rockchip IOMMU page table walk */
+    if (s->driver_mode == NPU_DRIVER_MODE_RKNPU && s->rk_iommu) {
+        return rk_iommu_translate(s->rk_iommu, iova);
+    }
+
+    /* Rocket mode: use mailbox-populated table */
     uint32_t page = iova & ~0xFFF;
     uint32_t offset = iova & 0xFFF;
 
@@ -966,9 +973,44 @@ static void execute_job(RockchipNPUState *s, RocketNPUCore *core,
  * MMIO read/write handlers
  * ====================================================================== */
 
+/*
+ * Check if an address falls within the embedded IOMMU region.
+ * In rknpu mode, IOMMU registers appear at offsets 0x9000 and 0xa000
+ * within the 0x10000 per-core region.
+ */
+static bool is_iommu_offset(hwaddr addr)
+{
+    return (addr >= 0x9000 && addr < 0x9100) ||
+           (addr >= 0xa000 && addr < 0xa100);
+}
+
+static unsigned iommu_instance_for_offset(hwaddr addr, unsigned core_id)
+{
+    /* Core 0: 0x9000 → instance 0, 0xa000 → instance 1
+     * Core 1: 0xa000 → instance 2
+     * Core 2: 0xa000 → instance 3
+     */
+    if (core_id == 0 && addr >= 0x9000 && addr < 0x9100) return 0;
+    if (core_id == 0 && addr >= 0xa000 && addr < 0xa100) return 1;
+    if (core_id == 1 && addr >= 0xa000 && addr < 0xa100) return 2;
+    if (core_id == 2 && addr >= 0xa000 && addr < 0xa100) return 3;
+    return 0;
+}
+
 static uint64_t rockchip_npu_read(void *opaque, hwaddr addr, unsigned size)
 {
     RocketNPUCore *core = opaque;
+    RockchipNPUState *s = container_of(core, RockchipNPUState,
+                                       cores[core->core_id]);
+
+    /* Forward IOMMU register reads in rknpu mode */
+    if (s->driver_mode == NPU_DRIVER_MODE_RKNPU && is_iommu_offset(addr)
+        && s->rk_iommu) {
+        unsigned inst = iommu_instance_for_offset(addr, core->core_id);
+        hwaddr iommu_reg = addr & 0xFF;
+        return rk_iommu_instance_read(&s->rk_iommu->instances[inst],
+                                       iommu_reg, size);
+    }
 
     switch (addr) {
     case REG_PC_VERSION:
@@ -993,7 +1035,7 @@ static uint64_t rockchip_npu_read(void *opaque, hwaddr addr, unsigned size)
         return 0; /* Tasks always complete immediately */
     default:
         /* Return stored register value or 0 */
-        if (addr < NPU_REGION_SIZE) {
+        if (addr < NPU_REGION_SIZE_RKNPU) {
             return core->regs[addr / 4];
         }
         return 0;
@@ -1006,6 +1048,16 @@ static void rockchip_npu_write(void *opaque, hwaddr addr, uint64_t val,
     RocketNPUCore *core = opaque;
     RockchipNPUState *s = container_of(core, RockchipNPUState,
                                        cores[core->core_id]);
+
+    /* Forward IOMMU register writes in rknpu mode */
+    if (s->driver_mode == NPU_DRIVER_MODE_RKNPU && is_iommu_offset(addr)
+        && s->rk_iommu) {
+        unsigned inst = iommu_instance_for_offset(addr, core->core_id);
+        hwaddr iommu_reg = addr & 0xFF;
+        rk_iommu_instance_write(&s->rk_iommu->instances[inst],
+                                 iommu_reg, val, size);
+        return;
+    }
 
     if (addr < 0x40) {
         qemu_log_mask(LOG_UNIMP,
@@ -1056,7 +1108,7 @@ static void rockchip_npu_write(void *opaque, hwaddr addr, uint64_t val,
 
     default:
         /* Store all register writes (may be read back by guest) */
-        if (addr < NPU_REGION_SIZE) {
+        if (addr < NPU_REGION_SIZE_RKNPU) {
             core->regs[addr / 4] = (uint32_t)val;
         }
         break;
@@ -1085,6 +1137,9 @@ static void rockchip_npu_realize(DeviceState *dev, Error **errp)
 
     s->dma_as = &address_space_memory;
 
+    uint64_t region_size = (s->driver_mode == NPU_DRIVER_MODE_RKNPU)
+                           ? NPU_REGION_SIZE_RKNPU : NPU_REGION_SIZE;
+
     for (int i = 0; i < s->num_cores; i++) {
         RocketNPUCore *core = &s->cores[i];
         core->core_id = i;
@@ -1092,15 +1147,17 @@ static void rockchip_npu_realize(DeviceState *dev, Error **errp)
 
         snprintf(name, sizeof(name), "rockchip-npu-core%d", i);
         memory_region_init_io(&core->iomem, OBJECT(dev), &rockchip_npu_ops,
-                              core, name, NPU_REGION_SIZE);
+                              core, name, region_size);
         sysbus_init_mmio(sbd, &core->iomem);
         sysbus_init_irq(sbd, &core->irq);
     }
 
-    /* IOMMU mailbox MMIO — kernel module writes IOVA→GPA mappings here */
-    memory_region_init_io(&s->iommu_mmio, OBJECT(dev), &npu_iommu_ops,
-                          s, "rockchip-npu-iommu", NPU_IOMMU_SIZE);
-    sysbus_init_mmio(sbd, &s->iommu_mmio);
+    /* IOMMU mailbox MMIO — only used in Rocket mode */
+    if (s->driver_mode == NPU_DRIVER_MODE_ROCKET) {
+        memory_region_init_io(&s->iommu_mmio, OBJECT(dev), &npu_iommu_ops,
+                              s, "rockchip-npu-iommu", NPU_IOMMU_SIZE);
+        sysbus_init_mmio(sbd, &s->iommu_mmio);
+    }
 }
 
 static void rockchip_npu_reset(DeviceState *dev)
@@ -1130,7 +1187,7 @@ static const VMStateDescription vmstate_rockchip_npu_core = {
         VMSTATE_UINT32(pc_irq_status, RocketNPUCore),
         VMSTATE_UINT32(pc_irq_raw_status, RocketNPUCore),
         VMSTATE_UINT32(pc_task_con, RocketNPUCore),
-        VMSTATE_UINT32_ARRAY(regs, RocketNPUCore, NPU_REGION_SIZE / 4),
+        VMSTATE_UINT32_ARRAY(regs, RocketNPUCore, NPU_REGION_SIZE_RKNPU / 4),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1148,6 +1205,7 @@ static const VMStateDescription vmstate_rockchip_npu = {
 
 static const Property rockchip_npu_properties[] = {
     DEFINE_PROP_UINT32("num-cores", RockchipNPUState, num_cores, 1),
+    DEFINE_PROP_UINT32("driver-mode", RockchipNPUState, driver_mode, 0),
 };
 
 static void rockchip_npu_class_init(ObjectClass *klass, const void *data)

@@ -33,8 +33,14 @@
 #define RK3588_NPU_CORE1_IRQ  111
 #define RK3588_NPU_CORE2_IRQ  112
 
-/* NPU IOMMU mailbox (QEMU-specific, for IOVA→GPA translation) */
+/* NPU IOMMU mailbox (QEMU-specific, for IOVA→GPA translation in Rocket mode) */
 #define NPU_IOMMU_BASE       0xfdaf0000ULL
+
+/* Rockchip IOMMU base addresses (vendor rknpu mode) */
+#define RK3588_NPU_IOMMU0_BASE  0xfdab9000ULL
+#define RK3588_NPU_IOMMU1_BASE  0xfdaba000ULL
+#define RK3588_NPU_IOMMU2_BASE  0xfdaca000ULL
+#define RK3588_NPU_IOMMU3_BASE  0xfdada000ULL
 
 /* High RAM (above 4GB) */
 #define RK3588_RAM_HIGH_BASE  0x100000000ULL

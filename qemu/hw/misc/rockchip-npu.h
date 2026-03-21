@@ -13,6 +13,9 @@
 #include "hw/sysbus.h"
 #include "qom/object.h"
 
+/* Forward declaration for Rockchip IOMMU (used in rknpu mode) */
+typedef struct RockchipIOMMUState RockchipIOMMUState;
+
 #define TYPE_ROCKCHIP_NPU "rockchip-npu"
 OBJECT_DECLARE_SIMPLE_TYPE(RockchipNPUState, ROCKCHIP_NPU)
 
@@ -28,7 +31,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RockchipNPUState, ROCKCHIP_NPU)
 #define NPU_CORE_OFFSET  0x3000  /* Core control */
 #define NPU_DPU_OFFSET   0x4000  /* Data Processing Unit */
 #define NPU_RDMA_OFFSET  0x5000  /* DPU Read DMA */
-#define NPU_REGION_SIZE  0x6000
+#define NPU_REGION_SIZE        0x6000
+#define NPU_REGION_SIZE_RKNPU  0x10000
 
 /* PC registers */
 #define REG_PC_VERSION           0x0000
@@ -225,8 +229,9 @@ typedef struct RocketNPUCore {
     uint32_t pc_irq_raw_status;
     uint32_t pc_task_con;
 
-    /* Shadow register file — written by regcmd or MMIO */
-    uint32_t regs[NPU_REGION_SIZE / 4];
+    /* Shadow register file — written by regcmd or MMIO.
+     * Sized for the larger region (rknpu mode = 0x10000). */
+    uint32_t regs[NPU_REGION_SIZE_RKNPU / 4];
 } RocketNPUCore;
 
 /*
@@ -241,10 +246,18 @@ typedef struct RocketIOMMUEntry {
     uint32_t phys;
 } RocketIOMMUEntry;
 
+/* Driver mode constants */
+#define NPU_DRIVER_MODE_ROCKET  0
+#define NPU_DRIVER_MODE_RKNPU   1
+
 struct RockchipNPUState {
     SysBusDevice parent_obj;
 
-    uint32_t num_cores;  /* configurable via property, default 1 */
+    uint32_t num_cores;    /* configurable via property, default 1 */
+    uint32_t driver_mode;  /* 0=rocket (upstream), 1=rknpu (vendor) */
+
+    /* Rockchip IOMMU state pointer (set by machine init in rknpu mode) */
+    RockchipIOMMUState *rk_iommu;
 
     RocketNPUCore cores[3];
 

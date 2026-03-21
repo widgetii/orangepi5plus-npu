@@ -1,0 +1,50 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+
+exec > /dev/ttyS0 2>&1
+
+echo ""
+echo "=== QEMU RK3588 Vendor Kernel Boot ==="
+echo "Kernel: $(uname -r)"
+
+# Load qemu_reset module if available
+if [ -f /lib/modules/qemu_reset.ko ]; then
+    echo "Loading qemu_reset.ko..."
+    insmod /lib/modules/qemu_reset.ko
+fi
+
+# Wait for deferred probes to complete (RKNPU takes ~15s)
+echo "Waiting for RKNPU driver probe..."
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if [ -e /dev/dri/card0 ]; then
+        echo "  /dev/dri/card0 found after ${i}s"
+        break
+    fi
+    sleep 1
+done
+
+echo ""
+echo "=== Checking RKNPU driver ==="
+dmesg | grep -i rknpu | head -10
+echo ""
+
+echo "=== Checking IOMMU ==="
+dmesg | grep -iE 'rockchip.*iommu|iommu.*group|iommu.*fdab' | head -10
+echo ""
+
+echo "=== Checking DRM devices ==="
+ls -la /dev/dri/ 2>/dev/null || echo "No /dev/dri/"
+echo ""
+
+# Run test if available
+if [ -f /bin/rknpu_test ]; then
+    echo "=== Running RKNPU test ==="
+    /bin/rknpu_test
+    echo "Test exit code: $?"
+fi
+
+echo ""
+echo "--- QEMU RKNPU TEST COMPLETE ---"
+exec /bin/sh < /dev/ttyS0
