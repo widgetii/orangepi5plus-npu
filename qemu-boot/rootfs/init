@@ -12,7 +12,13 @@ insmod /lib/modules/gpu-sched.ko
 insmod /lib/modules/rocket.ko
 
 echo "Waiting for device..."
-sleep 1
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if [ -e /dev/accel/accel0 ]; then
+        echo "  /dev/accel/accel0 found after ${i}s"
+        break
+    fi
+    sleep 1
+done
 ls -la /dev/accel/ 2>/dev/null
 
 echo "Running NPU test..."

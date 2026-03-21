@@ -1,5 +1,5 @@
 /*
- * Rockchip RK3588 Rocket NPU device model
+ * Rockchip RK3588 NPU device model
  *
  * Emulates 3 NPU cores with MMIO register interface, regcmd parser,
  * and software INT8 convolution engine for CI testing.
@@ -13,26 +13,24 @@
 #include "hw/sysbus.h"
 #include "qom/object.h"
 
-/* Forward declaration for Rockchip IOMMU (used in rknpu mode) */
 typedef struct RockchipIOMMUState RockchipIOMMUState;
 
 #define TYPE_ROCKCHIP_NPU "rockchip-npu"
 OBJECT_DECLARE_SIMPLE_TYPE(RockchipNPUState, ROCKCHIP_NPU)
 
-/* Hardware constants from the Rocket driver */
+/* Hardware constants */
 #define NPU_FEATURE_ATOMIC_SIZE  16
 #define NPU_WEIGHT_ATOMIC_SIZE   32
 #define NPU_ATOMIC_K_SIZE        16
 #define NPU_MAX_REGCMD_ENTRIES   512
 
-/* MMIO region sizes within each core */
+/* MMIO region sizes — 0x10000 per core (matches real hardware) */
 #define NPU_PC_OFFSET    0x0000  /* Program Controller */
 #define NPU_CNA_OFFSET   0x1000  /* Convolution engine */
 #define NPU_CORE_OFFSET  0x3000  /* Core control */
 #define NPU_DPU_OFFSET   0x4000  /* Data Processing Unit */
 #define NPU_RDMA_OFFSET  0x5000  /* DPU Read DMA */
-#define NPU_REGION_SIZE        0x6000
-#define NPU_REGION_SIZE_RKNPU  0x10000
+#define NPU_REGION_SIZE  0x10000
 
 /* PC registers */
 #define REG_PC_VERSION           0x0000
@@ -129,27 +127,27 @@ OBJECT_DECLARE_SIMPLE_TYPE(RockchipNPUState, ROCKCHIP_NPU)
 /* Parsed convolution task state from regcmd */
 typedef struct RocketConvTask {
     /* Input */
-    uint32_t src_addr;         /* DMA address of input tensor */
-    uint32_t input_width;      /* DATAIN_WIDTH field */
-    uint32_t input_height;     /* DATAIN_HEIGHT field */
-    uint32_t input_channels;   /* DATAIN_CHANNEL field (padded to 16) */
-    uint32_t input_channels_real; /* DATAIN_CHANNEL_REAL field */
+    uint32_t src_addr;
+    uint32_t input_width;
+    uint32_t input_height;
+    uint32_t input_channels;
+    uint32_t input_channels_real;
     uint32_t input_line_stride;
     uint32_t input_surface_stride;
 
     /* Weights */
-    uint32_t weight_addr;      /* DMA address of weight buffer */
-    uint32_t weight_width;     /* Filter kernel width */
-    uint32_t weight_height;    /* Filter kernel height */
-    uint32_t weight_kernels;   /* Number of output kernels (output channels) */
-    uint32_t weight_size0;     /* Total weight elements */
-    uint32_t weight_size1;     /* Weight elements per kernel */
+    uint32_t weight_addr;
+    uint32_t weight_width;
+    uint32_t weight_height;
+    uint32_t weight_kernels;
+    uint32_t weight_size0;
+    uint32_t weight_size1;
 
     /* Output */
-    uint32_t dst_addr;         /* DMA address of output tensor */
-    uint32_t output_width;     /* DATAOUT_WIDTH */
-    uint32_t output_height;    /* DATAOUT_HEIGHT */
-    uint32_t output_channels;  /* DATAOUT_CHANNEL */
+    uint32_t dst_addr;
+    uint32_t output_width;
+    uint32_t output_height;
+    uint32_t output_channels;
     uint32_t output_channels_real;
     uint32_t output_surface_stride;
 
@@ -158,8 +156,8 @@ typedef struct RocketConvTask {
     uint32_t stride_y;
     uint32_t pad_left;
     uint32_t pad_top;
-    int32_t  pad_value;        /* Padding fill value (from PAD_CON1) */
-    bool     depthwise;        /* CONV_MODE == 3 */
+    int32_t  pad_value;
+    bool     depthwise;
 
     /* Quantization */
     uint32_t out_cvt_offset;
@@ -168,27 +166,27 @@ typedef struct RocketConvTask {
     uint32_t truncate_bits;
 
     /* BS (Bias/Scale) stage */
-    uint32_t bias_addr;        /* DMA address of bias buffer */
-    uint32_t bs_cfg;           /* BS stage config */
-    int32_t  bs_alu_cfg;       /* BS ALU config (per-channel bias) */
-    uint32_t bs_mul_cfg;       /* BS MUL config (operand[31:16], shift[13:8], src[0]) */
-    uint32_t bs_relux_cmp;     /* BS ReLUx compare value */
-    uint32_t bs_ow_op;         /* Weight zero point offset */
-    uint32_t brdma_cfg;        /* Bias RDMA config */
+    uint32_t bias_addr;
+    uint32_t bs_cfg;
+    int32_t  bs_alu_cfg;
+    uint32_t bs_mul_cfg;
+    uint32_t bs_relux_cmp;
+    uint32_t bs_ow_op;
+    uint32_t brdma_cfg;
 
     /* BN (Batch Norm) stage */
-    uint32_t bn_cfg;           /* BN stage config */
-    int32_t  bn_alu_cfg;       /* BN ALU operand */
-    uint32_t bn_mul_cfg;       /* BN MUL config */
-    uint32_t bn_relux_cmp;     /* BN ReLUx compare value */
+    uint32_t bn_cfg;
+    int32_t  bn_alu_cfg;
+    uint32_t bn_mul_cfg;
+    uint32_t bn_relux_cmp;
 
     /* EW (Element-Wise) stage */
-    uint32_t ew_cfg;           /* EW stage config */
-    int32_t  ew_cvt_offset;    /* EW conversion offset */
-    uint32_t ew_cvt_scale;     /* EW conversion scale + shift + truncate */
-    uint32_t erdma_cfg;        /* ERDMA config */
-    uint32_t ew_base_addr;     /* ERDMA source base address */
-    uint32_t ew_surf_stride;   /* ERDMA surface stride */
+    uint32_t ew_cfg;
+    int32_t  ew_cvt_offset;
+    uint32_t ew_cvt_scale;
+    uint32_t erdma_cfg;
+    uint32_t ew_base_addr;
+    uint32_t ew_surf_stride;
 
     /* Data format */
     uint32_t data_format;
@@ -229,56 +227,28 @@ typedef struct RocketNPUCore {
     uint32_t pc_irq_raw_status;
     uint32_t pc_task_con;
 
-    /* Shadow register file — written by regcmd or MMIO.
-     * Sized for the larger region (rknpu mode = 0x10000). */
-    uint32_t regs[NPU_REGION_SIZE_RKNPU / 4];
+    /* Shadow register file — written by regcmd or MMIO */
+    uint32_t regs[NPU_REGION_SIZE / 4];
 } RocketNPUCore;
-
-/*
- * IOMMU page table entry for IOVA→GPA translation.
- * The kernel IOMMU module writes mappings via a mailbox MMIO region,
- * and the NPU model uses them to resolve DMA addresses in regcmds.
- */
-#define NPU_IOMMU_MAX_PAGES 4096
-
-typedef struct RocketIOMMUEntry {
-    uint32_t iova;
-    uint32_t phys;
-} RocketIOMMUEntry;
-
-/* Driver mode constants */
-#define NPU_DRIVER_MODE_ROCKET  0
-#define NPU_DRIVER_MODE_RKNPU   1
 
 struct RockchipNPUState {
     SysBusDevice parent_obj;
 
-    uint32_t num_cores;    /* configurable via property, default 1 */
-    uint32_t driver_mode;  /* 0=rocket (upstream), 1=rknpu (vendor) */
+    uint32_t num_cores;
 
-    /* Rockchip IOMMU state pointer (set by machine init in rknpu mode) */
+    /* Rockchip IOMMU for IOVA→GPA translation (set by machine init) */
     RockchipIOMMUState *rk_iommu;
 
     RocketNPUCore cores[3];
 
     /* Guest physical address space for DMA reads/writes */
     AddressSpace *dma_as;
-
-    /* IOVA→GPA translation table (written by kernel IOMMU module) */
-    RocketIOMMUEntry iommu_table[NPU_IOMMU_MAX_PAGES];
-    uint32_t iommu_entry_count;
-
-    /* Mailbox registers for IOMMU map/unmap from kernel module */
-    MemoryRegion iommu_mmio;
-    uint32_t iommu_iova;    /* written first */
-    uint32_t iommu_phys;    /* written second, triggers add */
 };
 
-/* NPU tensor offset macros matching Mesa/librocketnpu */
+/* NPU tensor offset macros */
 static inline uint32_t npu_input_offset(uint32_t g, uint32_t x, uint32_t y,
                                          uint32_t w, uint32_t h)
 {
-    /* x-major interleaved: [group][x][y][c16] */
     return g * w * h * NPU_FEATURE_ATOMIC_SIZE +
            x * h * NPU_FEATURE_ATOMIC_SIZE +
            y * NPU_FEATURE_ATOMIC_SIZE;
@@ -287,7 +257,6 @@ static inline uint32_t npu_input_offset(uint32_t g, uint32_t x, uint32_t y,
 static inline uint32_t npu_output_offset(uint32_t g, uint32_t y, uint32_t x,
                                           uint32_t w, uint32_t h)
 {
-    /* y-major interleaved: [group][y][x][c16] — NPU DPU output order */
     return g * w * h * NPU_FEATURE_ATOMIC_SIZE +
            y * w * NPU_FEATURE_ATOMIC_SIZE +
            x * NPU_FEATURE_ATOMIC_SIZE;

@@ -97,13 +97,6 @@ hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova)
  * MMIO read/write handlers (per-instance)
  * ====================================================================== */
 
-typedef struct {
-    RockchipIOMMUState *parent;
-    unsigned idx;
-} RkIOMMUInstanceOpaque;
-
-/* We embed the instance index in the opaque pointer via container_of */
-
 uint64_t rk_iommu_instance_read(RkIOMMUInstance *inst, hwaddr addr,
                                  unsigned size)
 {
