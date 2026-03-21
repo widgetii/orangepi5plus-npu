@@ -644,6 +644,11 @@ static int run_conv_test(int fd, const char *name,
         printf("  %s: FAIL (BO creation)\n", name);
         return 0;
     }
+    /* Remove BO address debug print (uncomment for debugging)
+    printf("  %s: BOs in=0x%x out=0x%x wt=0x%x bias=0x%x regcmd=0x%x\n",
+           name, (unsigned)in_dma, (unsigned)out_dma, (unsigned)wt_dma,
+           (unsigned)bias_dma, (unsigned)regcmd_dma);
+    */
 
     /* Map BOs */
     uint8_t *in_map = mmap(NULL, in_alloc, PROT_READ|PROT_WRITE, MAP_SHARED, fd, in_off);
@@ -688,7 +693,7 @@ static int run_conv_test(int fd, const char *name,
     fini.handle = bias_h_bo; ioctl(fd, DRM_IOCTL_ROCKET_FINI_BO, &fini);
     fini.handle = regcmd_h_bo; ioctl(fd, DRM_IOCTL_ROCKET_FINI_BO, &fini);
 
-    /* Submit */
+    /* Submit — regcmd is the DMA address of the regcmd BO */
     struct drm_rocket_task task = {
         .regcmd = (uint32_t)regcmd_dma,
         .regcmd_count = regcmd_count * 2,
@@ -765,6 +770,18 @@ cleanup:
     munmap(wt_map, wt_alloc);
     munmap((void *)bias_map, bias_alloc);
     munmap((void *)regcmd_map, regcmd_alloc);
+
+    /* Close GEM handles so IOVAs are freed for reuse by the next test.
+     * Without this, CREATE_BO.dma_address doesn't match the runtime IOVA
+     * because the IOMMU domain recycles IOVAs from unpinned-but-open BOs. */
+    {
+        struct drm_gem_close cl = { .pad = 0 };
+        uint32_t handles[] = { in_h_bo, out_h_bo, wt_h_bo, bias_h_bo, regcmd_h_bo };
+        for (int i = 0; i < 5; i++) {
+            cl.handle = handles[i];
+            ioctl(fd, DRM_IOCTL_GEM_CLOSE, &cl);
+        }
+    }
 
     return pass;
 }
@@ -1021,14 +1038,26 @@ int main(void)
     int passed = 0;
     int total = 6;
 
-    passed += test_matmul_small(fd);
-    passed += test_matmul_medium(fd);
-    passed += test_conv3x3_stride2(fd);
-    passed += test_depthwise3x3(fd);
-    passed += test_bias_dma(fd);
-    passed += test_bn_relu(fd);
-
+    /*
+     * Each test opens a fresh fd to get its own IOMMU domain.
+     * This ensures CREATE_BO.dma_address matches the runtime IOVA
+     * (no stale mappings from previous tests' unpinned BOs).
+     */
     close(fd);
+
+    int (*tests[])(int) = {
+        test_matmul_small, test_matmul_medium, test_conv3x3_stride2,
+        test_depthwise3x3, test_bias_dma, test_bn_relu,
+    };
+    for (int i = 0; i < total; i++) {
+        fd = open("/dev/accel/accel0", O_RDWR);
+        if (fd < 0) {
+            perror("open /dev/accel/accel0");
+            break;
+        }
+        passed += tests[i](fd);
+        close(fd);
+    }
 
     printf("=== CONV TESTS: %d/%d passed ===\n", passed, total);
     return (passed == total) ? 0 : 1;

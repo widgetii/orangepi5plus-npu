@@ -64,7 +64,7 @@ hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova)
      */
     uint32_t dte_addr = 0;
     for (int i = RK_IOMMU_NUM_INSTANCES - 1; i >= 0; i--) {
-        if (s->instances[i].paging_enabled && s->instances[i].active_dte_addr) {
+        if (s->instances[i].active_dte_addr) {
             dte_addr = s->instances[i].active_dte_addr;
             break;
         }
@@ -172,7 +172,10 @@ void rk_iommu_instance_write(RkIOMMUInstance *inst, hwaddr addr,
             break;
         case RK_IOMMU_CMD_DISABLE_PAGING:
             inst->paging_enabled = false;
-            inst->active_dte_addr = 0;
+            /* Keep active_dte_addr — the page table is still valid in memory.
+             * The kernel transiently disables paging during domain switches
+             * (stall → disable → update DTE → enable). Clearing here would
+             * cause DMA between disable and re-enable to use identity mapping. */
             inst->status &= ~RK_IOMMU_STATUS_PAGING_ENABLED;
             break;
         case RK_IOMMU_CMD_ENABLE_STALL:

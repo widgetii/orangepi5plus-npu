@@ -314,10 +314,22 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
                      &iommu_ref, sizeof(iommu_ref));
 
     /*
-     * Per-core NPU nodes for upstream Rocket driver.
-     * References the Rockchip IOMMU — with iommu.passthrough=1, the kernel
-     * uses identity mapping (no page table walk needed).
+     * Per-core NPU nodes for the upstream Rocket driver.
+     *
+     * These use the same MMIO addresses as the rknpu node above but with
+     * smaller sub-regions (pc/cna/core). The rknpu node is disabled here
+     * (status=disabled) so that only one set of nodes is active at a time:
+     * - Default DTB: rknpu node disabled, per-core nodes active → Rocket
+     * - Vendor kernel: pass -dtb with only the rknpu node (or rknpu driver
+     *   matches first and ignores the per-core nodes)
+     *
+     * On the real RK3588, the upstream DTS has only per-core nodes and the
+     * vendor DTS has only the single rknpu node — they never coexist.
+     * We include both but disable the rknpu node by default since the
+     * Rocket driver needs reg-names and per-core IOMMU groups.
      */
+    qemu_fdt_setprop_string(fdt, "/npu@fdab0000", "status", "disabled");
+
     for (int i = 0; i < RK3588_NPU_NUM_CORES; i++) {
         snprintf(node, sizeof(node), "/npu-core@%" PRIx64,
                  (uint64_t)npu_bases[i]);
