@@ -59,7 +59,8 @@ static uint32_t fb_vec_len(const uint8_t *b, uint32_t vec) {
 #define OPT_DEPTHWISE_CONV2D      2
 #define OPT_CONCATENATION         3
 #define OPT_ADD                   18
-#define OPT_POOL2D                22
+#define OPT_POOL2D                5
+#define OPT_POOL2D_COMPAT         22
 #define OPT_PAD                   28
 #define OPT_RESIZE_NEAREST        42
 
@@ -208,7 +209,7 @@ static int parse_operator(const uint8_t *b, uint32_t otable,
       switch (ot_type) {
       case OPT_CONV2D: parse_conv_options(b, ot, op); break;
       case OPT_DEPTHWISE_CONV2D: parse_dw_conv_options(b, ot, op); break;
-      case OPT_POOL2D: parse_pool_options(b, ot, op); break;
+      case OPT_POOL2D: case OPT_POOL2D_COMPAT: parse_pool_options(b, ot, op); break;
       case OPT_CONCATENATION: parse_concat_options(b, ot, op); break;
       default: break;
       }
