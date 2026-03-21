@@ -19,6 +19,10 @@ echo "Running NPU test..."
 /bin/npu_test
 echo "Test exit code: $?"
 
+echo "Running conv test suite..."
+/bin/npu_conv_tests
+echo "Conv tests exit code: $?"
+
 echo "Running MobileNetV1..."
 /bin/test_mobilenet /model.tflite 1 /golden.bin
 echo "MobileNetV1 exit code: $?"
