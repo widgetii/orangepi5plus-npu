@@ -114,7 +114,7 @@ static void parse_regcmd_entry(RocketConvTask *task, uint64_t entry)
         task->pad_top = val & 0xf;
         task->pad_left = (val >> 4) & 0xf;
         break;
-    case 0x106c: /* CNA_PAD_CON1 */
+    case 0x1184: /* CNA_PAD_CON1 */
         task->pad_value = (int32_t)val;
         break;
     case 0x107c: /* CNA_DMA_CON1: LINE_STRIDE[27:0] */
@@ -211,20 +211,44 @@ static void parse_regcmd_entry(RocketConvTask *task, uint64_t entry)
         task->out_cvt_shift = val & 0xfff;
         break;
 
-    /* DPU: Data format */
-    case 0x4014: /* DPU_DATA_FORMAT */
+    /* DPU: Data format and additional parsed registers */
+    case 0x400c: /* DPU_FEATURE_MODE_CFG */
+        task->feature_mode_cfg = val;
+        break;
+    case 0x4010: /* DPU_DATA_FORMAT */
         task->data_format = val;
         break;
-    case 0x40b0: /* DPU_SURFACE_ADD */
+    case 0x4050: /* DPU_BS_OW_CFG */
+        task->bs_ow_cfg = val;
+        break;
+    case 0x4058: /* DPU_WDMA_SIZE_0 */
+        task->wdma_size_0 = val;
+        break;
+    case 0x405c: /* DPU_WDMA_SIZE_1 */
+        task->wdma_size_1 = val;
+        break;
+    case 0x407c: /* DPU_EW_RELUX_CMP */
+        task->ew_relux_cmp = val;
+        break;
+    case 0x40c0: /* DPU_SURFACE_ADD */
         task->surface_add = val & 0xfffff;
         break;
 
-    /* RDMA: Bias DMA */
+    /* RDMA: DMA config */
+    case 0x5018: /* RDMA_SRC_BASE_ADDR */
+        task->rdma_src_base_addr = val;
+        break;
     case 0x501c: /* RDMA_BRDMA_CFG */
         task->brdma_cfg = val;
         break;
     case 0x5020: /* RDMA_BS_BASE_ADDR */
         task->bias_addr = val;
+        break;
+    case 0x5028: /* RDMA_NRDMA_CFG */
+        task->nrdma_cfg = val;
+        break;
+    case 0x502c: /* RDMA_BN_BASE_ADDR */
+        task->bn_base_addr = val;
         break;
     case 0x5034: /* RDMA_ERDMA_CFG */
         task->erdma_cfg = val;
@@ -234,6 +258,12 @@ static void parse_regcmd_entry(RocketConvTask *task, uint64_t entry)
         break;
     case 0x5040: /* RDMA_EW_SURF_STRIDE */
         task->ew_surf_stride = (val >> 4) & 0x0fffffff;
+        break;
+    case 0x5044: /* RDMA_FEATURE_MODE_CFG */
+        task->rdma_feat_mode_cfg = val;
+        break;
+    case 0x5068: /* RDMA_WEIGHT */
+        task->rdma_weight = val;
         break;
 
     /* Task chaining (last entries of regcmd) */
@@ -777,9 +807,16 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                         acc = (int32_t)nvdla_truncate(acc, ew_trunc);
                     }
 
-                    /* EW ReLU */
+                    /* EW ReLU / ReLUx */
                     if (!((task->ew_cfg >> 9) & 1)) { /* EW_RELU_BYPASS */
-                        if (acc < 0) acc = 0;
+                        bool ew_relux_en = (task->ew_cfg >> 10) & 1;
+                        if (ew_relux_en) {
+                            if (acc < 0) acc = 0;
+                            if (acc > (int32_t)task->ew_relux_cmp)
+                                acc = (int32_t)task->ew_relux_cmp;
+                        } else {
+                            if (acc < 0) acc = 0;
+                        }
                     }
                 }
 
@@ -814,8 +851,20 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
         }
     }
 
-    /* Write output tensor to guest memory (via IOVA translation) */
-    npu_dma_write(s, task->dst_addr, out_buf, out_buf_size);
+    /* Write output tensor to guest memory (via IOVA translation).
+     * When output_surface_stride is set, write each group as a separate
+     * DMA chunk with stride between groups (sparse output layout from
+     * per-channel group decomposition).
+     */
+    if (task->output_surface_stride > 0 && out_groups > 1) {
+        uint32_t group_size = out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
+        for (uint32_t g = 0; g < out_groups; g++) {
+            uint32_t dst = task->dst_addr + g * task->output_surface_stride;
+            npu_dma_write(s, dst, out_buf + g * group_size, group_size);
+        }
+    } else {
+        npu_dma_write(s, task->dst_addr, out_buf, out_buf_size);
+    }
 
     g_free(in_buf);
     g_free(wt_buf);

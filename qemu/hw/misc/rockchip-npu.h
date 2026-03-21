@@ -54,7 +54,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RockchipNPUState, ROCKCHIP_NPU)
 #define CNA_WEIGHT_SIZE1  0x1034
 #define CNA_WEIGHT_SIZE2  0x1038
 #define CNA_PAD_CON0      0x1068
-#define CNA_PAD_CON1      0x106c
+#define CNA_PAD_CON1      0x1184
 #define CNA_FEAT_ADDR     0x1070
 #define CNA_DCOMP_ADDR0   0x1110
 
@@ -65,8 +65,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RockchipNPUState, ROCKCHIP_NPU)
 #define CORE_CLIP_TRUNCATE 0x301c
 
 /* DPU registers */
-#define DPU_FEAT_MODE_CFG    0x4010
-#define DPU_DATA_FORMAT      0x4014
+#define DPU_FEAT_MODE_CFG    0x400c
+#define DPU_DATA_FORMAT      0x4010
 #define DPU_DST_BASE_ADDR    0x4020
 #define DPU_DST_SURF_STRIDE  0x4024
 #define DPU_DATA_CUBE_WIDTH  0x4030
@@ -87,14 +87,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(RockchipNPUState, ROCKCHIP_NPU)
 #define DPU_OUT_CVT_OFFSET   0x4080
 #define DPU_OUT_CVT_SCALE    0x4084
 #define DPU_OUT_CVT_SHIFT    0x4088
-#define DPU_SURFACE_ADD      0x40b0
+#define DPU_BS_OW_CFG        0x4050
+#define DPU_WDMA_SIZE_0      0x4058
+#define DPU_WDMA_SIZE_1      0x405c
+#define DPU_EW_RELUX_CMP     0x407c
+#define DPU_SURFACE_ADD      0x40c0
 
 /* RDMA registers */
+#define RDMA_SRC_BASE_ADDR  0x5018
 #define RDMA_BRDMA_CFG      0x501c
 #define RDMA_BS_BASE_ADDR   0x5020
+#define RDMA_NRDMA_CFG      0x5028
+#define RDMA_BN_BASE_ADDR   0x502c
 #define RDMA_ERDMA_CFG      0x5034
 #define RDMA_EW_BASE_ADDR   0x5038
 #define RDMA_EW_SURF_STRIDE 0x5040
+#define RDMA_FEAT_MODE_CFG  0x5044
+#define RDMA_WEIGHT         0x5068
 
 /* Regcmd format: 64-bit packed entry
  * bits [15:0]  = register offset
@@ -180,6 +189,18 @@ typedef struct RocketConvTask {
     /* Data format */
     uint32_t data_format;
     uint32_t surface_add;
+    uint32_t feature_mode_cfg;
+    uint32_t bs_ow_cfg;
+    uint32_t wdma_size_0;
+    uint32_t wdma_size_1;
+    uint32_t ew_relux_cmp;
+
+    /* RDMA additional */
+    uint32_t rdma_src_base_addr;
+    uint32_t nrdma_cfg;
+    uint32_t bn_base_addr;
+    uint32_t rdma_feat_mode_cfg;
+    uint32_t rdma_weight;
 
     /* CNA input conversion */
     uint32_t conv_con1;

@@ -4,7 +4,7 @@
 
 A QEMU machine type (`orangepi5plus`) that emulates the RK3588 SoC with a software Rocket NPU model. Boots mainline Linux 6.18+ kernels, probes the upstream Rocket DRM/accel driver, and executes INT8 convolution jobs entirely in software. Enables CI testing of the kernel driver and Mesa/libteflon/librocketnpu userspace without physical hardware.
 
-Built against QEMU v10.2.0. Total implementation: ~2400 lines across 13 files.
+Built against QEMU v10.2.0. Total implementation: ~2700 lines across 13 files.
 
 ## Architecture
 
@@ -44,12 +44,12 @@ Built against QEMU v10.2.0. Total implementation: ~2400 lines across 13 files.
 | File | Lines | Role |
 |------|-------|------|
 | `hw/arm/rk3588.c` | 401 | Machine type: CPUs, GICv3, UART, DTB generation, device wiring |
-| `hw/misc/rockchip-npu.c` | 885 | NPU device: MMIO handlers, regcmd parser, INT8 conv engine, IOMMU mailbox |
-| `hw/misc/rockchip-npu.h` | 230 | NPU register offsets, RocketConvTask struct, tensor offset macros |
+| `hw/misc/rockchip-npu.c` | 1171 | NPU device: MMIO handlers, regcmd parser, INT8 conv engine, SDP pipeline, IOMMU mailbox |
+| `hw/misc/rockchip-npu.h` | 281 | NPU register offsets, RocketConvTask struct, tensor offset macros |
 | `include/hw/arm/rk3588.h` | 42 | Memory map constants, IRQ numbers |
 | `qemu_iommu.c` | 205 | Kernel module: dummy IOMMU with MMIO mailbox for IOVA→GPA forwarding |
 | `qemu_reset.c` | 40 | Kernel module: dummy reset controller |
-| `tests/npu_test.c` | 412 | Userspace test: CREATE_BO, fill regcmd, SUBMIT, verify output |
+| `tests/npu_test.c` | 444 | Userspace test: CREATE_BO, fill regcmd, SUBMIT, verify output |
 | `hw/arm/Kconfig.rk3588` | 10 | Kconfig additions for ORANGEPI5PLUS |
 | `hw/misc/Kconfig.rockchip_npu` | 3 | Kconfig additions for ROCKCHIP_NPU |
 
@@ -179,6 +179,7 @@ The last 4 entries of each task are: chain pointer (PC_BASE_ADDRESS), chain coun
 - `WEIGHT_SIZE2` (0x1038): KERNELS[13:0], HEIGHT[20:16], WIDTH[28:24]
 - `CONV_CON3` (0x1014): STRIDE_X[2:0], STRIDE_Y[5:3]
 - `PAD_CON0` (0x1068): PAD_TOP[3:0], PAD_LEFT[7:4]
+- `PAD_CON1` (0x1184): pad_value (signed int8 in lowest byte)
 
 **CORE/DPU registers store COUNT-1**:
 - `DATAOUT_SIZE_0` (0x3014): WIDTH[15:0]+1, HEIGHT[31:16]+1
@@ -187,25 +188,38 @@ The last 4 entries of each task are: chain pointer (PC_BASE_ADDRESS), chain coun
 
 **DPU DST_SURF_STRIDE** (0x4024): value shifted left by 4 in register, parser shifts right.
 
+**DPU additional parsed registers** (stored in RocketConvTask for future use):
+- `FEATURE_MODE_CFG` (0x400c): OUTPUT_MODE, BURST_LEN, CONV_MODE mirror
+- `DATA_FORMAT` (0x4010): BS_MUL_SHIFT_VALUE_NEG bits
+- `BS_OW_CFG` (0x4050): SIZE_E field (3 for depthwise, 1 for standard)
+- `WDMA_SIZE_0` (0x4058), `WDMA_SIZE_1` (0x405c): output DMA channel counts
+- `EW_RELUX_CMP` (0x407c): EW ReLUx clamp value
+- `SURFACE_ADD` (0x40c0): surfaces per row for output addressing
+
+**RDMA additional parsed registers**:
+- `SRC_BASE_ADDR` (0x5018), `NRDMA_CFG` (0x5028), `BN_BASE_ADDR` (0x502c)
+- `FEATURE_MODE_CFG` (0x5044), `WEIGHT` (0x5068)
+
 ### INT8 Convolution Engine
 
 ```c
 for (oy = 0..out_h)
   for (ox = 0..out_w)
     for (oc = 0..out_c)
-      acc = bias[oc]
-      for (ky = 0..filt_h)
-        for (kx = 0..filt_w)
-          for (ic = 0..in_c)  // or ic=oc for depthwise
-            in_val = read from x-major interleaved input
-            w_val = read from packed weight buffer
-            acc += in_val * w_val
-      // Truncation
-      acc = (acc + half) >> truncate_bits
-      // Requantization
-      result = (acc * out_cvt_scale + rounding) >> out_cvt_shift + offset
-      // Clamp and write to y-major interleaved output
-      output[og][oy][ox][oc%16] = clamp(result, -128, 127)
+      // CACC: accumulate
+      acc = 0
+      for (ky, kx, ic): acc += in_val * w_val
+      // CACC truncation (NVDLA round-half-to-even)
+      acc = nvdla_truncate(acc, truncate_bits)
+      // SDP BS stage: ALU(bias) → MUL → ReLU/ReLUx
+      acc = apply_sdp_x_stage(acc, bs_cfg, bias[oc], bs_mul_cfg, bs_relux_cmp)
+      // SDP BN stage: ALU → MUL → ReLU/ReLUx
+      acc = apply_sdp_x_stage(acc, bn_cfg, bn_alu_cfg, bn_mul_cfg, bn_relux_cmp)
+      // SDP EW stage: element-wise ALU(max/min/add) → CVT → ReLU/ReLUx
+      if (!ew_bypass): acc = ew_alu(acc, ew_src[oc]) → ew_cvt → ew_relu
+      // OUT_CVT: requantization (NVDLA 64-bit shift-right rounding)
+      result = clamp((acc * scale) >> shift + offset, -128, 127)
+      output[og][oy][ox][oc%16] = result
 ```
 
 **Tensor layouts** (must match NPU hardware exactly):
@@ -392,7 +406,7 @@ The kernel encodes the regcmd entry count as `PC_DATA_AMOUNT = (regcmd_count + 1
 
 2. **Per-channel quantization**: The convolution engine supports per-channel mode (RKNN-style BS bypass with `BS_CFG=0x13F`, bias from `BS_ALU_CFG` register, `BN_CFG=0x12` for ReLU). Not yet tested end-to-end in QEMU.
 
-3. **Addition/element-wise ops**: The EW (element-wise) stage is parsed but not executed. ADD operations (used in MobileNetV2 residual connections) will produce incorrect results.
+3. **BN per-channel DMA**: The BN stage supports scalar ALU/MUL operands from registers but not DMA-sourced per-channel operands via NRDMA. RKNN uses per-channel BN for ReLU — not needed for Mesa/librocketnpu workloads.
 
 4. **No virtio-blk**: The machine doesn't add virtio devices. For rootfs, use initramfs or add virtio-mmio support.
 

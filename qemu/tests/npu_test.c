@@ -151,7 +151,7 @@ static unsigned build_regcmd(uint64_t *buf, uint32_t in_addr, uint32_t wt_addr,
         *p++ = emit(TARGET_CNA, 0x1114 + i * 4, 0);
 
     *p++ = emit(TARGET_CNA, 0x10a0, 0);           /* CVT_CON5 */
-    *p++ = emit(TARGET_CNA, 0x106c, 0xffffff80);  /* PAD_CON1: pad_value */
+    *p++ = emit(TARGET_CNA, 0x1184, 0xffffff80);  /* PAD_CON1: pad_value */
 
     /* CORE registers */
     *p++ = emit(TARGET_CORE, 0x3010, 0x00000001);  /* MISC_CFG: QD_EN=1 */
@@ -161,9 +161,9 @@ static unsigned build_regcmd(uint64_t *buf, uint32_t in_addr, uint32_t wt_addr,
     *p++ = emit(0x0801, 0x3030, 0);                /* raw CORE reg */
 
     /* DPU registers */
-    *p++ = emit(TARGET_DPU, 0x4010, 0x0000020f);  /* FEAT_MODE_CFG: burst=15, out_mode=2 */
-    *p++ = emit(TARGET_DPU, 0x4014, 0);           /* DATA_FORMAT */
-    *p++ = emit(TARGET_DPU, 0x4018, 0);           /* OFFSET_PEND */
+    *p++ = emit(TARGET_DPU, 0x400c, 0x0000020f);  /* FEAT_MODE_CFG: burst=15, out_mode=2 */
+    *p++ = emit(TARGET_DPU, 0x4010, 0);           /* DATA_FORMAT */
+    *p++ = emit(TARGET_DPU, 0x4014, 0);           /* OFFSET_PEND */
 
     /* Output DMA address */
     *p++ = emit(TARGET_DPU, 0x4020, out_addr);
@@ -205,7 +205,7 @@ static unsigned build_regcmd(uint64_t *buf, uint32_t in_addr, uint32_t wt_addr,
     for (int i = 0; i < 8; i++)
         *p++ = emit(TARGET_DPU, 0x4090 + i * 4, 0);
 
-    *p++ = emit(TARGET_DPU, 0x40b0, 1);           /* SURFACE_ADD */
+    *p++ = emit(TARGET_DPU, 0x40c0, 1);           /* SURFACE_ADD */
     *p++ = emit(0x1001, 0x40c4, 0);               /* raw DPU reg */
 
     /* LUT registers (all zero) */

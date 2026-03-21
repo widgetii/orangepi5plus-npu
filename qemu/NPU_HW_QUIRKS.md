@@ -114,7 +114,29 @@ unsigned scale = ((sb >> 9) & 0x7fff) + 1;
 if (scale < (1 << 14)) scale |= (1 << 14);
 ```
 
-## 8. Depthwise Convolution
+## 8. QEMU Register Alignment Status
+
+The following register address mismatches were fixed in the QEMU NPU model:
+
+| Register | Old (wrong) | Fixed | Notes |
+|----------|------------|-------|-------|
+| `CNA_PAD_CON1` | 0x106c | 0x1184 | pad_value was always 0 for non-zero zp |
+| `DPU_DATA_FORMAT` | 0x4014 | 0x4010 | was parsing DPU_OFFSET_PEND instead |
+| `DPU_SURFACE_ADD` | 0x40b0 | 0x40c0 | surface_add at wrong offset |
+| `DPU_FEAT_MODE_CFG` | 0x4010 | 0x400c | define was at DATA_FORMAT's offset |
+
+Newly parsed registers (stored in RocketConvTask, available for computation):
+- `DPU_FEATURE_MODE_CFG` (0x400c), `DPU_BS_OW_CFG` (0x4050)
+- `DPU_WDMA_SIZE_0/1` (0x4058/0x405c), `DPU_EW_RELUX_CMP` (0x407c)
+- `RDMA_SRC_BASE_ADDR` (0x5018), `RDMA_NRDMA_CFG` (0x5028), `RDMA_BN_BASE_ADDR` (0x502c)
+- `RDMA_FEATURE_MODE_CFG` (0x5044), `RDMA_WEIGHT` (0x5068)
+
+Functional additions:
+- **Output surface stride**: when `output_surface_stride > 0` and multiple output groups,
+  DMA writes use per-group stride (supports sparse layouts from per-channel decomposition)
+- **EW ReLUx**: EW stage now supports ReLUx (clamp to `ew_relux_cmp`) via bit 10 of `ew_cfg`
+
+## 9. Depthwise Convolution
 
 Signaled by:
 - `CNA_CONV_CON1.CONV_MODE = 3`
@@ -128,7 +150,7 @@ Differences from standard conv:
 - Output channels align to 64 instead of 32 for small channel counts
 - `surfaces_per_row *= 2` for depthwise
 
-## 9. Per-Channel Quantization (RKNN-style)
+## 10. Per-Channel Quantization (RKNN-style)
 
 When `DPU_DATA_CUBE_CHANNEL = 0` (single output channel per task):
 - Each task has its own `OUT_CVT_SCALE` and `OUT_CVT_SHIFT`
@@ -142,7 +164,7 @@ When `DPU_DATA_CUBE_CHANNEL = 0` (single output channel per task):
 This is how RKNN achieves perfect per-axis quantization: decompose each
 CONV into one task per output channel, each with its own requantization scale.
 
-## 10. Data Formats
+## 11. Data Formats
 
 ### NPU Interleaved Tensor Format (x-major)
 ```
@@ -163,7 +185,7 @@ offset(group, x, y, W, H) = group * W * H * 16 + x * H * 16 + y * 16
 - Computed as: `sum(input_zp * weight_value) * -1` per channel
 - Truncate bits applied based on max bias magnitude
 
-## 11. CBUF (Convolution Buffer) Constants
+## 12. CBUF (Convolution Buffer) Constants
 
 ```
 CBUF_BANK_SIZE        = 32768 bytes
@@ -179,7 +201,7 @@ When input doesn't fit in CBUF, operations are split into multiple tasks:
 - Adjacent tasks overlap by `(kernel_height - 1)` rows
 - First task gets `pad_top`, last gets `pad_bottom`
 
-## 12. Kernel Driver Quirks (for QEMU correctness)
+## 13. Kernel Driver Quirks (for QEMU correctness)
 
 ### Job submission
 - Mesa batches ~27 jobs in a single SUBMIT ioctl
@@ -206,7 +228,7 @@ When input doesn't fit in CBUF, operations are split into multiple tasks:
 - Multiple timeouts corrupt IOMMU state → kernel memory corruption
   (with `panic_on_oops=1`, this triggers clean reboot)
 
-## 13. Specific Register Values to Validate
+## 14. Specific Register Values to Validate
 
 ### Convolution pipeline stages (standard conv, no addition)
 ```
@@ -230,7 +252,7 @@ ERDMA_CFG      = ERDMA_DATA_MODE(1) | ERDMA_DATA_SIZE(1)
 RDMA_FEATURE   = ... | COMB_USE(5)
 ```
 
-## 14. Known Hardware Limitations
+## 15. Known Hardware Limitations
 
 - INT16 output precision (`OUT_PRECISION=1`) NOT SUPPORTED — causes NPU timeout
 - Small spatial sizes (8x8) produce incorrect results even with Mesa
@@ -240,7 +262,7 @@ RDMA_FEATURE   = ... | COMB_USE(5)
   `NONALIGN_DMA(1) | GROUP_LINE_OFF(1) | ARGB_IN(8)` in CONV_CON1,
   and custom CVT_CON0-5 truncate/scale values
 
-## 15. Test Vectors
+## 16. Test Vectors
 
 MobileNetV1 INT8 (224x224x3 input):
 - 28 CONV operations (14 standard + 14 depthwise)
