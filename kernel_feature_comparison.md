@@ -88,6 +88,24 @@ RK3588 has two VDPU381 cores for up to 8K@30; currently only single-core is
 used. Multi-core scheduling is being worked on. GStreamer 1.28 has merged
 support; FFmpeg has preliminary patches.
 
+### Parallel Video Processing
+
+All VPU blocks (VDPU121, 2x VDPU381, VPU981, 5x VEPU121, VEPU580/721) are
+**physically independent hardware** with separate MMIO register sets, clock
+domains, IRQ lines, and DMA engines. They can all operate simultaneously at
+full declared throughput — e.g. decoding H.265 + AV1 + encoding H.264 + JPEG
+all at once.
+
+The practical bottleneck is **DRAM bandwidth** (~25.6 GB/s LPDDR4X or ~51.2 GB/s
+LPDDR5), shared across CPU, GPU, NPU, all VPU blocks, and display. A single
+8K@30 HEVC decode already consumes significant bandwidth, so running everything
+at max simultaneously would saturate the bus.
+
+On vendor kernel, Rockchip MPP (Media Process Platform) is the userspace
+scheduler that routes work across all codec blocks. On mainline, each block is
+exposed as a separate `/dev/video*` V4L2 device, and userspace manages
+parallelism directly.
+
 ### Encode — NOT upstream
 
 - **JPEG encode** (VEPU121): merged in Linux 6.12
