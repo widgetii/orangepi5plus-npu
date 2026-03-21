@@ -111,8 +111,11 @@ enum rnpu_tfl_opcode {
    TFLITE_OP_CONCATENATION = 2,
    TFLITE_OP_CONV_2D = 3,
    TFLITE_OP_DEPTHWISE_CONV_2D = 4,
+   TFLITE_OP_AVERAGE_POOL_2D = 1,
    TFLITE_OP_LOGISTIC = 14,
    TFLITE_OP_MAX_POOL_2D = 17,
+   TFLITE_OP_RESHAPE = 22,
+   TFLITE_OP_SOFTMAX = 25,
    TFLITE_OP_PAD = 34,
    TFLITE_OP_RESIZE_NEAREST_NEIGHBOR = 97,
 };
@@ -161,6 +164,9 @@ enum rnpu_op_type {
    RNPU_OP_PAD,
    RNPU_OP_RESIZE_NEAREST,
    RNPU_OP_LOGISTIC,
+   RNPU_OP_AVG_POOL,
+   RNPU_OP_RESHAPE,
+   RNPU_OP_SOFTMAX,
 };
 
 struct rnpu_split_task {
@@ -255,6 +261,12 @@ struct rnpu_operation {
          uint8_t lut[256];
          uint8_t raw_lut[256];
       } logistic;
+      struct {
+         float in_scale;
+         int in_zp;
+         float out_scale;
+         int out_zp;
+      } softmax;
    } sw;
 };
 

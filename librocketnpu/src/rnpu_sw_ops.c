@@ -179,6 +179,183 @@ static void exec_resize_nearest(struct rnpu_model *m, struct rnpu_operation *op)
    }
 }
 
+static void exec_avg_pool(struct rnpu_model *m, struct rnpu_operation *op)
+{
+   unsigned in_w = op->input_width, in_h = op->input_height;
+   unsigned out_w = op->output_width, out_h = op->output_height;
+   unsigned ch = op->input_channels;
+   unsigned groups = DIV_ROUND_UP(ch, FEATURE_ATOMIC_SIZE);
+   unsigned fw = op->sw.pool.filter_width, fh = op->sw.pool.filter_height;
+   unsigned sx = op->sw.pool.stride_x, sy = op->sw.pool.stride_y;
+   unsigned pbw = 0, pbh = 0;
+   if (op->sw.pool.padding_same) {
+      unsigned ptw = (out_w - 1) * sx + fw - in_w;
+      unsigned pth = (out_h - 1) * sy + fh - in_h;
+      pbw = ptw / 2; pbh = pth / 2;
+   }
+   uint8_t *in = tensor_ptr(m, op->input_tensor);
+   uint8_t *out = tensor_ptr(m, op->output_tensor);
+
+   if (m->sw_only) {
+      for (unsigned ox = 0; ox < out_w; ox++)
+         for (unsigned oy = 0; oy < out_h; oy++) {
+            uint8_t *d = out + (ox * out_h + oy) * ch;
+            for (unsigned c = 0; c < ch; c++) {
+               int32_t sum = 0;
+               unsigned count = 0;
+               for (unsigned fx = 0; fx < fw; fx++)
+                  for (unsigned fy = 0; fy < fh; fy++) {
+                     int ix = (int)(ox * sy) - (int)pbw + (int)fx;
+                     int iy = (int)(oy * sx) - (int)pbh + (int)fy;
+                     if (ix < 0 || ix >= (int)in_w || iy < 0 || iy >= (int)in_h) continue;
+                     sum += (int)(int8_t)in[(ix * in_h + iy) * ch + c];
+                     count++;
+                  }
+               int val = count ? (int)roundf((float)sum / count) : 0;
+               if (val < -128) val = -128;
+               if (val > 127) val = 127;
+               d[c] = (uint8_t)(int8_t)val;
+            }
+         }
+   } else {
+      for (unsigned g = 0; g < groups; g++) {
+         unsigned rc = MIN2(FEATURE_ATOMIC_SIZE, ch - g * FEATURE_ATOMIC_SIZE);
+         for (unsigned ox = 0; ox < out_w; ox++)
+            for (unsigned oy = 0; oy < out_h; oy++) {
+               uint8_t *d = out + NPU_OFFSET(g, ox, oy, out_w, out_h);
+               for (unsigned c = 0; c < rc; c++) {
+                  int32_t sum = 0;
+                  unsigned count = 0;
+                  for (unsigned fx = 0; fx < fw; fx++)
+                     for (unsigned fy = 0; fy < fh; fy++) {
+                        int ix = (int)(ox * sx) - (int)pbw + (int)fx;
+                        int iy = (int)(oy * sy) - (int)pbh + (int)fy;
+                        if (ix < 0 || ix >= (int)in_w || iy < 0 || iy >= (int)in_h) continue;
+                        sum += (int)(int8_t)(in[NPU_OFFSET(g, ix, iy, in_w, in_h) + c]);
+                        count++;
+                     }
+                  int val = count ? (int)roundf((float)sum / count) : 0;
+                  if (val < -128) val = -128;
+                  if (val > 127) val = 127;
+                  d[c] = (uint8_t)(int8_t)val;
+               }
+               /* Zero-fill padding channels */
+               for (unsigned c = rc; c < FEATURE_ATOMIC_SIZE; c++)
+                  d[c] = 0;
+            }
+      }
+   }
+}
+
+static void exec_reshape(struct rnpu_model *m, struct rnpu_operation *op)
+{
+   /* Reshape is a data reinterpretation. If dimensions change but the
+    * underlying NPU-format layout is compatible, it's a memcpy or no-op.
+    * For MBv1: 1×1×1024 (NPU) → 1×1×1024 (NPU) — same layout, different
+    * TFLite shape metadata. Just copy if different tensors. */
+   if (op->input_tensor == op->output_tensor)
+      return;
+
+   uint8_t *in = tensor_ptr(m, op->input_tensor);
+   uint8_t *out = tensor_ptr(m, op->output_tensor);
+   unsigned in_sz = m->tensors[op->input_tensor].size;
+   unsigned out_sz = m->tensors[op->output_tensor].size;
+   memcpy(out, in, MIN2(in_sz, out_sz));
+}
+
+static void exec_softmax(struct rnpu_model *m, struct rnpu_operation *op)
+{
+   unsigned w = op->input_width, h = op->input_height;
+   unsigned ch = op->input_channels;
+   unsigned total = w * h * ch;
+   float in_scale = op->sw.softmax.in_scale;
+   int in_zp = op->sw.softmax.in_zp;
+   float out_scale = op->sw.softmax.out_scale;
+   int out_zp = op->sw.softmax.out_zp;
+   uint8_t *in = tensor_ptr(m, op->input_tensor);
+   uint8_t *out = tensor_ptr(m, op->output_tensor);
+
+   /* Softmax is applied over the entire flattened output (channel dim).
+    * Data is in NPU interleaved format unless sw_only. */
+   float *exp_vals = malloc(total * sizeof(float));
+   float max_val = -1e30f;
+
+   if (m->sw_only) {
+      for (unsigned i = 0; i < total; i++) {
+         float v = ((int)(int8_t)in[i] - in_zp) * in_scale;
+         if (v > max_val) max_val = v;
+      }
+      float sum = 0;
+      for (unsigned i = 0; i < total; i++) {
+         float v = ((int)(int8_t)in[i] - in_zp) * in_scale;
+         exp_vals[i] = expf(v - max_val);
+         sum += exp_vals[i];
+      }
+      for (unsigned i = 0; i < total; i++) {
+         float prob = exp_vals[i] / sum;
+         int q = (int)roundf(prob / out_scale) + out_zp;
+         if (q < -128) q = -128;
+         if (q > 127) q = 127;
+         out[i] = (uint8_t)(int8_t)q;
+      }
+   } else {
+      unsigned groups = DIV_ROUND_UP(ch, FEATURE_ATOMIC_SIZE);
+      /* NPU format: stored value = TFLite_int8 - 0x80
+       * To read:  tflite_val = (int)(int8_t)(stored + 0x80)
+       * To write: stored = (uint8_t)((int8_t)tflite_val - 0x80) */
+
+      /* First pass: find max for numerical stability */
+      for (unsigned g = 0; g < groups; g++) {
+         unsigned rc = MIN2(FEATURE_ATOMIC_SIZE, ch - g * FEATURE_ATOMIC_SIZE);
+         for (unsigned x = 0; x < w; x++)
+            for (unsigned y = 0; y < h; y++) {
+               uint8_t *p = in + NPU_OFFSET(g, x, y, w, h);
+               for (unsigned c = 0; c < rc; c++) {
+                  int tv = (int)(int8_t)((uint8_t)(p[c] + 0x80));
+                  float v = (tv - in_zp) * in_scale;
+                  if (v > max_val) max_val = v;
+               }
+            }
+      }
+      /* Second pass: exp + sum */
+      float sum = 0;
+      unsigned idx = 0;
+      for (unsigned g = 0; g < groups; g++) {
+         unsigned rc = MIN2(FEATURE_ATOMIC_SIZE, ch - g * FEATURE_ATOMIC_SIZE);
+         for (unsigned x = 0; x < w; x++)
+            for (unsigned y = 0; y < h; y++) {
+               uint8_t *p = in + NPU_OFFSET(g, x, y, w, h);
+               for (unsigned c = 0; c < rc; c++) {
+                  int tv = (int)(int8_t)((uint8_t)(p[c] + 0x80));
+                  float v = (tv - in_zp) * in_scale;
+                  float e = expf(v - max_val);
+                  exp_vals[idx++] = e;
+                  sum += e;
+               }
+            }
+      }
+      /* Third pass: normalize + requantize */
+      idx = 0;
+      for (unsigned g = 0; g < groups; g++) {
+         unsigned rc = MIN2(FEATURE_ATOMIC_SIZE, ch - g * FEATURE_ATOMIC_SIZE);
+         for (unsigned x = 0; x < w; x++)
+            for (unsigned y = 0; y < h; y++) {
+               uint8_t *p = out + NPU_OFFSET(g, x, y, w, h);
+               for (unsigned c = 0; c < rc; c++) {
+                  float prob = exp_vals[idx++] / sum;
+                  int q = (int)roundf(prob / out_scale) + out_zp;
+                  if (q < -128) q = -128;
+                  if (q > 127) q = 127;
+                  p[c] = (uint8_t)((int8_t)q - 0x80);
+               }
+               for (unsigned c = rc; c < FEATURE_ATOMIC_SIZE; c++)
+                  p[c] = (uint8_t)((int8_t)out_zp - 0x80);
+            }
+      }
+   }
+   free(exp_vals);
+}
+
 static void exec_logistic(struct rnpu_model *m, struct rnpu_operation *op)
 {
    unsigned w = op->input_width, h = op->input_height, ch = op->input_channels;
@@ -200,6 +377,9 @@ void rnpu_execute_sw_op(struct rnpu_model *m, unsigned op_index)
    case RNPU_OP_PAD:            exec_pad(m, op); break;
    case RNPU_OP_RESIZE_NEAREST: exec_resize_nearest(m, op); break;
    case RNPU_OP_LOGISTIC:       exec_logistic(m, op); break;
+   case RNPU_OP_AVG_POOL:       exec_avg_pool(m, op); break;
+   case RNPU_OP_RESHAPE:        exec_reshape(m, op); break;
+   case RNPU_OP_SOFTMAX:        exec_softmax(m, op); break;
    default: break;
    }
 }

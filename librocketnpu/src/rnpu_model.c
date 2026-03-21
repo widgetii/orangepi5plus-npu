@@ -147,6 +147,73 @@ static void lower_pad(struct rnpu_model *m, const struct rnpu_tfl_op *top,
    }
 }
 
+static void lower_sw_op_auto(struct rnpu_model *m, const struct rnpu_tfl_op *top,
+                              struct rnpu_operation *op, enum rnpu_op_type type)
+{
+   /* Like lower_sw_op but handles 2D tensors (e.g. RESHAPE/SOFTMAX output [1, 1001])
+    * by treating them as 1×1×C in NPU format */
+   const struct rnpu_tfl_model *tfl = &m->tfl;
+   const struct rnpu_tfl_tensor *it = &tfl->tensors[top->inputs[0]];
+   const struct rnpu_tfl_tensor *ot = &tfl->tensors[top->outputs[0]];
+
+   op->type = type;
+   op->add_tensor = -1;
+   op->input_tensor = top->inputs[0];
+   if (it->shape_len >= 4) {
+      op->input_width = it->shape[1];
+      op->input_height = it->shape[2];
+      op->input_channels = it->shape[3];
+   } else if (it->shape_len == 2) {
+      op->input_width = 1;
+      op->input_height = 1;
+      op->input_channels = it->shape[1];
+   }
+   op->input_zero_point = (uint8_t)it->quant.zero_point;
+   op->input_scale = it->quant.scale;
+
+   op->output_tensor = top->outputs[0];
+   if (ot->shape_len >= 4) {
+      op->output_width = ot->shape[1];
+      op->output_height = ot->shape[2];
+      op->output_channels = ot->shape[3];
+   } else if (ot->shape_len == 2) {
+      op->output_width = 1;
+      op->output_height = 1;
+      op->output_channels = ot->shape[1];
+   }
+   op->output_zero_point = (uint8_t)ot->quant.zero_point;
+   op->output_scale = ot->quant.scale;
+}
+
+static void lower_avg_pool(struct rnpu_model *m, const struct rnpu_tfl_op *top,
+                             struct rnpu_operation *op)
+{
+   lower_sw_op(m, top, op, RNPU_OP_AVG_POOL);
+   op->sw.pool.filter_width = top->opt.pool.filter_w;
+   op->sw.pool.filter_height = top->opt.pool.filter_h;
+   op->sw.pool.stride_x = top->opt.pool.stride_w;
+   op->sw.pool.stride_y = top->opt.pool.stride_h;
+   op->sw.pool.padding_same = (top->opt.pool.padding == 0);
+}
+
+static void lower_reshape(struct rnpu_model *m, const struct rnpu_tfl_op *top,
+                            struct rnpu_operation *op)
+{
+   lower_sw_op_auto(m, top, op, RNPU_OP_RESHAPE);
+}
+
+static void lower_softmax(struct rnpu_model *m, const struct rnpu_tfl_op *top,
+                            struct rnpu_operation *op)
+{
+   lower_sw_op_auto(m, top, op, RNPU_OP_SOFTMAX);
+   const struct rnpu_tfl_tensor *it = &m->tfl.tensors[top->inputs[0]];
+   const struct rnpu_tfl_tensor *ot = &m->tfl.tensors[top->outputs[0]];
+   op->sw.softmax.in_scale = it->quant.scale;
+   op->sw.softmax.in_zp = it->quant.zero_point;
+   op->sw.softmax.out_scale = ot->quant.scale;
+   op->sw.softmax.out_zp = ot->quant.zero_point;
+}
+
 static void lower_logistic(struct rnpu_model *m, const struct rnpu_tfl_op *top,
                             struct rnpu_operation *op)
 {
@@ -539,9 +606,13 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
          m->tensors[i].width = t->shape[1];
          m->tensors[i].height = t->shape[2];
          m->tensors[i].channels = t->shape[3];
-         m->tensors[i].scale = t->quant.scale;
-         m->tensors[i].zero_point = t->quant.zero_point;
+      } else if (t->shape_len == 2) {
+         m->tensors[i].width = 1;
+         m->tensors[i].height = 1;
+         m->tensors[i].channels = t->shape[1];
       }
+      m->tensors[i].scale = t->quant.scale;
+      m->tensors[i].zero_point = t->quant.zero_point;
    }
 
    /* Lower TFLite ops to internal ops */
@@ -606,6 +677,18 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
          break;
       case TFLITE_OP_LOGISTIC:
          lower_logistic(m, top, op);
+         m->op_count++;
+         break;
+      case TFLITE_OP_AVERAGE_POOL_2D:
+         lower_avg_pool(m, top, op);
+         m->op_count++;
+         break;
+      case TFLITE_OP_RESHAPE:
+         lower_reshape(m, top, op);
+         m->op_count++;
+         break;
+      case TFLITE_OP_SOFTMAX:
+         lower_softmax(m, top, op);
          m->op_count++;
          break;
       default:

@@ -1,5 +1,5 @@
 /*
- * CPU software ops: concat, max_pool, pad, resize, logistic
+ * CPU software ops: concat, max_pool, avg_pool, pad, resize, logistic, reshape, softmax
  * SPDX-License-Identifier: MIT
  */
 
