@@ -1,0 +1,27 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+
+echo "Loading kernel modules..."
+insmod /lib/modules/qemu_reset.ko
+insmod /lib/modules/qemu_iommu.ko
+sleep 1
+insmod /lib/modules/drm_shmem_helper.ko
+insmod /lib/modules/gpu-sched.ko
+insmod /lib/modules/rocket.ko
+
+echo "Waiting for device..."
+sleep 1
+ls -la /dev/accel/ 2>/dev/null
+
+echo "Running NPU test..."
+/bin/npu_test
+echo "Test exit code: $?"
+
+echo "Running MobileNetV1..."
+/bin/test_mobilenet /model.tflite 1 /golden.bin
+echo "MobileNetV1 exit code: $?"
+
+echo "--- QEMU NPU TEST COMPLETE ---"
+exec /bin/sh
