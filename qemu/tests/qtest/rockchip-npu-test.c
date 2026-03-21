@@ -4,7 +4,8 @@
  * Tests:
  * 1. NPU probe: PC_VERSION returns valid value for all 3 cores
  * 2. IRQ: Write PC_OPERATION_ENABLE, check IRQ raised, clear works
- * 3. Regcmd parse: Simple 1x1 convolution produces expected output
+ * 3. Register round-trip
+ * 4. BS/BN/EW SDP register round-trip
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -32,6 +33,10 @@
 #define EXPECTED_VERSION     0x00010001
 #define EXPECTED_VERSION_NUM 0x00000001
 
+#define MACHINE "-M orangepi5plus -m 256M"
+
+static QTestState *qts;
+
 /*
  * Test 1: All 3 NPU cores return valid PC_VERSION on read.
  * This is what the kernel Rocket driver checks during probe.
@@ -41,11 +46,10 @@ static void test_npu_probe(void)
     uint64_t bases[] = { CORE0_BASE, CORE1_BASE, CORE2_BASE };
 
     for (int i = 0; i < 3; i++) {
-        uint32_t version = qtest_readl(global_qtest, bases[i] + PC_VERSION);
+        uint32_t version = qtest_readl(qts, bases[i] + PC_VERSION);
         g_assert_cmpuint(version, ==, EXPECTED_VERSION);
 
-        uint32_t version_num = qtest_readl(global_qtest,
-                                           bases[i] + PC_VERSION_NUM);
+        uint32_t version_num = qtest_readl(qts, bases[i] + PC_VERSION_NUM);
         g_assert_cmpuint(version_num, ==, EXPECTED_VERSION_NUM);
     }
 }
@@ -57,18 +61,11 @@ static void test_npu_probe(void)
  */
 static void test_npu_irq(void)
 {
-    /* Set up a dummy (empty) regcmd — base_addr=0 will cause early exit
-     * but IRQ should still fire since execute_job always signals completion */
-    qtest_writel(global_qtest, CORE0_BASE + PC_BASE_ADDRESS, 0);
-    qtest_writel(global_qtest, CORE0_BASE + PC_REGISTER_AMOUNTS, 0);
+    qtest_writel(qts, CORE0_BASE + PC_BASE_ADDRESS, 0);
+    qtest_writel(qts, CORE0_BASE + PC_REGISTER_AMOUNTS, 0);
+    qtest_writel(qts, CORE0_BASE + PC_IRQ_MASK, 0);
 
-    /* Unmask all interrupts */
-    qtest_writel(global_qtest, CORE0_BASE + PC_IRQ_MASK, 0);
-
-    /* Note: with 0 reg_amounts, no job executes, so no IRQ. Test the mask. */
-    uint32_t raw = qtest_readl(global_qtest,
-                               CORE0_BASE + PC_IRQ_RAW_STATUS);
-    /* After reset, should be 0 */
+    uint32_t raw = qtest_readl(qts, CORE0_BASE + PC_IRQ_RAW_STATUS);
     g_assert_cmpuint(raw, ==, 0);
 }
 
@@ -78,11 +75,62 @@ static void test_npu_irq(void)
  */
 static void test_npu_reg_roundtrip(void)
 {
-    /* Write to a CNA register offset */
     uint64_t addr = CORE1_BASE + 0x1070; /* CNA_FEATURE_DATA_ADDR */
-    qtest_writel(global_qtest, addr, 0xDEADBEEF);
-    uint32_t val = qtest_readl(global_qtest, addr);
+    qtest_writel(qts, addr, 0xDEADBEEF);
+    uint32_t val = qtest_readl(qts, addr);
     g_assert_cmpuint(val, ==, 0xDEADBEEF);
+}
+
+/*
+ * Test 4: BS/BN/EW register read/write round-trip.
+ * Verify that the new pipeline stage registers are accessible.
+ */
+static void test_npu_sdp_regs(void)
+{
+    /* BS_MUL_CFG: operand=0x1234, shift=5, src=1 */
+    uint32_t bs_mul_val = 0x12340501;
+    qtest_writel(qts, CORE0_BASE + 0x4048, bs_mul_val);
+    g_assert_cmpuint(qtest_readl(qts, CORE0_BASE + 0x4048), ==, bs_mul_val);
+
+    /* BS_RELUX_CMP */
+    qtest_writel(qts, CORE0_BASE + 0x404c, 0x0000007F);
+    g_assert_cmpuint(qtest_readl(qts, CORE0_BASE + 0x404c), ==, 0x0000007F);
+
+    /* BN_ALU_CFG */
+    qtest_writel(qts, CORE0_BASE + 0x4064, 0xFFFFFF80);
+    g_assert_cmpuint(qtest_readl(qts, CORE0_BASE + 0x4064), ==, 0xFFFFFF80);
+
+    /* BN_MUL_CFG */
+    qtest_writel(qts, CORE0_BASE + 0x4068, 0xABCD0000);
+    g_assert_cmpuint(qtest_readl(qts, CORE0_BASE + 0x4068), ==, 0xABCD0000);
+
+    /* BN_RELUX_CMP */
+    qtest_writel(qts, CORE0_BASE + 0x406c, 42);
+    g_assert_cmpuint(qtest_readl(qts, CORE0_BASE + 0x406c), ==, 42);
+
+    /* EW_CFG: bypass all */
+    qtest_writel(qts, CORE0_BASE + 0x4070, 0x00000383);
+    g_assert_cmpuint(qtest_readl(qts, CORE0_BASE + 0x4070), ==, 0x00000383);
+
+    /* EW_CVT_OFFSET */
+    qtest_writel(qts, CORE0_BASE + 0x4074, 0x00000005);
+    g_assert_cmpuint(qtest_readl(qts, CORE0_BASE + 0x4074), ==, 0x00000005);
+
+    /* EW_CVT_SCALE (packed: truncate[31:22], shift[21:16], scale[15:0]) */
+    qtest_writel(qts, CORE0_BASE + 0x4078, 0x00010001);
+    g_assert_cmpuint(qtest_readl(qts, CORE0_BASE + 0x4078), ==, 0x00010001);
+
+    /* ERDMA_CFG */
+    qtest_writel(qts, CORE0_BASE + 0x5034, 0x00000001);
+    g_assert_cmpuint(qtest_readl(qts, CORE0_BASE + 0x5034), ==, 0x00000001);
+
+    /* EW_BASE_ADDR */
+    qtest_writel(qts, CORE0_BASE + 0x5038, 0xCAFE0000);
+    g_assert_cmpuint(qtest_readl(qts, CORE0_BASE + 0x5038), ==, 0xCAFE0000);
+
+    /* EW_SURF_STRIDE */
+    qtest_writel(qts, CORE0_BASE + 0x5040, 0x00001000);
+    g_assert_cmpuint(qtest_readl(qts, CORE0_BASE + 0x5040), ==, 0x00001000);
 }
 
 int main(int argc, char **argv)
@@ -92,10 +140,11 @@ int main(int argc, char **argv)
     qtest_add_func("/rockchip-npu/probe", test_npu_probe);
     qtest_add_func("/rockchip-npu/irq", test_npu_irq);
     qtest_add_func("/rockchip-npu/reg-roundtrip", test_npu_reg_roundtrip);
+    qtest_add_func("/rockchip-npu/sdp-regs", test_npu_sdp_regs);
 
-    qtest_start("-M orangepi5plus -m 256M");
+    qts = qtest_init(MACHINE);
     int ret = g_test_run();
-    qtest_end();
+    qtest_quit(qts);
 
     return ret;
 }

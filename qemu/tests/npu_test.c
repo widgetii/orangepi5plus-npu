@@ -157,7 +157,7 @@ static unsigned build_regcmd(uint64_t *buf, uint32_t in_addr, uint32_t wt_addr,
     *p++ = emit(TARGET_CORE, 0x3010, 0x00000001);  /* MISC_CFG: QD_EN=1 */
     *p++ = emit(TARGET_CORE, 0x3014, 0x00000000);  /* DATAOUT_SIZE_0: w=0+1=1, h=0+1=1 */
     *p++ = emit(TARGET_CORE, 0x3018, 0x0000000f);  /* DATAOUT_SIZE_1: ch=15+1=16 */
-    *p++ = emit(TARGET_CORE, 0x301c, 0);           /* CLIP_TRUNCATE */
+    *p++ = emit(TARGET_CORE, 0x301c, 1);           /* CLIP_TRUNCATE: 1 bit */
     *p++ = emit(0x0801, 0x3030, 0);                /* raw CORE reg */
 
     /* DPU registers */
@@ -225,11 +225,11 @@ static unsigned build_regcmd(uint64_t *buf, uint32_t in_addr, uint32_t wt_addr,
     /* BRDMA: DATA_USE=1 (bias from DMA) */
     *p++ = emit(TARGET_RDMA, 0x501c, 0x00000002);
     *p++ = emit(TARGET_RDMA, 0x5020, bias_addr);  /* BS_BASE_ADDR */
-    *p++ = emit(TARGET_RDMA, 0x5024, 0);          /* NRDMA_CFG */
-    *p++ = emit(TARGET_RDMA, 0x5028, 0);          /* BN_BASE_ADDR */
-    *p++ = emit(TARGET_RDMA, 0x502c, 0x00000001); /* ERDMA_CFG: disable */
-    *p++ = emit(TARGET_RDMA, 0x5030, 0);          /* EW_BASE_ADDR */
-    *p++ = emit(TARGET_RDMA, 0x5034, 0);          /* EW_SURF_STRIDE */
+    *p++ = emit(TARGET_RDMA, 0x5028, 0);          /* NRDMA_CFG */
+    *p++ = emit(TARGET_RDMA, 0x502c, 0);          /* BN_BASE_ADDR */
+    *p++ = emit(TARGET_RDMA, 0x5034, 0x00000001); /* ERDMA_CFG: disable */
+    *p++ = emit(TARGET_RDMA, 0x5038, 0);          /* EW_BASE_ADDR */
+    *p++ = emit(TARGET_RDMA, 0x5040, 0);          /* EW_SURF_STRIDE */
     *p++ = emit(TARGET_RDMA, 0x5000, 0x000f0010); /* FEAT_MODE_CFG: burst=15, MRDMA_DISABLE=1 */
     *p++ = emit(TARGET_RDMA, 0x5038, 0);          /* SRC_DMA_CFG */
     *p++ = emit(TARGET_RDMA, 0x503c, 0);          /* SURF_NOTCH */
@@ -302,21 +302,28 @@ int main(void)
         perror("mmap"); return 1;
     }
 
-    /* Fill input: 16 channels, value=10 (signed: 10 in int8 domain) */
+    /*
+     * Fill input: 16 channels.
+     * Channel 0: value = 10 (basic identity test)
+     * Channel 1: value = -3 (NVDLA rounding test: -3 >> 1 should be -2, not -1)
+     * Channels 2-15: value = 10
+     */
     memset(in_buf, 0, 4096);
-    for (int c = 0; c < 16; c++)
-        in_buf[c] = 10;  /* signed int8 value = 10 */
+    in_buf[0] = 10;
+    in_buf[1] = (uint8_t)(int8_t)(-3);
+    for (int c = 2; c < 16; c++)
+        in_buf[c] = 10;
 
     /* Fill weights: identity-like (w[oc][0][0][ic] = 1 if oc==ic, else 0)
      * Weight layout: [oc1][ic1][kx][ky][oc2][ic2] with WEIGHT_ATOMIC_SIZE=32
      * For 1x1 filter, 16 output, 16 input: oc1=0, ic1=0, kx=0, ky=0
-     * Inner loop: oc2 in [0,31], ic2 in [0,31] — total 32*32=1024 but we only have 16 real
+     * ic2_count = MIN(MAX(in_ch, FEATURE_ATOMIC_SIZE), WEIGHT_ATOMIC_SIZE)
+     *           = MIN(MAX(16, 16), 32) = 16
+     * offset = oc2 * ic2_count + ic2 = oc * 16 + ic
      */
     memset(wt_buf, 0, 4096);
     for (int oc = 0; oc < 16; oc++) {
-        /* offset = oc * 32 + oc (since ic == oc for identity) */
-        /* Actually: oc2 * ic2_count + ic2 where ic2_count=32 */
-        wt_buf[oc * 32 + oc] = 1;  /* w[oc][oc] = 1 (signed) */
+        wt_buf[oc * 16 + oc] = 1;  /* w[oc][oc] = 1 (signed) */
     }
 
     /* Fill bias: all zeros */
@@ -390,17 +397,40 @@ int main(void)
     for (int i = 0; i < 16; i++)
         printf("  [%2d] = %d (0x%02x)\n", i, (int8_t)out_buf[i], out_buf[i]);
 
-    /* Check: with identity weights and input=10, expected output ≈ 10 per channel */
+    /*
+     * Check results with CLIP_TRUNCATE=1:
+     *
+     * Channel 0: input=10, acc=10, nvdla_truncate(10,1):
+     *   guide=0, result = 10>>1 = 5. OUT_CVT(5*16384>>14) = 5.
+     *
+     * Channel 1: input=-3, acc=-3, nvdla_truncate(-3,1):
+     *   sign=1, guide=1, sticky=0, round_up = 1 & (0|0) = 0
+     *   result = (-3>>1) + 0 = -2. OUT_CVT(-2*16384>>14) = -2.
+     *   (Simple round-half-up would give (-3+1)>>1 = -1 — WRONG)
+     *
+     * Channels 2-15: same as channel 0, expected 5.
+     */
+    int8_t expected[16];
+    expected[0] = 5;    /* 10 >> 1 = 5 */
+    expected[1] = -2;   /* -3 >> 1 = -2 (NVDLA rounding) */
+    for (int i = 2; i < 16; i++) expected[i] = 5;
+
     int pass = 1;
     for (int i = 0; i < 16; i++) {
         int8_t val = (int8_t)out_buf[i];
-        if (val != 10) { pass = 0; break; }
+        if (val != expected[i]) {
+            printf("  MISMATCH ch[%d]: got %d, expected %d\n",
+                   i, val, expected[i]);
+            pass = 0;
+        }
     }
 
-    if (pass)
-        printf("PASS: All 16 output channels = 10 (identity conv correct)\n");
-    else
-        printf("OUTPUT: Values differ from expected (10) — check convolution engine\n");
+    if (pass) {
+        printf("PASS: Identity conv with NVDLA truncation correct\n");
+        printf("  ch[0]=5 (10>>1), ch[1]=-2 (-3>>1 NVDLA rounding), ch[2-15]=5\n");
+    } else {
+        printf("FAIL: Output mismatch — check convolution engine\n");
+    }
 
     /* Cleanup */
     munmap(in_buf, 4096);

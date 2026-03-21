@@ -75,8 +75,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(RockchipNPUState, ROCKCHIP_NPU)
 #define DPU_BS_CFG           0x4040
 #define DPU_BS_ALU_CFG       0x4044
 #define DPU_BS_MUL_CFG       0x4048
+#define DPU_BS_RELUX_CMP     0x404c
 #define DPU_BS_OW_OP         0x4054
 #define DPU_BN_CFG           0x4060
+#define DPU_BN_ALU_CFG       0x4064
+#define DPU_BN_MUL_CFG       0x4068
+#define DPU_BN_RELUX_CMP     0x406c
+#define DPU_EW_CFG           0x4070
+#define DPU_EW_CVT_OFFSET    0x4074
+#define DPU_EW_CVT_SCALE     0x4078
 #define DPU_OUT_CVT_OFFSET   0x4080
 #define DPU_OUT_CVT_SCALE    0x4084
 #define DPU_OUT_CVT_SHIFT    0x4088
@@ -85,6 +92,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(RockchipNPUState, ROCKCHIP_NPU)
 /* RDMA registers */
 #define RDMA_BRDMA_CFG      0x501c
 #define RDMA_BS_BASE_ADDR   0x5020
+#define RDMA_ERDMA_CFG      0x5034
+#define RDMA_EW_BASE_ADDR   0x5038
+#define RDMA_EW_SURF_STRIDE 0x5040
 
 /* Regcmd format: 64-bit packed entry
  * bits [15:0]  = register offset
@@ -144,13 +154,28 @@ typedef struct RocketConvTask {
     uint32_t out_cvt_shift;
     uint32_t truncate_bits;
 
-    /* Bias */
+    /* BS (Bias/Scale) stage */
     uint32_t bias_addr;        /* DMA address of bias buffer */
     uint32_t bs_cfg;           /* BS stage config */
     int32_t  bs_alu_cfg;       /* BS ALU config (per-channel bias) */
+    uint32_t bs_mul_cfg;       /* BS MUL config (operand[31:16], shift[13:8], src[0]) */
+    uint32_t bs_relux_cmp;     /* BS ReLUx compare value */
     uint32_t bs_ow_op;         /* Weight zero point offset */
-    uint32_t bn_cfg;           /* BN stage config */
     uint32_t brdma_cfg;        /* Bias RDMA config */
+
+    /* BN (Batch Norm) stage */
+    uint32_t bn_cfg;           /* BN stage config */
+    int32_t  bn_alu_cfg;       /* BN ALU operand */
+    uint32_t bn_mul_cfg;       /* BN MUL config */
+    uint32_t bn_relux_cmp;     /* BN ReLUx compare value */
+
+    /* EW (Element-Wise) stage */
+    uint32_t ew_cfg;           /* EW stage config */
+    int32_t  ew_cvt_offset;    /* EW conversion offset */
+    uint32_t ew_cvt_scale;     /* EW conversion scale + shift + truncate */
+    uint32_t erdma_cfg;        /* ERDMA config */
+    uint32_t ew_base_addr;     /* ERDMA source base address */
+    uint32_t ew_surf_stride;   /* ERDMA surface stride */
 
     /* Data format */
     uint32_t data_format;

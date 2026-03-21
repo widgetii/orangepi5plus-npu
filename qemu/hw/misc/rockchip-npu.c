@@ -29,7 +29,6 @@
 #include "migration/vmstate.h"
 #include "trace.h"
 
-#include <math.h>
 
 /* Version that the Rocket kernel driver checks during probe */
 #define ROCKET_PC_VERSION      0x00010001
@@ -166,6 +165,12 @@ static void parse_regcmd_entry(RocketConvTask *task, uint64_t entry)
     case 0x4044: /* DPU_BS_ALU_CFG */
         task->bs_alu_cfg = (int32_t)val;
         break;
+    case 0x4048: /* DPU_BS_MUL_CFG */
+        task->bs_mul_cfg = val;
+        break;
+    case 0x404c: /* DPU_BS_RELUX_CMP */
+        task->bs_relux_cmp = val;
+        break;
     case 0x4054: /* DPU_BS_OW_OP */
         task->bs_ow_op = val & 0xffff;
         break;
@@ -173,6 +178,26 @@ static void parse_regcmd_entry(RocketConvTask *task, uint64_t entry)
     /* DPU: BN stage */
     case 0x4060: /* DPU_BN_CFG */
         task->bn_cfg = val;
+        break;
+    case 0x4064: /* DPU_BN_ALU_CFG */
+        task->bn_alu_cfg = (int32_t)val;
+        break;
+    case 0x4068: /* DPU_BN_MUL_CFG */
+        task->bn_mul_cfg = val;
+        break;
+    case 0x406c: /* DPU_BN_RELUX_CMP */
+        task->bn_relux_cmp = val;
+        break;
+
+    /* DPU: EW (Element-Wise) stage */
+    case 0x4070: /* DPU_EW_CFG */
+        task->ew_cfg = val;
+        break;
+    case 0x4074: /* DPU_EW_CVT_OFFSET */
+        task->ew_cvt_offset = (int32_t)val;
+        break;
+    case 0x4078: /* DPU_EW_CVT_SCALE */
+        task->ew_cvt_scale = val;
         break;
 
     /* DPU: Output conversion (requantization) */
@@ -200,6 +225,15 @@ static void parse_regcmd_entry(RocketConvTask *task, uint64_t entry)
         break;
     case 0x5020: /* RDMA_BS_BASE_ADDR */
         task->bias_addr = val;
+        break;
+    case 0x5034: /* RDMA_ERDMA_CFG */
+        task->erdma_cfg = val;
+        break;
+    case 0x5038: /* RDMA_EW_BASE_ADDR */
+        task->ew_base_addr = val;
+        break;
+    case 0x5040: /* RDMA_EW_SURF_STRIDE */
+        task->ew_surf_stride = (val >> 4) & 0x0fffffff;
         break;
 
     /* Task chaining (last entries of regcmd) */
@@ -388,6 +422,128 @@ static const MemoryRegionOps npu_iommu_ops = {
 };
 
 /* ======================================================================
+ * NVDLA-referenced rounding helpers
+ *
+ * The Rockchip NPU is based on NVDLA. The truncation and shift-right
+ * operations use round-half-to-even (banker's rounding) with guide and
+ * sticky bits, NOT simple round-half-up.
+ *
+ * From NV_NVDLA_CACC_CALC_int8.v:
+ *   {shifted, guide, sticky} = ($signed({value, 16'b0}) >>> truncate)
+ *   round_up = guide & (~sign | (|sticky))
+ *   result = shifted + round_up
+ *
+ * For negative values at an exact tie (guide=1, sticky=0), this does NOT
+ * round up — it rounds toward zero (banker's rounding for negative).
+ * ====================================================================== */
+
+/*
+ * NVDLA truncation: round-half-to-even for 32-bit accumulator.
+ * Used after CACC accumulation (CLIP_TRUNCATE register).
+ */
+static inline int32_t nvdla_truncate(int32_t value, unsigned truncate)
+{
+    if (truncate == 0) {
+        return value;
+    }
+    int32_t sign = (value < 0) ? 1 : 0;
+    uint32_t guide = (value >> (truncate - 1)) & 1;
+    uint32_t sticky = (truncate > 1)
+        ? ((value & ((1u << (truncate - 1)) - 1)) != 0) : 0;
+    int32_t round_up = guide & ((!sign) | sticky);
+    return (value >> truncate) + round_up;
+}
+
+/*
+ * NVDLA shift-right with rounding for 64-bit values.
+ * Used in OUT_CVT: (acc * scale) >> shift, and EW CVT.
+ * From NV_NVDLA_SDP_HLS_C_int.v / NV_NVDLA_HLS_shiftrightsatsu.
+ */
+static inline int64_t nvdla_shift_right_round64(int64_t value, unsigned shift)
+{
+    if (shift == 0) {
+        return value;
+    }
+    int64_t sign = (value < 0) ? 1 : 0;
+    uint64_t guide = (value >> (shift - 1)) & 1;
+    uint64_t sticky = (shift > 1)
+        ? ((value & ((1ULL << (shift - 1)) - 1)) != 0) : 0;
+    int64_t round_up = guide & ((!sign) | sticky);
+    return (value >> shift) + round_up;
+}
+
+/* ======================================================================
+ * SDP X-stage pipeline (shared by BS and BN)
+ *
+ * Each X-stage (BS, BN) has: ALU → MUL → ReLU sub-stages.
+ * The cfg register has identical bit layout for both:
+ *   [0]     BYPASS      — skip entire stage
+ *   [1]     ALU_BYPASS  — skip ALU sub-stage
+ *   [4]     MUL_BYPASS  — skip MUL sub-stage
+ *   [5]     MUL_PRELU   — MUL acts as PReLU (multiply only if negative)
+ *   [6]     RELU_BYPASS — skip ReLU sub-stage
+ *   [7]     RELUX_EN    — use ReLUx (clamp to relux_cmp) instead of ReLU
+ *   [8]     ALU_SRC     — 0=register, 1=DMA
+ *   [19:16] ALU_ALGO    — 0=max, 1=min, 2=add
+ * ====================================================================== */
+
+static inline int32_t apply_sdp_x_stage(int32_t value, uint32_t cfg,
+                                         int32_t alu_operand,
+                                         uint32_t mul_cfg,
+                                         int32_t relux_cmp)
+{
+    /* Stage bypass */
+    if (cfg & 0x01) {
+        return value;
+    }
+
+    /* ALU sub-stage */
+    if (!(cfg & 0x02)) { /* ALU_BYPASS */
+        uint32_t algo = (cfg >> 16) & 0xf;
+        switch (algo) {
+        case 0: /* MAX */
+            if (value < alu_operand) value = alu_operand;
+            break;
+        case 1: /* MIN */
+            if (value > alu_operand) value = alu_operand;
+            break;
+        case 2: /* ADD */
+            value += alu_operand;
+            break;
+        default:
+            break;
+        }
+    }
+
+    /* MUL sub-stage */
+    if (!(cfg & 0x10)) { /* MUL_BYPASS */
+        int16_t mul_operand = (int16_t)((mul_cfg >> 16) & 0xffff);
+        unsigned mul_shift = (mul_cfg >> 8) & 0x3f;
+        bool mul_prelu = (cfg >> 5) & 1;
+
+        if (!mul_prelu || value < 0) {
+            int64_t product = (int64_t)value * (int64_t)mul_operand;
+            value = (int32_t)nvdla_shift_right_round64(product, mul_shift);
+        }
+    }
+
+    /* ReLU sub-stage */
+    if (!(cfg & 0x40)) { /* RELU_BYPASS */
+        bool relux_en = (cfg >> 7) & 1;
+        if (relux_en) {
+            /* ReLUx: clamp to [0, relux_cmp] */
+            if (value < 0) value = 0;
+            if (value > relux_cmp) value = relux_cmp;
+        } else {
+            /* Standard ReLU */
+            if (value < 0) value = 0;
+        }
+    }
+
+    return value;
+}
+
+/* ======================================================================
  * INT8 Convolution Engine
  * ====================================================================== */
 
@@ -428,10 +584,26 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                          * MIN2(wt_oc, NPU_WEIGHT_ATOMIC_SIZE)
                          * MIN2(wt_ic, wt_ic_group);
 
-    /* Determine if bias comes from DMA or from register (per-channel mode) */
+    /*
+     * Determine bias source.
+     * The BS pipeline is handled generically below via apply_sdp_x_stage(),
+     * but we still pre-load bias from DMA into bias_buf[] for the
+     * accumulator initialization (bias is added before CACC truncation,
+     * not in the BS ALU — it's the CACC bias port).
+     *
+     * When BS is NOT bypassed: bias comes from BRDMA (DMA) or BS_ALU_CFG
+     * register. When BS IS bypassed: per-channel mode uses BS_ALU_CFG.
+     */
     bool bias_from_dma = (task->brdma_cfg & 0x1e) == 0x02; /* BRDMA_DATA_USE=1 */
-    bool bs_bypass = (task->bs_cfg & 0x01); /* BS_BYPASS bit */
     uint32_t bias_buf_size = out_c * sizeof(int32_t);
+
+    /* EW stage: check if element-wise source tensor needs to be read */
+    bool ew_bypass = (task->ew_cfg & 0x01);
+    bool ew_op_bypass = (task->ew_cfg >> 1) & 1;
+    bool ew_active = !ew_bypass && !ew_op_bypass;
+    bool erdma_enabled = !(task->erdma_cfg & 0x01); /* ERDMA_DISABLE bit */
+    uint8_t *ew_buf = NULL;
+    uint32_t ew_buf_size = 0;
 
     /* Output buffer: y-major interleaved */
     uint32_t out_groups = DIV_ROUND_UP(out_c, NPU_FEATURE_ATOMIC_SIZE);
@@ -449,27 +621,25 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     /* Read weight buffer from guest memory */
     npu_dma_read(s, task->weight_addr, wt_buf, wt_buf_size);
 
-    /* Read or compute bias */
+    /*
+     * Read bias from DMA.
+     * In the real hardware pipeline: CACC → truncate → BS(ALU=ADD bias) → BN → EW → OUT_CVT
+     * The bias is applied by the BS ALU stage, not inside the CACC accumulator.
+     * However, Mesa/librocketnpu configures BS_ALU_SRC=1 (DMA) with BS_ALU_ALGO=ADD,
+     * so apply_sdp_x_stage reads the ALU operand from the register. For DMA-sourced
+     * bias, we load it into a per-channel buffer and apply it as per-channel ALU operand
+     * inside the BS stage.
+     */
     if (bias_from_dma && task->bias_addr != 0) {
         npu_dma_read(s, task->bias_addr, bias_buf, bias_buf_size);
-    } else if (bs_bypass) {
-        /* Per-channel mode: bias comes from BS_ALU_CFG register */
-        for (uint32_t oc = 0; oc < out_c; oc++) {
-            bias_buf[oc] = task->bs_alu_cfg;
-        }
     }
 
-    /*
-     * Weight zero point offset (from BS_OW_OP register).
-     * In standard mode: BS_OW_OP = 0x80 - weight_zero_point
-     * This is applied as a multiplicative correction in the BS stage:
-     * the NPU hardware multiplies each accumulator output by (1 + ow_op/N).
-     * For our software model, we don't subtract it from weights during
-     * accumulation — the weights are already in the correct signed domain
-     * (w_val - 0x80 was applied during weight packing). The BS_OW_OP
-     * correction is inherent in the bias calculation done by Mesa.
-     */
-    (void)task->bs_ow_op;
+    /* Read EW source tensor if element-wise addition is active */
+    if (ew_active && erdma_enabled && task->ew_base_addr != 0) {
+        ew_buf_size = out_groups * out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
+        ew_buf = g_malloc0(ew_buf_size);
+        npu_dma_read(s, task->ew_base_addr, ew_buf, ew_buf_size);
+    }
 
     /* Requantization parameters */
     uint32_t out_cvt_scale = task->out_cvt_scale;
@@ -483,7 +653,7 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     for (uint32_t oy = 0; oy < out_h; oy++) {
         for (uint32_t ox = 0; ox < out_w; ox++) {
             for (uint32_t oc = 0; oc < out_c; oc++) {
-                int32_t acc = bias_buf[oc];
+                int32_t acc = 0;
 
                 uint32_t ic_limit = depthwise ? 1 : in_c_real;
                 uint32_t ic_base = depthwise ? oc : 0;
@@ -536,28 +706,94 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                     }
                 }
 
-                /* Truncation (CLIP_TRUNCATE) */
-                if (task->truncate_bits > 0) {
-                    int32_t half = 1 << (task->truncate_bits - 1);
-                    acc = (acc + half) >> task->truncate_bits;
+                /*
+                 * CACC truncation (CLIP_TRUNCATE).
+                 * NVDLA uses round-half-to-even via guide+sticky bits.
+                 */
+                acc = nvdla_truncate(acc, task->truncate_bits);
+
+                /*
+                 * SDP Pipeline: BS → BN → EW → OUT_CVT
+                 *
+                 * BS stage: ALU operand is per-channel from DMA (ALU_SRC=1)
+                 * or scalar from register (ALU_SRC=0).
+                 */
+                {
+                    bool bs_alu_src = (task->bs_cfg >> 8) & 1;
+                    int32_t bs_alu_op = bs_alu_src ? bias_buf[oc]
+                                                   : task->bs_alu_cfg;
+                    acc = apply_sdp_x_stage(acc, task->bs_cfg,
+                                             bs_alu_op,
+                                             task->bs_mul_cfg,
+                                             (int32_t)task->bs_relux_cmp);
+                }
+
+                /* BN stage: same structure as BS */
+                acc = apply_sdp_x_stage(acc, task->bn_cfg,
+                                         task->bn_alu_cfg,
+                                         task->bn_mul_cfg,
+                                         (int32_t)task->bn_relux_cmp);
+
+                /*
+                 * EW stage: element-wise operation with second tensor.
+                 * When active, reads from ERDMA source and applies ALU.
+                 */
+                if (!ew_bypass) {
+                    if (!ew_op_bypass) {
+                        int32_t ew_operand = 0;
+                        uint32_t ew_algo = (task->ew_cfg >> 16) & 0xf;
+
+                        /* Read EW source element from DMA buffer */
+                        if (ew_buf != NULL) {
+                            uint32_t og = oc / NPU_FEATURE_ATOMIC_SIZE;
+                            uint32_t oc_within = oc % NPU_FEATURE_ATOMIC_SIZE;
+                            uint32_t ew_off = npu_output_offset(og, oy, ox,
+                                                                 out_w, out_h);
+                            ew_operand = (int32_t)(int8_t)ew_buf[ew_off +
+                                                                  oc_within];
+                        }
+
+                        /* Apply EW ALU operation */
+                        switch (ew_algo) {
+                        case 0: /* MAX */
+                            if (acc < ew_operand) acc = ew_operand;
+                            break;
+                        case 1: /* MIN */
+                            if (acc > ew_operand) acc = ew_operand;
+                            break;
+                        case 2: /* ADD */
+                            acc += ew_operand;
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+
+                    /* EW CVT: offset + truncate */
+                    bool ew_cvt_bypass = (task->ew_cfg >> 8) & 1;
+                    if (!ew_cvt_bypass) {
+                        acc += task->ew_cvt_offset;
+                        uint32_t ew_trunc = (task->ew_cvt_scale >> 22) & 0x3ff;
+                        acc = (int32_t)nvdla_truncate(acc, ew_trunc);
+                    }
+
+                    /* EW ReLU */
+                    if (!((task->ew_cfg >> 9) & 1)) { /* EW_RELU_BYPASS */
+                        if (acc < 0) acc = 0;
+                    }
                 }
 
                 /*
-                 * Requantization: OUT_CVT
-                 * scaled = (acc * out_cvt_scale + rounding) >> out_cvt_shift
-                 * result = clamp(scaled + out_cvt_offset, -128, 127)
-                 *
-                 * Scale has implicit bit 14 set if < (1<<14).
-                 * The shift includes the 16-bit fractional part.
+                 * OUT_CVT: requantization
+                 * scaled = (acc * scale) >> shift   (NVDLA rounding)
+                 * result = clamp(scaled + offset, -128, 127)
                  */
-                int64_t scaled;
-                if (out_cvt_shift > 0) {
-                    int64_t rounding = 1LL << (out_cvt_shift - 1);
-                    scaled = ((int64_t)acc * (int64_t)out_cvt_scale + rounding)
-                             >> out_cvt_shift;
-                } else {
-                    scaled = (int64_t)acc * (int64_t)out_cvt_scale;
-                }
+                int64_t scaled = nvdla_shift_right_round64(
+                    (int64_t)acc * (int64_t)out_cvt_scale, out_cvt_shift);
+
+                /* Saturate to 17-bit signed before int8 clamp (NVDLA chain) */
+                if (scaled > 65535) scaled = 65535;
+                if (scaled < -65536) scaled = -65536;
 
                 int32_t result = (int32_t)scaled + out_cvt_offset;
 
@@ -584,6 +820,7 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     g_free(in_buf);
     g_free(wt_buf);
     g_free(bias_buf);
+    g_free(ew_buf);
     g_free(out_buf);
 }
 
