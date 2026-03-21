@@ -104,7 +104,10 @@ int rnpu_bo_prep(int fd, struct rnpu_bo *bo)
       .handle = bo->handle,
       .timeout_ns = 5000000000LL, /* 5s */
    };
-   return ioctl(fd, DRM_IOCTL_ROCKET_PREP_BO, &req);
+   int ret = ioctl(fd, DRM_IOCTL_ROCKET_PREP_BO, &req);
+   /* Kernel returns remaining jiffies (>0) on success, -1 on error */
+   if (ret > 0) ret = 0;
+   return ret;
 }
 
 int rnpu_bo_fini(int fd, struct rnpu_bo *bo)
@@ -133,7 +136,9 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
       .job_count = job_count,
       .job_struct_size = sizeof(struct drm_rocket_job),
    };
-   int ret = ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &req);
+   /* Use drmIoctl for EINTR/EAGAIN retry (matches Mesa) */
+   extern int drmIoctl(int fd, unsigned long request, void *arg);
+   int ret = drmIoctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &req);
    if (ret) {
       fprintf(stderr, "rnpu: SUBMIT failed: %s (jobs=%u)\n",
               strerror(errno), job_count);
