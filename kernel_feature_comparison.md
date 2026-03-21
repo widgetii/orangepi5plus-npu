@@ -106,6 +106,56 @@ scheduler that routes work across all codec blocks. On mainline, each block is
 exposed as a separate `/dev/video*` V4L2 device, and userspace manages
 parallelism directly.
 
+### VOD Transcoding Use Case
+
+VEPU580 (H.265) and VEPU721 (H.264) are independent hardware blocks with
+separate MMIO, clocks, and IRQs. A VOD transcoding pipeline can run both
+encoders simultaneously:
+
+```
+Source file
+    |
+    v
+VDPU381 (HW decode) --> shared DRAM buffer
+    |                         |
+    +-- RGA3 (HW scale) --> VEPU580 (H.265) --> HLS/DASH .265 segments
+    |
+    +-- RGA2 (HW scale) --> VEPU721 (H.264) --> HLS/DASH .264 segments
+```
+
+Approximate per-encoder throughput (from Rockchip specs):
+
+| Resolution | Encode speed | Time per rendition (2hr movie) |
+|---|---|---|
+| 4K@30 | ~1x realtime | ~2 hours |
+| 1080p@30 | ~4x realtime | ~30 min |
+| 720p@30 | ~6-8x realtime | ~15-20 min |
+| 480p@30 | ~10x+ realtime | ~12 min |
+
+Each encoder processes one stream at a time, so the ABR ladder is sequential
+within each codec but **parallel across codecs**. A 4-rendition ladder for a
+2-hour movie takes ~3 hours per codec — but both run simultaneously, so
+wall-clock time is ~3 hours for complete H.264 + H.265 ladders (vs ~6 hours
+sequential). Decode and scaling are essentially free (VDPU381 and RGA are much
+faster than encode).
+
+Constraints:
+- **Memory bandwidth** — simultaneous decode + 2x encode + 2x scale is heavy
+  at 4K; fine at 1080p and below
+- **Encode quality** — Hantro H2 hardware encoders produce lower quality-per-bit
+  than x265/x264 software. Acceptable for cost-effective mass transcoding
+  (IPTV, budget streaming), not for premium VOD (Netflix-quality)
+- **B-frame support** — Hantro H2 likely has limited B-frame support vs software
+  encoders, reducing compression efficiency
+- **Software stack** — requires vendor kernel + MPP; no mainline encoder driver.
+  FFmpeg + MPP integration exists but isn't upstream
+
+At ~10W TDP, RK3588 could serve as a low-power transcoding node doing both
+H.264 + H.265 ABR ladders in roughly realtime for 4K content, or 3-4x realtime
+for 1080p. A rack of these could compete with a single Xeon for bulk
+transcoding at a fraction of the power budget, trading encode quality for
+power efficiency.
+
 ### Encode — NOT upstream
 
 - **JPEG encode** (VEPU121): merged in Linux 6.12
