@@ -9,12 +9,6 @@ echo ""
 echo "=== QEMU RK3588 Vendor Kernel Boot ==="
 echo "Kernel: $(uname -r)"
 
-# Load qemu_reset module if available
-if [ -f /lib/modules/qemu_reset.ko ]; then
-    echo "Loading qemu_reset.ko..."
-    insmod /lib/modules/qemu_reset.ko
-fi
-
 # Wait for deferred probes to complete (RKNPU takes ~15s)
 echo "Waiting for RKNPU driver probe..."
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do

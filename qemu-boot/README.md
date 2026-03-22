@@ -81,20 +81,21 @@ A few `NPU job timed out` messages during MobileNetV1 are normal — the
 deferred-IRQ timer in the QEMU NPU model fires asynchronously with TCG
 timeslicing, so the DRM scheduler occasionally retries. Results are correct.
 
-No custom kernel modules are needed — the QEMU machine emulates the RK3588
-CRU clock/reset controller, so the kernel's built-in Rockchip reset driver
-provides all necessary reset controls.
+No custom kernel modules are needed for either kernel — the QEMU machine
+emulates the RK3588 CRU clock/reset controller, so each kernel's built-in
+Rockchip clock driver provides all necessary reset controls. Both kernels
+use the same QEMU-generated device tree (no external `-dtb` file required).
 
 ## Running — Vendor Kernel (RKNPU Driver)
 
-The vendor kernel requires more memory and an explicit CMA reservation:
+The vendor kernel needs an explicit CMA reservation (and typically more
+memory):
 
 ```sh
 qemu-system-aarch64 \
   -M orangepi5plus -m 3G -nographic -smp 4 \
   -kernel Image-vendor \
   -initrd initrd-vendor.gz \
-  -dtb vendor.dtb \
   -append "console=ttyS0,1500000 earlycon panic=10 cma=64M"
 ```
 
@@ -104,7 +105,6 @@ qemu-system-aarch64 \
 |-----------|-------|-----|
 | `-m` | 2G-4G+ | Any size works. RAM >3838 MiB is capped at the MMIO boundary with a warning |
 | `cma=64M` | Required | Default 16MB CMA is too small; the RKNPU driver allocates ~8MB contiguous for the activation buffer |
-| `-dtb vendor.dtb` | Required | Vendor kernel needs the single-node `rockchip,rk3588-rknpu` binding |
 
 The RKNPU driver probe takes ~15 seconds (deferred probe). The init script
 waits, then runs:
@@ -173,7 +173,6 @@ and boot with the command above.
 |------|-------------|
 | `Image-6.18` | Mainline Linux 6.18 kernel (aarch64) |
 | `Image-vendor` | Vendor kernel 6.1.115-vendor-rk35xx |
-| `vendor.dtb` | Device tree for vendor kernel (single rknpu node) |
 | `initrd.gz` | Rocket initrd (busybox + modules + tests + model) |
 | `initrd-vendor.gz` | RKNPU initrd (busybox + tests + model) |
 | `model.tflite` | MobileNetV1 INT8 quantised TFLite model |
