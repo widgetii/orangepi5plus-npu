@@ -400,24 +400,14 @@ static void *rk3588_get_dtb(const struct arm_boot_info *info, int *size)
 }
 
 /*
- * arm_boot.c overwrites /memory with a single contiguous region
- * (loader_start → loader_start + ram_size). When RAM has a gap (low ends
- * at 0xF0000000, high starts at 0x100000000), the kernel sees "RAM" where
- * there's no backing memory and crashes. Fix up /memory after arm_boot.
+ * arm_boot.c sets /memory reg from loader_start + machine->ram_size.
+ * Since we cap ram_size below the MMIO hole, the single-region layout
+ * is correct. No-op placeholder for future use.
  */
 static void rk3588_modify_dtb(const struct arm_boot_info *info, void *fdt)
 {
-    uint64_t ram_size = rk3588_ms->ram_size;
-    uint64_t low_size = MIN(ram_size, RK3588_RAM_LOW_TOP - RK3588_RAM_BASE);
-
-    if (ram_size > low_size) {
-        uint64_t high_size = ram_size - low_size;
-        uint64_t mem_reg[4] = {
-            cpu_to_be64(RK3588_RAM_BASE), cpu_to_be64(low_size),
-            cpu_to_be64(RK3588_RAM_HIGH_BASE), cpu_to_be64(high_size),
-        };
-        qemu_fdt_setprop(fdt, "/memory", "reg", mem_reg, sizeof(mem_reg));
-    }
+    (void)info;
+    (void)fdt;
 }
 
 static void rk3588_init(MachineState *ms)
@@ -429,7 +419,15 @@ static void rk3588_init(MachineState *ms)
     uint64_t ram_size = ms->ram_size;
 
     rk3588_ms = ms;
-    uint64_t low_size = MIN(ram_size, RK3588_RAM_LOW_TOP - RK3588_RAM_BASE);
+    uint64_t max_low = RK3588_RAM_LOW_TOP - RK3588_RAM_BASE;
+    if (ram_size > max_low) {
+        warn_report("RAM size %" PRIu64 " MiB exceeds max usable %"
+                    PRIu64 " MiB (MMIO hole at 0x%llx). Capping.",
+                    ram_size / MiB, max_low / MiB,
+                    (unsigned long long)RK3588_RAM_LOW_TOP);
+        ram_size = max_low;
+    }
+    uint64_t low_size = ram_size;
     MemoryRegion *lowram = g_new(MemoryRegion, 1);
 
     /* RAM */

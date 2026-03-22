@@ -33,28 +33,26 @@
 /*
  * Decode a page table entry to a physical address.
  *
- * Rockchip IOMMU has two formats:
- *   v1 DTE: phys = entry & 0xFFFFFC00  (1KB-aligned page table base)
- *   v1 PTE: phys = entry & 0xFFFFF000  (4KB page)
- *   v2 DTE: phys = (entry & 0xFFFFF000) | ((entry >> 4) & 0xFF) << 32
- *   v2 PTE: same as v2 DTE
+ * Rockchip IOMMU v2 encodes up to 40-bit physical addresses:
+ *   DTE: phys[31:4] from entry[31:4], phys[39:32] from entry[11:4]
+ *   PTE: phys[31:12] from entry[31:12], phys[39:32] from entry[11:4]
  *
- * For systems with <=4GB RAM (our case), bits 39:32 are always 0, so
- * v2 high-bit encoding is irrelevant. We use v1 masks which are wider
- * and correctly decode both v1 and v2 entries in the <4GB range.
+ * For page-aligned addresses (bits [11:0] = 0), the low bits of the
+ * entry are reused to carry high address bits without aliasing.
+ * This handles pages in high memory (>4GB).
  */
 static hwaddr rk_iommu_decode_dte(uint32_t entry)
 {
-    /* v1: pt_addr = entry & 0xFFFFFC00 (1KB-aligned, covers <4GB) */
+    /* Page table base is always in <4GB memory (DMA zone).
+     * Use v1 mask (1KB-aligned) which works for both v1 and v2. */
     return (hwaddr)(entry & 0xFFFFFC00ULL);
 }
 
 static hwaddr rk_iommu_decode_pte(uint32_t entry)
 {
-    /* v1: page_addr = entry & 0xFFFFF000
-     * v2: page_addr = (entry & 0xFFFFF000) | ((entry >> 4) & 0xFF) << 32
-     * Both equivalent for <4GB */
-    return (hwaddr)(entry & 0xFFFFF000ULL);
+    hwaddr lo = (hwaddr)(entry & 0xFFFFF000ULL);
+    hwaddr hi = ((hwaddr)((entry >> 4) & 0xFF)) << 32;
+    return lo | hi;
 }
 
 hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova)
@@ -108,7 +106,17 @@ hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova)
 
     /* Decode page physical address from PTE (4KB page) */
     hwaddr page_phys = rk_iommu_decode_pte(pte);
-    return page_phys + offset;
+    hwaddr result = page_phys + offset;
+    static int xlate_count = 0;
+    if (xlate_count < 20) {
+        qemu_log_mask(LOG_UNIMP,
+                      "rockchip-iommu: XLATE iova=0x%08x → DTE[%u]=0x%08x "
+                      "pt=0x%lx PTE[%u]=0x%08x → gpa=0x%lx\n",
+                      iova, dte_idx, dte, (unsigned long)pt_base,
+                      pte_idx, pte, (unsigned long)result);
+        xlate_count++;
+    }
+    return result;
 }
 
 /* ======================================================================
@@ -157,6 +165,9 @@ void rk_iommu_instance_write(RkIOMMUInstance *inst, hwaddr addr,
             inst->paging_enabled = true;
             inst->active_dte_addr = inst->dte_addr;
             inst->status |= RK_IOMMU_STATUS_PAGING_ENABLED;
+            if (inst->parent) {
+                inst->parent->last_active_dte = inst->active_dte_addr;
+            }
             qemu_log_mask(LOG_UNIMP,
                           "rockchip-iommu: ENABLE_PAGING (DTE=0x%08x)\n",
                           inst->active_dte_addr);
@@ -243,6 +254,7 @@ static void rk_iommu_realize(DeviceState *dev, Error **errp)
 
     for (int i = 0; i < RK_IOMMU_NUM_INSTANCES; i++) {
         RkIOMMUInstance *inst = &s->instances[i];
+        inst->parent = s;
         char name[32];
         snprintf(name, sizeof(name), "rockchip-iommu-%d", i);
         inst->status = RK_IOMMU_STATUS_IDLE |

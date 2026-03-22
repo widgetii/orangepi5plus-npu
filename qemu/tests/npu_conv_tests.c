@@ -20,6 +20,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <time.h>
 
 /* ======================================================================
  * DRM ioctl definitions — shared base
@@ -274,9 +275,12 @@ static int npu_submit_and_wait(int fd, struct npu_bo *regcmd_bo,
         int ret = ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &submit);
         if (ret < 0) return ret;
 
+        struct timespec _ts;
+        clock_gettime(CLOCK_MONOTONIC, &_ts);
+        int64_t _abs = (int64_t)_ts.tv_sec * 1000000000LL + _ts.tv_nsec + 5000000000LL;
         struct drm_rocket_prep_bo prep = {
             .handle = out_bos[0]->handle,
-            .timeout_ns = 5000000000LL,
+            .timeout_ns = _abs,
         };
         ret = ioctl(fd, DRM_IOCTL_ROCKET_PREP_BO, &prep);
         return (ret < 0) ? ret : 0;

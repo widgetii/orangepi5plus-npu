@@ -385,10 +385,13 @@ int main(void)
         printf("SUBMIT succeeded!\n");
     }
 
-    /* Wait for completion by PREP_BO on output */
+    /* Wait for completion by PREP_BO on output (absolute timeout) */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t abs_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec + 5000000000LL;
     struct drm_rocket_prep_bo prep = {
         .handle = out_h,
-        .timeout_ns = 5000000000LL,  /* 5 seconds */
+        .timeout_ns = abs_ns,
     };
     printf("Waiting for NPU completion...\n");
     ret = ioctl(fd, DRM_IOCTL_ROCKET_PREP_BO, &prep);

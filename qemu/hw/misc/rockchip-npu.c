@@ -612,9 +612,6 @@ static void execute_job(RockchipNPUState *s, RocketNPUCore *core,
     core->pc_irq_raw_status |= 0x0300; /* DPU_0 | DPU_1 */
     core->pc_irq_status = core->pc_irq_raw_status & core->pc_irq_mask;
     if (core->pc_irq_status) {
-        /* Defer IRQ delivery so the MMIO write returns to guest first.
-         * Without this, the DRM scheduler's fence callback fires during the
-         * OP_ENABLE handler, reusing stale per-core state for the next job. */
         int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
         timer_mod(core->irq_timer, now + 1);
     }

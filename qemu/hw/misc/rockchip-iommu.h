@@ -51,6 +51,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RockchipIOMMUState, ROCKCHIP_IOMMU)
 /* Per-instance register state */
 typedef struct RkIOMMUInstance {
     MemoryRegion iomem;
+    struct RockchipIOMMUState *parent; /* back-pointer for last_active_dte */
     uint32_t dte_addr;         /* staging register (written by MMIO) */
     uint32_t active_dte_addr;  /* latched on ENABLE_PAGING */
     uint32_t status;
