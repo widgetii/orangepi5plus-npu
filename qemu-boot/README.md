@@ -81,6 +81,10 @@ A few `NPU job timed out` messages during MobileNetV1 are normal — the
 deferred-IRQ timer in the QEMU NPU model fires asynchronously with TCG
 timeslicing, so the DRM scheduler occasionally retries. Results are correct.
 
+No custom kernel modules are needed — the QEMU machine emulates the RK3588
+CRU clock/reset controller, so the kernel's built-in Rockchip reset driver
+provides all necessary reset controls.
+
 ## Running — Vendor Kernel (RKNPU Driver)
 
 The vendor kernel requires more memory and an explicit CMA reservation:
@@ -121,71 +125,37 @@ harmless.
 
 ## Running — Full Armbian Rootfs
 
-Boots the real Armbian 25.11.1 Noble image with networking, package
-management, and all Armbian services (zram, ramlog, hw-monitor, etc.):
+Boots a real Armbian disk image with networking, package management, and all
+Armbian services. The image is used as-is (full GPT disk image, no partition
+extraction needed):
 
 ```sh
 qemu-system-aarch64 \
   -M orangepi5plus -m 2G -nographic -smp 4 \
   -kernel Image-6.18 \
-  -append "console=ttyS0,1500000 earlycon panic=10 root=/dev/vda rw" \
-  -drive file=armbian_rootfs.img,format=raw,if=none,id=hd0 \
+  -append "console=ttyS0,1500000 earlycon panic=10 root=LABEL=armbi_root rw" \
+  -drive file=armbian.img,format=raw,if=none,id=hd0 \
   -device virtio-blk-device,drive=hd0 \
   -netdev user,id=net0 -device virtio-net-device,netdev=net0
 ```
 
 ### Preparing the rootfs image
 
-A script automates all of the steps below:
+The stock Armbian image ships with the vendor 6.1 kernel which lacks virtio
+drivers. A script installs mainline kernel modules into the image:
 
 ```sh
-bash qemu-boot/mkrootfs.sh              # produces qemu-boot/armbian_rootfs.img
+bash qemu-boot/mkrootfs.sh              # produces qemu-boot/armbian.img
 bash qemu-boot/mkrootfs.sh /tmp/my.img  # or specify output path
 ```
 
-**Manual steps** (for reference, or if the script needs adjustment):
+This is the **only** preparation step — the script downloads the Armbian
+image, installs kernel modules, and produces a bootable image. No partition
+extraction, fstab fixups, or custom kernel modules are needed.
 
-1. Download Armbian Noble minimal for Orange Pi 5 Plus:
-   ```sh
-   curl -L -o armbian.img.xz \
-     "https://dl.armbian.com/orangepi5-plus/Noble_vendor_minimal"
-   xz -d armbian.img.xz
-   ```
-
-2. Extract the rootfs partition to a standalone image:
-   ```sh
-   # Find partition offset (typically 32768 sectors × 512 bytes)
-   fdisk -l armbian.img
-   dd if=armbian.img of=armbian_rootfs.img bs=512 skip=32768 count=3235807
-   truncate -s 2G armbian_rootfs.img
-   e2fsck -f armbian_rootfs.img && resize2fs armbian_rootfs.img
-   ```
-
-3. Install mainline kernel modules (the stock image ships vendor 6.1 only):
-   ```sh
-   # Download Armbian kernel deb
-   # Find exact filename at https://apt.armbian.com/pool/main/l/linux-6.18.10/
-   curl -L -o linux-image.deb \
-     "https://apt.armbian.com/pool/main/l/linux-6.18.10/linux-image-current-rockchip64_26.2.1_arm64__6.18.10-S41ce-D1d59-P992d-C2cce-H050e-HK01ba-Vc222-B052a-R448a.deb"
-   mkdir deb && cd deb && ar x ../linux-image.deb
-   sudo mount -o loop armbian_rootfs.img /mnt
-   sudo tar xf data.tar.xz -C /mnt ./lib/modules/6.18.10-current-rockchip64/
-   ```
-
-4. Install QEMU helper modules and configure:
-   ```sh
-   MODDIR="/mnt/lib/modules/6.18.10-current-rockchip64"
-   sudo cp qemu_reset.ko qemu_iommu.ko "$MODDIR/kernel/drivers/"
-   sudo chroot /mnt depmod 6.18.10-current-rockchip64
-   echo -e "qemu_reset\nqemu_iommu" | sudo tee /mnt/etc/modules-load.d/qemu.conf
-   ```
-
-5. Fix fstab (stock image uses UUID that won't match):
-   ```sh
-   echo "/dev/vda / ext4 defaults,noatime 0 1" | sudo tee /mnt/etc/fstab
-   echo "tmpfs /tmp tmpfs defaults,nosuid 0 0" | sudo tee -a /mnt/etc/fstab
-   sudo umount /mnt
-   ```
+**For raw eMMC/SD dumps** from an existing board: just install the mainline
+kernel modules into the rootfs partition (mount with `mount -o loop,offset=...`)
+and boot with the command above.
 
 ### What works
 
@@ -193,9 +163,8 @@ bash qemu-boot/mkrootfs.sh /tmp/my.img  # or specify output path
 - **Networking**: `eth0` via virtio-net, DHCP at `10.0.2.x`, full internet
   (`wget https://example.com` works)
 - **NPU**: All 3 Rocket cores probe, `/dev/accel/accel0` available
-- **Root disk**: virtio-blk at `/dev/vda`
-- **0 failed systemd units** (only `serial-getty@ttyFIQ0` dep fails — expected,
-  no Rockchip FIQ debugger UART in QEMU)
+- **Root disk**: virtio-blk with GPT, kernel finds root via `LABEL=armbi_root`
+- **No custom kernel modules** — CRU provides resets, stock IOMMU driver works
 - Armbian auto-login on serial console, first-run password wizard works
 
 ## File Inventory
@@ -246,14 +215,21 @@ grep -E "CONV TESTS|RESULT|exit code" /tmp/rocket_test.log
 
 The QEMU machine (`orangepi5plus`) emulates:
 
-- 4× Cortex-A55 (EL3 enabled for vendor kernel SMC calls)
+- 4x Cortex-A55 (EL3 enabled for vendor kernel SMC calls)
 - GICv3 interrupt controller
 - DW UART2 at 0xfeb50000
-- CRU/PMU stubs (PLL lock bits)
+- RK3588 CRU (clock/reset controller) with PLL lock bit emulation
 - GRF/IOC stubs (for vendor kernel built-in drivers)
-- 3× NPU cores at 0xfdab0000/0xfdac0000/0xfdad0000
+- 3x NPU cores at 0xfdab0000/0xfdac0000/0xfdad0000
 - Rockchip IOMMU v2 (page-table walk)
-- 8× virtio-mmio transports (for virtio-blk root disk and virtio-net)
+- 8x virtio-mmio transports (for virtio-blk root disk and virtio-net)
+
+The CRU stub emulates enough of the RK3588 Clock and Reset Unit for the
+kernel's built-in `rockchip,rk3588-cru` driver to probe. This registers
+both clocks and the soft reset controller, eliminating the need for the
+custom `qemu_reset.ko` module. All PLL registers default to zero (slow mode,
+24 MHz), which is safe — no division-by-zero, and correct enough for
+emulation where actual clock rates don't matter.
 
 The NPU model executes INT8 convolutions in software (C loops) inside the
 MMIO write handler for `PC_OPERATION_ENABLE`, then defers the completion IRQ

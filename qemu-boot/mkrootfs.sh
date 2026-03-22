@@ -1,20 +1,21 @@
 #!/bin/bash
 #
-# Build a QEMU-bootable rootfs image from the official Armbian image.
+# Prepare an Armbian disk image for QEMU booting.
+#
+# Downloads the Armbian Noble minimal image, installs mainline 6.18 kernel
+# modules (the stock image ships only vendor 6.1, which lacks virtio), and
+# produces a ready-to-boot full disk image. The QEMU machine's built-in CRU
+# reset controller eliminates the need for any custom kernel modules.
 #
 # Usage:
 #   bash qemu-boot/mkrootfs.sh [output.img]
 #
-# The script downloads the Armbian Noble minimal image, extracts the rootfs
-# partition, installs mainline 6.18 kernel modules + QEMU helper modules,
-# fixes fstab, and produces a ready-to-boot ext4 image.
-#
-# Requirements: curl, xz, fdisk, e2fsck, resize2fs, qemu-aarch64-static
+# Requirements: curl, xz, fdisk, qemu-aarch64-static (optional, for depmod)
 #
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-OUTPUT="${1:-$SCRIPT_DIR/armbian_rootfs.img}"
+OUTPUT="${1:-$SCRIPT_DIR/armbian.img}"
 WORK="/tmp/mkrootfs-$$"
 MNT="$WORK/mnt"
 
@@ -29,34 +30,21 @@ mkdir -p "$WORK" "$MNT"
 
 # ── 1. Download Armbian image ────────────────────────────────────────────
 ARMBIAN_XZ="$WORK/armbian.img.xz"
-ARMBIAN_IMG="$WORK/armbian.img"
-if [ -f "$ARMBIAN_IMG" ]; then
-    echo "Armbian image already exists, skipping download"
+if [ -f "$OUTPUT" ]; then
+    echo "Output image already exists, skipping download"
+    ARMBIAN_IMG="$OUTPUT"
 else
     echo "Downloading Armbian Noble minimal..."
     curl -L -o "$ARMBIAN_XZ" "$ARMBIAN_URL"
     echo "Decompressing..."
-    xz -d "$ARMBIAN_XZ"
+    xz -d -c "$ARMBIAN_XZ" > "$OUTPUT"
+    ARMBIAN_IMG="$OUTPUT"
 fi
 
-# ── 2. Extract rootfs partition ──────────────────────────────────────────
-echo "Extracting rootfs partition..."
-# Parse partition offset from fdisk
-PART_INFO=$(fdisk -l "$ARMBIAN_IMG" 2>/dev/null | grep '\.img1')
-START=$(echo "$PART_INFO" | awk '{print $2}')
-COUNT=$(echo "$PART_INFO" | awk '{print $4}')
-
-dd if="$ARMBIAN_IMG" of="$OUTPUT" bs=512 skip="$START" count="$COUNT" \
-    status=progress 2>&1
-rm -f "$ARMBIAN_IMG"
-
-# Resize to 2 GB
-truncate -s 2G "$OUTPUT"
-e2fsck -f -y "$OUTPUT" >/dev/null 2>&1 || true
-resize2fs "$OUTPUT" >/dev/null 2>&1
-echo "Rootfs image: $(ls -lh "$OUTPUT" | awk '{print $5}')"
-
-# ── 3. Install mainline kernel modules ───────────────────────────────────
+# ── 2. Install mainline kernel modules ───────────────────────────────────
+# The stock Armbian image ships vendor kernel 6.1 which lacks virtio-blk
+# and virtio-net drivers. Install mainline 6.18 modules so the kernel
+# (passed via -kernel) can find its modules.
 echo "Downloading kernel modules..."
 DEB="$WORK/linux-image.deb"
 curl -sL -o "$DEB" "$KERNEL_DEB_URL"
@@ -65,14 +53,12 @@ echo "Extracting modules..."
 mkdir -p "$WORK/deb" && cd "$WORK/deb"
 ar x "$DEB"
 
-sudo mount -o loop "$OUTPUT" "$MNT"
-sudo tar xf data.tar.xz -C "$MNT" ./lib/modules/"$KERNEL_VER"/
+# Mount the rootfs partition (first partition in the GPT image)
+PART_INFO=$(fdisk -l "$OUTPUT" 2>/dev/null | grep "${OUTPUT}1\|\.img1")
+START=$(echo "$PART_INFO" | awk '{print $2}')
+sudo mount -o loop,offset=$((START * 512)) "$OUTPUT" "$MNT"
 
-# ── 4. Install QEMU helper modules ──────────────────────────────────────
-echo "Installing QEMU helper modules..."
-MODDIR="$MNT/lib/modules/$KERNEL_VER"
-sudo cp "$SCRIPT_DIR/qemu_reset.ko" "$MODDIR/kernel/drivers/"
-sudo cp "$SCRIPT_DIR/qemu_iommu.ko" "$MODDIR/kernel/drivers/"
+sudo tar xf data.tar.xz -C "$MNT" ./lib/modules/"$KERNEL_VER"/
 
 # Run depmod (needs qemu-aarch64-static for cross-arch chroot)
 if command -v qemu-aarch64-static >/dev/null 2>&1; then
@@ -84,31 +70,13 @@ else
     echo "  Modules will still work but modprobe may not auto-resolve deps"
 fi
 
-sudo mkdir -p "$MNT/etc/modules-load.d"
-echo -e "qemu_reset\nqemu_iommu" | sudo tee "$MNT/etc/modules-load.d/qemu.conf" >/dev/null
-
-# ── 5. Fix fstab and serial console ─────────────────────────────────────
-echo "Configuring fstab and serial console..."
-printf '/dev/vda / ext4 defaults,noatime 0 1\ntmpfs /tmp tmpfs defaults,nosuid 0 0\n' \
-    | sudo tee "$MNT/etc/fstab" >/dev/null
-
-# Enable serial console on ttyS0 (QEMU UART, not ttyFIQ0)
-sudo mkdir -p "$MNT/etc/systemd/system/getty.target.wants"
-sudo ln -sf /lib/systemd/system/serial-getty@.service \
-    "$MNT/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service"
-
-# Ensure systemd-networkd is enabled for virtio-net DHCP
-sudo mkdir -p "$MNT/etc/systemd/network"
-printf '[Match]\nName=eth* en*\n\n[Network]\nDHCP=yes\n' \
-    | sudo tee "$MNT/etc/systemd/network/20-wired.network" >/dev/null
-
 sudo umount "$MNT"
 
 echo ""
 echo "Done! Boot with:"
 echo "  qemu-system-aarch64 -M orangepi5plus -m 2G -nographic -smp 4 \\"
 echo "    -kernel $SCRIPT_DIR/Image-6.18 \\"
-echo "    -append 'console=ttyS0,1500000 earlycon panic=10 root=/dev/vda rw' \\"
+echo "    -append 'console=ttyS0,1500000 earlycon panic=10 root=LABEL=armbi_root rw' \\"
 echo "    -drive file=$OUTPUT,format=raw,if=none,id=hd0 \\"
 echo "    -device virtio-blk-device,drive=hd0 \\"
 echo "    -netdev user,id=net0 -device virtio-net-device,netdev=net0"

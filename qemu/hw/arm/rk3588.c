@@ -39,10 +39,15 @@
 #define GIC_NUM_SPI 256
 
 /*
- * CRU stub — returns PLL lock bit (bit 6) for PLL status registers to
- * prevent the vendor kernel's rockchip-clk driver from spinning forever.
+ * CRU stub — stores register values for the Rockchip CRU clock/reset
+ * controller driver. Returns PLL lock bit (bit 15) for PLL status registers
+ * so the kernel's rockchip-clk driver doesn't spin waiting for PLL lock.
+ *
+ * The mainline kernel's rk3588-cru driver uses the CRU to register both
+ * clocks and reset controllers. By emulating enough of the CRU, we get
+ * a built-in reset controller and eliminate the custom qemu_reset.ko module.
  */
-#define CRU_STUB_REGS  (0x10000 / 4)
+#define CRU_STUB_REGS  (RK3588_CRU_SIZE / 4)
 
 typedef struct RK3588CRUStub {
     MemoryRegion iomem;
@@ -55,8 +60,13 @@ static uint64_t rk3588_cru_read(void *opaque, hwaddr addr, unsigned size)
     uint32_t idx = addr / 4;
 
     if (idx < CRU_STUB_REGS) {
+        /*
+         * PLL lock status: each PLL has 8 registers (0x20 spacing).
+         * The status register is at offset +0x18 within each PLL block.
+         * Bit 15 = PLL lock. PLLs span the first 0x200 bytes of the CRU.
+         */
         if (addr < 0x200 && (addr & 0x1F) == 0x18) {
-            return s->regs[idx] | (1 << 6);
+            return s->regs[idx] | (1 << 15);
         }
         return s->regs[idx];
     }
@@ -217,13 +227,58 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
     qemu_fdt_setprop_cell(fdt, "/npu-clk", "clock-frequency", 1000000000);
     qemu_fdt_setprop_cell(fdt, "/npu-clk", "phandle", clk_phandle);
 
-    /* Dummy reset controller (qemu_reset.ko module) */
-    int rst_phandle = qemu_fdt_alloc_phandle(fdt);
-    qemu_fdt_add_subnode(fdt, "/npu-reset");
-    qemu_fdt_setprop_string(fdt, "/npu-reset", "compatible",
-                            "qemu,reset-dummy");
-    qemu_fdt_setprop_cell(fdt, "/npu-reset", "#reset-cells", 1);
-    qemu_fdt_setprop_cell(fdt, "/npu-reset", "phandle", rst_phandle);
+    /*
+     * System GRF (General Register File) as syscon.
+     * The CRU driver looks up "rockchip,grf" for PLL lock status.
+     * Our unimplemented_device MMIO stub handles reads (returns 0).
+     */
+    int grf_phandle = qemu_fdt_alloc_phandle(fdt);
+    qemu_fdt_add_subnode(fdt, "/syscon@fd58c000");
+    {
+        char *grf_compat[] = {
+            (char *)"rockchip,rk3588-sys-grf",
+            (char *)"syscon",
+        };
+        qemu_fdt_setprop_string_array(fdt, "/syscon@fd58c000", "compatible",
+                                      grf_compat, 2);
+    }
+    uint64_t grf_reg[2] = {
+        cpu_to_be64(0xfd58c000ULL), cpu_to_be64(0x1000),
+    };
+    qemu_fdt_setprop(fdt, "/syscon@fd58c000", "reg",
+                     grf_reg, sizeof(grf_reg));
+    qemu_fdt_setprop_cell(fdt, "/syscon@fd58c000", "phandle", grf_phandle);
+
+    /*
+     * CRU (Clock and Reset Unit) — the kernel's built-in rockchip-clk
+     * driver probes this node and registers both clocks and the reset
+     * controller. This eliminates the need for qemu_reset.ko.
+     *
+     * With all PLL registers at zero + lock bit set, PLLs report as
+     * "slow mode" (24 MHz) — no division-by-zero, just low clock rates.
+     * The soft reset registers at CRU+0xA00 are backed by our read/write
+     * CRU stub, so assert/deassert works correctly.
+     */
+    int cru_phandle = qemu_fdt_alloc_phandle(fdt);
+    qemu_fdt_add_subnode(fdt, "/clock-controller@fd7c0000");
+    qemu_fdt_setprop_string(fdt, "/clock-controller@fd7c0000",
+                            "compatible", "rockchip,rk3588-cru");
+    uint64_t cru_reg[2] = {
+        cpu_to_be64(RK3588_CRU_BASE), cpu_to_be64(RK3588_CRU_SIZE),
+    };
+    qemu_fdt_setprop(fdt, "/clock-controller@fd7c0000", "reg",
+                     cru_reg, sizeof(cru_reg));
+    qemu_fdt_setprop_cell(fdt, "/clock-controller@fd7c0000",
+                          "#clock-cells", 1);
+    qemu_fdt_setprop_cell(fdt, "/clock-controller@fd7c0000",
+                          "#reset-cells", 1);
+    qemu_fdt_setprop_cell(fdt, "/clock-controller@fd7c0000",
+                          "phandle", cru_phandle);
+    {
+        uint32_t grf_ref = cpu_to_be32(grf_phandle);
+        qemu_fdt_setprop(fdt, "/clock-controller@fd7c0000", "rockchip,grf",
+                         &grf_ref, sizeof(grf_ref));
+    }
 
     /* Rockchip IOMMU */
     int iommu_phandle = qemu_fdt_alloc_phandle(fdt);
@@ -252,18 +307,19 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
     qemu_fdt_setprop(fdt, "/iommu@fdab9000", "interrupts",
                      iommu_irqs, sizeof(iommu_irqs));
     qemu_fdt_setprop_cell(fdt, "/iommu@fdab9000", "#iommu-cells", 0);
-    uint32_t iommu_clks[6];
-    for (int i = 0; i < 6; i++)
-        iommu_clks[i] = cpu_to_be32(clk_phandle);
+    /* The mainline rockchip-iommu driver uses devm_clk_get(dev, "aclk")
+     * and devm_clk_get(dev, "iface"). Provide two named clocks. */
+    uint32_t iommu_clks[2] = {
+        cpu_to_be32(clk_phandle), cpu_to_be32(clk_phandle),
+    };
     qemu_fdt_setprop(fdt, "/iommu@fdab9000", "clocks",
                      iommu_clks, sizeof(iommu_clks));
     {
         char *clk_names[] = {
-            (char *)"aclk0", (char *)"aclk1", (char *)"aclk2",
-            (char *)"hclk0", (char *)"hclk1", (char *)"hclk2",
+            (char *)"aclk", (char *)"iface",
         };
         qemu_fdt_setprop_string_array(fdt, "/iommu@fdab9000",
-                                      "clock-names", clk_names, 6);
+                                      "clock-names", clk_names, 2);
     }
     qemu_fdt_setprop_string(fdt, "/iommu@fdab9000", "status", "okay");
     qemu_fdt_setprop_cell(fdt, "/iommu@fdab9000", "phandle", iommu_phandle);
@@ -306,13 +362,14 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
         qemu_fdt_setprop_string_array(fdt, "/npu@fdab0000",
                                       "clock-names", clk_names, 8);
     }
+    /* Reset IDs from dt-bindings/reset/rockchip,rk3588-cru.h */
     uint32_t npu_rsts[12] = {
-        cpu_to_be32(rst_phandle), cpu_to_be32(0),
-        cpu_to_be32(rst_phandle), cpu_to_be32(1),
-        cpu_to_be32(rst_phandle), cpu_to_be32(2),
-        cpu_to_be32(rst_phandle), cpu_to_be32(3),
-        cpu_to_be32(rst_phandle), cpu_to_be32(4),
-        cpu_to_be32(rst_phandle), cpu_to_be32(5),
+        cpu_to_be32(cru_phandle), cpu_to_be32(272),  /* SRST_A_RKNN0 */
+        cpu_to_be32(cru_phandle), cpu_to_be32(250),  /* SRST_A_RKNN1 */
+        cpu_to_be32(cru_phandle), cpu_to_be32(254),  /* SRST_A_RKNN2 */
+        cpu_to_be32(cru_phandle), cpu_to_be32(274),  /* SRST_H_RKNN0 */
+        cpu_to_be32(cru_phandle), cpu_to_be32(252),  /* SRST_H_RKNN1 */
+        cpu_to_be32(cru_phandle), cpu_to_be32(256),  /* SRST_H_RKNN2 */
     };
     qemu_fdt_setprop(fdt, "/npu@fdab0000", "resets",
                      npu_rsts, sizeof(npu_rsts));
@@ -387,9 +444,12 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
             qemu_fdt_setprop_string_array(fdt, node, "clock-names",
                                           core_clk_names, 4);
         }
+        /* SRST_A_RKNN{0,1,2} and SRST_H_RKNN{0,1,2} from rk3588-cru.h */
+        static const uint32_t srst_a_rknn[] = { 272, 250, 254 };
+        static const uint32_t srst_h_rknn[] = { 274, 252, 256 };
         uint32_t core_rsts[4] = {
-            cpu_to_be32(rst_phandle), cpu_to_be32(i * 2 + 6),
-            cpu_to_be32(rst_phandle), cpu_to_be32(i * 2 + 7),
+            cpu_to_be32(cru_phandle), cpu_to_be32(srst_a_rknn[i]),
+            cpu_to_be32(cru_phandle), cpu_to_be32(srst_h_rknn[i]),
         };
         qemu_fdt_setprop(fdt, node, "resets",
                          core_rsts, sizeof(core_rsts));

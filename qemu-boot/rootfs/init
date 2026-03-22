@@ -4,7 +4,6 @@ mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 
 echo "Loading kernel modules..."
-insmod /lib/modules/qemu_reset.ko
 insmod /lib/modules/drm_shmem_helper.ko
 insmod /lib/modules/gpu-sched.ko
 insmod /lib/modules/rocket.ko
