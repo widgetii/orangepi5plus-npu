@@ -113,21 +113,12 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
     /* /memory */
     qemu_fdt_add_subnode(fdt, "/memory");
     qemu_fdt_setprop_string(fdt, "/memory", "device_type", "memory");
-    uint64_t ram_size = ms->ram_size;
-    uint64_t low_size = MIN(ram_size, RK3588_RAM_LOW_TOP - RK3588_RAM_BASE);
-    if (ram_size > low_size) {
-        uint64_t high_size = ram_size - low_size;
-        uint64_t mem_reg[4] = {
-            cpu_to_be64(RK3588_RAM_BASE), cpu_to_be64(low_size),
-            cpu_to_be64(RK3588_RAM_HIGH_BASE), cpu_to_be64(high_size),
-        };
-        qemu_fdt_setprop(fdt, "/memory", "reg", mem_reg, sizeof(mem_reg));
-    } else {
-        uint64_t mem_reg[2] = {
-            cpu_to_be64(RK3588_RAM_BASE), cpu_to_be64(low_size),
-        };
-        qemu_fdt_setprop(fdt, "/memory", "reg", mem_reg, sizeof(mem_reg));
-    }
+    uint64_t ram_size = MIN(ms->ram_size,
+                            RK3588_RAM_LOW_TOP - RK3588_RAM_BASE);
+    uint64_t mem_reg[2] = {
+        cpu_to_be64(RK3588_RAM_BASE), cpu_to_be64(ram_size),
+    };
+    qemu_fdt_setprop(fdt, "/memory", "reg", mem_reg, sizeof(mem_reg));
 
     /* /cpus */
     qemu_fdt_add_subnode(fdt, "/cpus");
@@ -399,11 +390,8 @@ static void *rk3588_get_dtb(const struct arm_boot_info *info, int *size)
     return rk3588_create_dtb(rk3588_ms, size);
 }
 
-/*
- * arm_boot.c sets /memory reg from loader_start + machine->ram_size.
- * Since we cap ram_size below the MMIO hole, the single-region layout
- * is correct. No-op placeholder for future use.
- */
+/* No-op: RAM is capped below the MMIO hole, so arm_boot.c's single-region
+ * /memory layout is always correct. Callback kept for future use. */
 static void rk3588_modify_dtb(const struct arm_boot_info *info, void *fdt)
 {
     (void)info;
@@ -421,27 +409,18 @@ static void rk3588_init(MachineState *ms)
     rk3588_ms = ms;
     uint64_t max_low = RK3588_RAM_LOW_TOP - RK3588_RAM_BASE;
     if (ram_size > max_low) {
-        warn_report("RAM size %" PRIu64 " MiB exceeds max usable %"
-                    PRIu64 " MiB (MMIO hole at 0x%llx). Capping.",
-                    ram_size / MiB, max_low / MiB,
-                    (unsigned long long)RK3588_RAM_LOW_TOP);
+        warn_report("Capping RAM from %" PRIu64 " MiB to %" PRIu64
+                    " MiB (rockchip-iommu DTE_ADDR is 32-bit; high memory "
+                    "causes IOMMU page table corruption)",
+                    ram_size / MiB, max_low / MiB);
         ram_size = max_low;
     }
-    uint64_t low_size = ram_size;
     MemoryRegion *lowram = g_new(MemoryRegion, 1);
 
-    /* RAM */
-    memory_region_init_ram(lowram, NULL, "rk3588.lowram", low_size,
+    /* RAM — single contiguous region below MMIO hole */
+    memory_region_init_ram(lowram, NULL, "rk3588.lowram", ram_size,
                            &error_fatal);
     memory_region_add_subregion(sysmem, RK3588_RAM_BASE, lowram);
-
-    if (ram_size > low_size) {
-        uint64_t high_size = ram_size - low_size;
-        MemoryRegion *highram = g_new(MemoryRegion, 1);
-        memory_region_init_ram(highram, NULL, "rk3588.highram", high_size,
-                               &error_fatal);
-        memory_region_add_subregion(sysmem, RK3588_RAM_HIGH_BASE, highram);
-    }
 
     /* CPUs — EL3 enabled for vendor kernel SMC SIP calls */
     for (int i = 0; i < ms->smp.cpus; i++) {
