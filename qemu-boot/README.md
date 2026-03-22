@@ -98,7 +98,7 @@ qemu-system-aarch64 \
 
 | Parameter | Value | Why |
 |-----------|-------|-----|
-| `-m` | 3G (max ~3.9G) | RAM >4GB places a fragment at 0x100000000 which crashes vendor kernel early boot (IPI oops) |
+| `-m` | 3G recommended | 2-3G works fully. 4G+ boots but NPU DMA has issues with high memory (conv tests fail, under investigation) |
 | `cma=64M` | Required | Default 16MB CMA is too small; the RKNPU driver allocates ~8MB contiguous for the activation buffer |
 | `-dtb vendor.dtb` | Required | Vendor kernel needs the single-node `rockchip,rk3588-rknpu` binding |
 
