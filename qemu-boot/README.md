@@ -183,3 +183,13 @@ job submissions.
 
 Both the Rocket (upstream DRM/accel) and RKNPU (vendor DRM) drivers program
 the same hardware registers — the emulator handles both transparently.
+
+## Known Issues
+
+- **RAM capped at ~3838 MiB** — the mainline `rockchip-iommu` driver
+  allocates its page table directory with `GFP_KERNEL`, which can land
+  above 4GB when a Normal zone exists. The 32-bit `DTE_ADDR` register
+  truncates the address, breaking all IOMMU translations. Any `-m` value
+  is accepted but silently capped. See
+  [`bugs/rockchip-iommu-gfp-kernel.md`](../bugs/rockchip-iommu-gfp-kernel.md)
+  for the full analysis and proposed kernel fix.
