@@ -146,8 +146,11 @@ struct rknpu_submit {
 #define RKNPU_JOB_PC       (1 << 0)
 #define RKNPU_JOB_BLOCK    0
 #define RKNPU_JOB_PINGPONG (1 << 2)
+#define RKNPU_MEM_NON_CONTIGUOUS (1 << 0)
+#define RKNPU_MEM_CACHEABLE      (1 << 1)
 #define RKNPU_MEM_KERNEL_MAPPING (1 << 3)
 #define RKNPU_MEM_IOMMU          (1 << 4)
+#define RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT (1 << 10)
 
 struct rknpu_action { uint32_t flags; uint32_t value; };
 #define RKNPU_POWER_ON  20
@@ -190,7 +193,12 @@ int rnpu_bo_create(int fd, uint32_t size, struct rnpu_bo *bo)
       bo->map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
                      fd, req.offset);
    } else {
-      struct rknpu_mem_create mc = { .size = size, .flags = 0, .iommu_domain_id = 0 };
+      struct rknpu_mem_create mc = {
+         .size = size,
+         .flags = RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_CACHEABLE
+                  | RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT,
+         .iommu_domain_id = 0,
+      };
       if (ioctl(fd, DRM_IOCTL_RKNPU_MEM_CREATE, &mc)) {
          fprintf(stderr, "rnpu: RKNPU MEM_CREATE failed: %s (size=%u)\n",
                  strerror(errno), size);
@@ -328,7 +336,9 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
       /* Allocate task BO with KERNEL_MAPPING — the driver reads the
        * rknpu_task descriptor from kernel space during job scheduling. */
       struct rknpu_mem_create tmc = {
-         .size = 4096, .flags = RKNPU_MEM_KERNEL_MAPPING,
+         .size = 4096,
+         .flags = RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_CACHEABLE
+                  | RKNPU_MEM_KERNEL_MAPPING | RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT,
          .iommu_domain_id = 0,
       };
       if (ioctl(fd, DRM_IOCTL_RKNPU_MEM_CREATE, &tmc)) {
@@ -348,24 +358,30 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
          return -1;
       }
 
+      uint32_t ntasks = job->task_count;
       struct rknpu_task *task = (struct rknpu_task *)tmap;
-      memset(task, 0, sizeof(*task));
-      task->op_idx = j;
-      task->enable_mask = 0xf;
-      task->int_mask = 0x300;
-      task->int_clear = 0x1ffff;
-      task->regcfg_amount = first_task->regcmd_count -
-                            (RKNPU_PC_DATA_EXTRA_AMOUNT + 4);
-      task->regcmd_addr = first_task->regcmd;
+      /* Fill task array for ALL tasks in this operation */
+      for (uint32_t t = 0; t < ntasks && t < 100; t++) {
+         struct drm_rocket_task *rt =
+            &((struct drm_rocket_task *)(uintptr_t)job->tasks)[t];
+         struct rknpu_task *tp = &task[t];
+         memset(tp, 0, sizeof(*tp));
+         tp->op_idx = j;
+         tp->enable_mask = 0xf;
+         tp->int_mask = 0x300;
+         tp->int_clear = 0x1ffff;
+         tp->regcfg_amount = rt->regcmd_count - RKNPU_PC_DATA_EXTRA_AMOUNT;
+         tp->regcmd_addr = (uint64_t)rt->regcmd;
+      }
 
       struct rknpu_submit submit = {
          .flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG,
          .timeout = 6000,
-         .task_number = 1,
+         .task_number = ntasks,
          .task_obj_addr = tmc.obj_addr,
-         .core_mask = 0x1,
+         .core_mask = 0x0,
          .fence_fd = -1,
-         .subcore_task = { {0, 1}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
+         .subcore_task = { {0, ntasks}, {0, ntasks}, {0, ntasks}, {0, ntasks}, {0, ntasks} },
       };
 
       int ret = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &submit);

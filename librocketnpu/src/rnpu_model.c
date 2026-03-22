@@ -441,7 +441,6 @@ static void compile_regcmds(struct rnpu_model *m)
          task->regcfg_amount = count;
          task->regcfg_addr = (uint32_t)(m->regcmd_bo.dma_addr +
                                         op->regcmd_offset + rc_offset);
-
          /* Chain pointers patched in second pass below */
 
          rc_offset += ALIGN_UP(size_bytes, 64);
@@ -582,7 +581,7 @@ int rnpu_open(const char *device)
       goto found;
    }
 
-   /* Auto-detect: try Rocket first, then scan DRM cards for RKNPU */
+   /* Auto-detect: try Rocket first, then scan DRM cards/render nodes for RKNPU */
    fd = open("/dev/accel/accel0", O_RDWR);
    if (fd >= 0) {
       rnpu_active_driver = RNPU_DRIVER_ROCKET;
@@ -590,26 +589,39 @@ int rnpu_open(const char *device)
    }
    for (int i = 0; i < 8; i++) {
       char sysfs[128], driver[64], devpath[32];
-      snprintf(sysfs, sizeof(sysfs),
-               "/sys/class/drm/card%d/device/uevent", i);
-      FILE *uf = fopen(sysfs, "r");
-      if (!uf) continue;
-      int is_rknpu = 0;
-      while (fgets(driver, sizeof(driver), uf)) {
-         if (strncmp(driver, "DRIVER=RKNPU", 12) == 0 ||
-             strncmp(driver, "DRIVER=rknpu", 12) == 0) {
-            is_rknpu = 1;
+      /* Check both card and renderD nodes */
+      int found_rknpu = 0;
+      for (int pass = 0; pass < 2; pass++) {
+         if (pass == 0) {
+            snprintf(sysfs, sizeof(sysfs),
+                     "/sys/class/drm/card%d/device/uevent", i);
+            snprintf(devpath, sizeof(devpath), "/dev/dri/card%d", i);
+         } else {
+            snprintf(sysfs, sizeof(sysfs),
+                     "/sys/class/drm/renderD%d/device/uevent", 128 + i);
+            snprintf(devpath, sizeof(devpath), "/dev/dri/renderD%d", 128 + i);
+         }
+         FILE *uf = fopen(sysfs, "r");
+         if (!uf) continue;
+         int is_rknpu = 0;
+         while (fgets(driver, sizeof(driver), uf)) {
+            if (strncmp(driver, "DRIVER=RKNPU", 12) == 0 ||
+                strncmp(driver, "DRIVER=rknpu", 12) == 0) {
+               is_rknpu = 1;
+               break;
+            }
+         }
+         fclose(uf);
+         if (!is_rknpu) continue;
+         fd = open(devpath, O_RDWR);
+         if (fd >= 0) {
+            rnpu_active_driver = RNPU_DRIVER_RKNPU;
+            fprintf(stderr, "rnpu: opened %s\n", devpath);
+            found_rknpu = 1;
             break;
          }
       }
-      fclose(uf);
-      if (!is_rknpu) continue;
-      snprintf(devpath, sizeof(devpath), "/dev/dri/card%d", i);
-      fd = open(devpath, O_RDWR);
-      if (fd >= 0) {
-         rnpu_active_driver = RNPU_DRIVER_RKNPU;
-         goto found;
-      }
+      if (found_rknpu) goto found;
    }
    fprintf(stderr, "rnpu: no NPU device found\n");
    return -1;
