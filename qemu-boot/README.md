@@ -119,33 +119,74 @@ RESULT: PASS (bit-exact)
 The `test_dmesg` sub-test reports PARTIAL (dmesg format parsing), which is
 harmless.
 
-## Running — Full Ubuntu Rootfs
+## Running — Full Armbian Rootfs
 
-For a full system with networking, package management, and SSH:
+Boots the real Armbian 25.11.1 Noble image with networking, package
+management, and all Armbian services (zram, ramlog, hw-monitor, etc.):
 
 ```sh
 qemu-system-aarch64 \
   -M orangepi5plus -m 2G -nographic -smp 4 \
   -kernel Image-6.18 \
   -append "console=ttyS0,1500000 earlycon panic=10 root=/dev/vda rw" \
-  -drive file=rootfs.img,format=raw,if=none,id=hd0 \
+  -drive file=armbian_rootfs.img,format=raw,if=none,id=hd0 \
   -device virtio-blk-device,drive=hd0 \
   -netdev user,id=net0 -device virtio-net-device,netdev=net0
 ```
 
-The rootfs image (`rootfs.img`) is an ext4 disk image with Ubuntu 24.04
-(debootstrap minbase). It needs:
+### Preparing the rootfs image
 
-- Kernel modules in `/lib/modules/6.18.10-current-rockchip64/` (from the
-  Armbian `linux-image-current-rockchip64` deb)
-- Our custom `qemu_reset.ko` and `qemu_iommu.ko` in the modules tree
-- Auto-load config in `/etc/modules-load.d/qemu.conf`
+1. Download Armbian Noble minimal for Orange Pi 5 Plus:
+   ```sh
+   curl -L -o armbian.img.xz \
+     "https://dl.armbian.com/orangepi5-plus/Noble_vendor_minimal"
+   xz -d armbian.img.xz
+   ```
 
-With this setup:
+2. Extract the rootfs partition to a standalone image:
+   ```sh
+   # Find partition offset (typically 32768 sectors × 512 bytes)
+   fdisk -l armbian.img
+   dd if=armbian.img of=armbian_rootfs.img bs=512 skip=32768 count=3235807
+   truncate -s 2G armbian_rootfs.img
+   e2fsck -f armbian_rootfs.img && resize2fs armbian_rootfs.img
+   ```
+
+3. Install mainline kernel modules (the stock image ships vendor 6.1 only):
+   ```sh
+   # Download Armbian kernel deb
+   curl -L -o linux-image.deb \
+     "https://apt.armbian.com/pool/main/l/linux-6.18.10/linux-image-current-rockchip64_26.2.1_arm64.deb"
+   mkdir deb && cd deb && ar x ../linux-image.deb
+   sudo mount -o loop armbian_rootfs.img /mnt
+   sudo tar xf data.tar.xz -C /mnt ./lib/modules/6.18.10-current-rockchip64/
+   ```
+
+4. Install QEMU helper modules and configure:
+   ```sh
+   MODDIR="/mnt/lib/modules/6.18.10-current-rockchip64"
+   sudo cp qemu_reset.ko qemu_iommu.ko "$MODDIR/kernel/drivers/"
+   sudo chroot /mnt depmod 6.18.10-current-rockchip64
+   echo -e "qemu_reset\nqemu_iommu" | sudo tee /mnt/etc/modules-load.d/qemu.conf
+   ```
+
+5. Fix fstab (stock image uses UUID that won't match):
+   ```sh
+   echo "/dev/vda / ext4 defaults,noatime 0 1" | sudo tee /mnt/etc/fstab
+   echo "tmpfs /tmp tmpfs defaults,nosuid 0 0" | sudo tee -a /mnt/etc/fstab
+   sudo umount /mnt
+   ```
+
+### What works
+
+- **Full Armbian**: systemd, zram, ramlog, hw-monitor, resize-fs, firstrun
 - **Networking**: `eth0` via virtio-net, DHCP at `10.0.2.x`, full internet
+  (`wget https://example.com` works)
 - **NPU**: All 3 Rocket cores probe, `/dev/accel/accel0` available
 - **Root disk**: virtio-blk at `/dev/vda`
-- Login: `root` / `root` on serial console
+- **0 failed systemd units** (only `serial-getty@ttyFIQ0` dep fails — expected,
+  no Rockchip FIQ debugger UART in QEMU)
+- Armbian auto-login on serial console, first-run password wizard works
 
 ## File Inventory
 
