@@ -21,7 +21,7 @@ OBJS = $(SRCS:.c=.o)
 
 .PHONY: all clean test
 
-all: librocketnpu.so test_mobilenet test_yolo test_debug test_sw_ops
+all: librocketnpu.so test_mobilenet test_yolo test_debug test_sw_ops test_rknpu_abi
 
 librocketnpu.so: $(OBJS)
 	$(CC) -shared -o $@ $^ $(LDFLAGS)
@@ -41,9 +41,13 @@ test_debug: tests/test_debug.c librocketnpu.so
 test_sw_ops: tests/test_sw_ops.c librocketnpu.so
 	$(CC) $(CFLAGS) -o $@ $< -L. -lrocketnpu -Wl,-rpath,'$$ORIGIN' $(LDFLAGS)
 
-test: test_sw_ops
+test_rknpu_abi: tests/test_rknpu_abi.c librocketnpu.so
+	$(CC) $(CFLAGS) -o $@ $< -L. -lrocketnpu -Wl,-rpath,'$$ORIGIN' $(LDFLAGS)
+
+test: test_sw_ops test_rknpu_abi
 	@LD_LIBRARY_PATH=. ./test_sw_ops
+	@LD_LIBRARY_PATH=. ./test_rknpu_abi
 	@echo "Run: LD_LIBRARY_PATH=. ./test_mobilenet <model.tflite>"
 
 clean:
-	rm -f $(OBJS) librocketnpu.so test_mobilenet test_yolo test_debug
+	rm -f $(OBJS) librocketnpu.so test_mobilenet test_yolo test_debug test_rknpu_abi

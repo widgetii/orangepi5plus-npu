@@ -609,7 +609,8 @@ static void execute_job(RockchipNPUState *s, RocketNPUCore *core,
         }
     }
 
-    core->pc_irq_raw_status |= 0x0300; /* DPU_0 | DPU_1 */
+    core->pc_task_status = 0; /* execution complete */
+    core->pc_irq_raw_status |= NPU_IDLE_RAW_BITS | 0x0300; /* idle + DPU_0 | DPU_1 */
     core->pc_irq_status = core->pc_irq_raw_status & core->pc_irq_mask;
     if (core->pc_irq_status) {
         int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
@@ -684,7 +685,7 @@ static uint64_t rockchip_npu_read(void *opaque, hwaddr addr, unsigned size)
     case REG_PC_TASK_CON:
         return core->pc_task_con;
     case REG_PC_TASK_STATUS:
-        return 0;
+        return core->pc_task_status;
     default:
         if (addr < NPU_REGION_SIZE) {
             return core->regs[addr / 4];
@@ -748,6 +749,7 @@ static void rockchip_npu_write(void *opaque, hwaddr addr, uint64_t val,
 
     case REG_PC_IRQ_CLEAR:
         core->pc_irq_raw_status &= ~(uint32_t)val;
+        core->pc_irq_raw_status |= NPU_IDLE_RAW_BITS; /* idle bits always set */
         core->pc_irq_status = core->pc_irq_raw_status & core->pc_irq_mask;
         if (!core->pc_irq_status) {
             qemu_irq_lower(core->irq);
@@ -813,8 +815,9 @@ static void rockchip_npu_reset(DeviceState *dev)
         core->pc_reg_amounts = 0;
         core->pc_irq_mask = 0;
         core->pc_irq_status = 0;
-        core->pc_irq_raw_status = 0;
+        core->pc_irq_raw_status = NPU_IDLE_RAW_BITS;
         core->pc_task_con = 0;
+        core->pc_task_status = 0;
         if (core->irq_timer) {
             timer_del(core->irq_timer);
         }
@@ -833,6 +836,7 @@ static const VMStateDescription vmstate_rockchip_npu_core = {
         VMSTATE_UINT32(pc_irq_status, RocketNPUCore),
         VMSTATE_UINT32(pc_irq_raw_status, RocketNPUCore),
         VMSTATE_UINT32(pc_task_con, RocketNPUCore),
+        VMSTATE_UINT32(pc_task_status, RocketNPUCore),
         VMSTATE_UINT32_ARRAY(regs, RocketNPUCore, NPU_REGION_SIZE / 4),
         VMSTATE_END_OF_LIST()
     }

@@ -28,6 +28,10 @@
 #define PC_IRQ_CLEAR        0x0024
 #define PC_IRQ_STATUS       0x0028
 #define PC_IRQ_RAW_STATUS   0x002c
+#define PC_TASK_STATUS      0x003c
+
+/* Idle bits: real HW always has bits 30-31 set when idle */
+#define NPU_IDLE_RAW_BITS   0xc0000000
 
 /* Expected version from the device model */
 #define EXPECTED_VERSION     0x00010001
@@ -66,7 +70,7 @@ static void test_npu_irq(void)
     qtest_writel(qts, CORE0_BASE + PC_IRQ_MASK, 0);
 
     uint32_t raw = qtest_readl(qts, CORE0_BASE + PC_IRQ_RAW_STATUS);
-    g_assert_cmpuint(raw, ==, 0);
+    g_assert_cmpuint(raw, ==, NPU_IDLE_RAW_BITS);
 }
 
 /*
@@ -133,6 +137,32 @@ static void test_npu_sdp_regs(void)
     g_assert_cmpuint(qtest_readl(qts, CORE0_BASE + 0x5040), ==, 0x00001000);
 }
 
+/*
+ * Test 5: All 3 cores show idle bits in INT_RAW_STATUS after reset.
+ */
+static void test_npu_idle_int_raw(void)
+{
+    uint64_t bases[] = { CORE0_BASE, CORE1_BASE, CORE2_BASE };
+
+    for (int i = 0; i < 3; i++) {
+        uint32_t raw = qtest_readl(qts, bases[i] + PC_IRQ_RAW_STATUS);
+        g_assert_cmpuint(raw & NPU_IDLE_RAW_BITS, ==, NPU_IDLE_RAW_BITS);
+    }
+}
+
+/*
+ * Test 6: All 3 cores have PC_TASK_STATUS == 0 when idle.
+ */
+static void test_npu_task_status_idle(void)
+{
+    uint64_t bases[] = { CORE0_BASE, CORE1_BASE, CORE2_BASE };
+
+    for (int i = 0; i < 3; i++) {
+        uint32_t status = qtest_readl(qts, bases[i] + PC_TASK_STATUS);
+        g_assert_cmpuint(status, ==, 0);
+    }
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -141,6 +171,8 @@ int main(int argc, char **argv)
     qtest_add_func("/rockchip-npu/irq", test_npu_irq);
     qtest_add_func("/rockchip-npu/reg-roundtrip", test_npu_reg_roundtrip);
     qtest_add_func("/rockchip-npu/sdp-regs", test_npu_sdp_regs);
+    qtest_add_func("/rockchip-npu/idle-int-raw", test_npu_idle_int_raw);
+    qtest_add_func("/rockchip-npu/task-status-idle", test_npu_task_status_idle);
 
     qts = qtest_init(MACHINE);
     int ret = g_test_run();

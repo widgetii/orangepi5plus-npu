@@ -19,6 +19,7 @@ typedef struct RockchipIOMMUState RockchipIOMMUState;
 OBJECT_DECLARE_SIMPLE_TYPE(RockchipNPUState, ROCKCHIP_NPU)
 
 /* Hardware constants */
+#define NPU_IDLE_RAW_BITS        0xc0000000  /* bits 30-31 always set when idle */
 #define NPU_FEATURE_ATOMIC_SIZE  16
 #define NPU_WEIGHT_ATOMIC_SIZE   32
 #define NPU_ATOMIC_K_SIZE        16
@@ -231,6 +232,7 @@ typedef struct RocketNPUCore {
     uint32_t pc_irq_status;
     uint32_t pc_irq_raw_status;
     uint32_t pc_task_con;
+    uint32_t pc_task_status;
 
     /* Shadow register file — written by regcmd or MMIO */
     uint32_t regs[NPU_REGION_SIZE / 4];
