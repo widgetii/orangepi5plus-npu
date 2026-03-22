@@ -136,6 +136,15 @@ qemu-system-aarch64 \
 
 ### Preparing the rootfs image
 
+A script automates all of the steps below:
+
+```sh
+bash qemu-boot/mkrootfs.sh              # produces qemu-boot/armbian_rootfs.img
+bash qemu-boot/mkrootfs.sh /tmp/my.img  # or specify output path
+```
+
+**Manual steps** (for reference, or if the script needs adjustment):
+
 1. Download Armbian Noble minimal for Orange Pi 5 Plus:
    ```sh
    curl -L -o armbian.img.xz \
@@ -155,8 +164,9 @@ qemu-system-aarch64 \
 3. Install mainline kernel modules (the stock image ships vendor 6.1 only):
    ```sh
    # Download Armbian kernel deb
+   # Find exact filename at https://apt.armbian.com/pool/main/l/linux-6.18.10/
    curl -L -o linux-image.deb \
-     "https://apt.armbian.com/pool/main/l/linux-6.18.10/linux-image-current-rockchip64_26.2.1_arm64.deb"
+     "https://apt.armbian.com/pool/main/l/linux-6.18.10/linux-image-current-rockchip64_26.2.1_arm64__6.18.10-S41ce-D1d59-P992d-C2cce-H050e-HK01ba-Vc222-B052a-R448a.deb"
    mkdir deb && cd deb && ar x ../linux-image.deb
    sudo mount -o loop armbian_rootfs.img /mnt
    sudo tar xf data.tar.xz -C /mnt ./lib/modules/6.18.10-current-rockchip64/
