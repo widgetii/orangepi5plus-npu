@@ -94,6 +94,27 @@ else
     echo "  hw/misc/meson.build already patched"
 fi
 
+# hw/net/Kconfig — NPCM GMAC as standalone selectable
+if ! grep -q 'config NPCM_GMAC' "$QEMU_DIR/hw/net/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/net/Kconfig" <<'KCONFIG'
+
+config NPCM_GMAC
+    bool
+KCONFIG
+    echo "  patched hw/net/Kconfig"
+else
+    echo "  hw/net/Kconfig already patched"
+fi
+
+# hw/net/meson.build — build npcm_gmac.c when CONFIG_NPCM_GMAC is set
+if ! grep -q 'CONFIG_NPCM_GMAC' "$QEMU_DIR/hw/net/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_NPCM_GMAC', if_true: files('npcm_gmac.c'))" \
+        >> "$QEMU_DIR/hw/net/meson.build"
+    echo "  patched hw/net/meson.build"
+else
+    echo "  hw/net/meson.build already patched"
+fi
+
 # ── 4. Build ────────────────────────────────────────────────────────────
 echo "Building QEMU (aarch64 target)..."
 cd "$QEMU_DIR"

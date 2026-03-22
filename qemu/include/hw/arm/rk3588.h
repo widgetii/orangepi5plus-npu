@@ -39,6 +39,11 @@
 #define RK3588_NPU_CORE1_IRQ  111
 #define RK3588_NPU_CORE2_IRQ  112
 
+/* GMAC1 — Synopsys DWC DWMAC 4.20a (built-in Ethernet) */
+#define RK3588_GMAC1_BASE     0xfe1b0000ULL
+#define RK3588_GMAC1_SIZE     0x00010000ULL
+#define RK3588_GMAC1_IRQ      227        /* SPI 227 = macirq */
+
 /* Low DRAM ends before SoC MMIO region (CRU at 0xFD7C0000, NPU at 0xFDAB0000).
  * RAM is capped here (~3838 MiB) because the mainline rockchip-iommu driver
  * allocates its page table directory with GFP_KERNEL. With high memory (Normal

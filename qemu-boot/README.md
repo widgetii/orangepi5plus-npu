@@ -59,7 +59,8 @@ qemu-system-aarch64 \
   -M orangepi5plus -m 2G -nographic -smp 4 \
   -kernel Image-6.18 \
   -initrd initrd.gz \
-  -append "console=ttyS0,1500000 earlycon panic=10"
+  -append "console=ttyS0,1500000 earlycon panic=10" \
+  -nic user
 ```
 
 The init script loads the Rocket kernel module, waits for `/dev/accel/accel0`,
@@ -91,7 +92,8 @@ qemu-system-aarch64 \
   -kernel Image-vendor \
   -initrd initrd-vendor.gz \
   -dtb vendor.dtb \
-  -append "console=ttyS0,1500000 earlycon panic=10 cma=64M"
+  -append "console=ttyS0,1500000 earlycon panic=10 cma=64M" \
+  -nic user
 ```
 
 **Important constraints:**
@@ -174,6 +176,7 @@ The QEMU machine (`orangepi5plus`) emulates:
 - GRF/IOC stubs (for vendor kernel built-in drivers)
 - 3× NPU cores at 0xfdab0000/0xfdac0000/0xfdad0000
 - Rockchip IOMMU v2 (page-table walk)
+- GMAC1 Ethernet at 0xfe1b0000 (Synopsys DWMAC4, reuses NPCM GMAC model)
 
 The NPU model executes INT8 convolutions in software (C loops) inside the
 MMIO write handler for `PC_OPERATION_ENABLE`, then defers the completion IRQ
@@ -183,6 +186,20 @@ job submissions.
 
 Both the Rocket (upstream DRM/accel) and RKNPU (vendor DRM) drivers program
 the same hardware registers — the emulator handles both transparently.
+
+## Networking
+
+The machine includes a GMAC1 Ethernet controller at `0xfe1b0000` (Synopsys
+DWC DWMAC 4.20a), emulated using QEMU's existing NPCM GMAC model. Add
+`-nic user` to enable NAT networking with DHCP (guest gets `10.0.2.x`).
+
+The Linux `stmmac` driver probes via the `"snps,dwmac-4.20a"` DT compatible.
+If the kernel has `stmmac` built-in or as a loaded module, `eth0` will appear
+and support basic TCP/UDP/ICMP traffic.
+
+**Limitations:** no real MDIO/PHY (stub returns link-up at 1 Gbps), no PTP,
+single DMA queue only. The 2× RTL8125 PCIe NICs on the real board are not
+emulated (would require PCIe host bridge emulation).
 
 ## Known Issues
 
