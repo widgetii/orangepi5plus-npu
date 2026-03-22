@@ -6,88 +6,26 @@ the vendor RKNPU driver.
 
 ## Building QEMU
 
-The NPU emulator is a set of source files in `qemu/` that plug into a
-vanilla QEMU 10.x tree. You need to clone QEMU, copy our files in, patch
-two Kconfig/meson.build files, and build.
-
-### 1. Clone QEMU
+A setup script handles everything — cloning QEMU, copying source files,
+patching the build system, and compiling. Run it once from the repo root:
 
 ```sh
-git clone --depth 1 --branch v10.2.0 https://gitlab.com/qemu-project/qemu.git qemu-src
-cd qemu-src
+bash qemu/setup.sh
 ```
 
-Any QEMU 10.x release should work (tested with 10.2.0).
-
-### 2. Copy NPU source files
-
-From the repo root:
+This takes a few minutes. When it finishes, verify:
 
 ```sh
-# Machine definition
-cp qemu/hw/arm/rk3588.c          qemu-src/hw/arm/
-cp qemu/include/hw/arm/rk3588.h  qemu-src/include/hw/arm/
-
-# NPU + IOMMU device models
-cp qemu/hw/misc/rockchip-npu.c   qemu-src/hw/misc/
-cp qemu/hw/misc/rockchip-npu.h   qemu-src/hw/misc/
-cp qemu/hw/misc/rockchip-iommu.c qemu-src/hw/misc/
-cp qemu/hw/misc/rockchip-iommu.h qemu-src/hw/misc/
-
-# Headers go to both locations (QEMU includes from both)
-cp qemu/hw/misc/rockchip-npu.h   qemu-src/include/hw/misc/
-cp qemu/hw/misc/rockchip-iommu.h qemu-src/include/hw/misc/
-```
-
-### 3. Patch build system
-
-Add our Kconfig entries and meson.build lines. The fragment files
-(`Kconfig.rk3588`, `meson.build.rk3588`, etc.) show exactly what to add.
-
-**hw/arm/Kconfig** — append:
-```
-config ORANGEPI5PLUS
-    bool
-    default y
-    depends on TCG && AARCH64
-    select ARM_GICV3
-    select SERIAL
-    select UNIMP
-    select ROCKCHIP_NPU
-```
-
-**hw/arm/meson.build** — add to the `arm_ss.add(...)` block:
-```meson
-arm_ss.add(when: 'CONFIG_ORANGEPI5PLUS', if_true: files('rk3588.c'))
-```
-
-**hw/misc/Kconfig** — append:
-```
-config ROCKCHIP_NPU
-    bool
-```
-
-**hw/misc/meson.build** — add to the `system_ss.add(...)` block:
-```meson
-system_ss.add(when: 'CONFIG_ROCKCHIP_NPU', if_true: files('rockchip-npu.c', 'rockchip-iommu.c'))
-```
-
-### 4. Configure and build
-
-```sh
-cd qemu-src
-mkdir -p build && cd build
-../configure --target-list=aarch64-softmmu --disable-docs
-ninja -j$(nproc)
-```
-
-The binary is `qemu-src/build/qemu-system-aarch64`. Verify the machine is
-registered:
-
-```sh
-./qemu-system-aarch64 -machine help | grep orangepi
+./qemu-src/build/qemu-system-aarch64 -machine help | grep orangepi
 # Expected: orangepi5plus   Rockchip RK3588 (Orange Pi 5 Plus) with NPU
 ```
+
+The script is safe to re-run — it skips steps that are already done.
+
+> **What it does under the hood:** clones QEMU v10.2.0 into `qemu-src/`,
+> copies the NPU/IOMMU/machine model files from `qemu/`, appends Kconfig
+> and meson.build entries, then runs `configure` + `ninja`. See
+> `qemu/setup.sh` for details.
 
 ## Cross-Compiling Test Binaries
 
