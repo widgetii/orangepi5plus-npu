@@ -39,7 +39,9 @@
 #define RK3588_NPU_CORE1_IRQ  111
 #define RK3588_NPU_CORE2_IRQ  112
 
-/* High RAM (above 4GB) */
+/* Low DRAM ends before SoC MMIO region (CRU at 0xFD7C0000, NPU at 0xFDAB0000).
+ * High DRAM starts at 4GB, above the 32-bit address space. */
+#define RK3588_RAM_LOW_TOP    0xF0000000ULL
 #define RK3588_RAM_HIGH_BASE  0x100000000ULL
 
 #endif /* HW_ARM_RK3588_H */

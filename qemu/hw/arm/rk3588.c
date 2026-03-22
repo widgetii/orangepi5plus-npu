@@ -114,7 +114,7 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
     qemu_fdt_add_subnode(fdt, "/memory");
     qemu_fdt_setprop_string(fdt, "/memory", "device_type", "memory");
     uint64_t ram_size = ms->ram_size;
-    uint64_t low_size = MIN(ram_size, 0x100000000ULL - RK3588_RAM_BASE);
+    uint64_t low_size = MIN(ram_size, RK3588_RAM_LOW_TOP - RK3588_RAM_BASE);
     if (ram_size > low_size) {
         uint64_t high_size = ram_size - low_size;
         uint64_t mem_reg[4] = {
@@ -399,6 +399,27 @@ static void *rk3588_get_dtb(const struct arm_boot_info *info, int *size)
     return rk3588_create_dtb(rk3588_ms, size);
 }
 
+/*
+ * arm_boot.c overwrites /memory with a single contiguous region
+ * (loader_start → loader_start + ram_size). When RAM has a gap (low ends
+ * at 0xF0000000, high starts at 0x100000000), the kernel sees "RAM" where
+ * there's no backing memory and crashes. Fix up /memory after arm_boot.
+ */
+static void rk3588_modify_dtb(const struct arm_boot_info *info, void *fdt)
+{
+    uint64_t ram_size = rk3588_ms->ram_size;
+    uint64_t low_size = MIN(ram_size, RK3588_RAM_LOW_TOP - RK3588_RAM_BASE);
+
+    if (ram_size > low_size) {
+        uint64_t high_size = ram_size - low_size;
+        uint64_t mem_reg[4] = {
+            cpu_to_be64(RK3588_RAM_BASE), cpu_to_be64(low_size),
+            cpu_to_be64(RK3588_RAM_HIGH_BASE), cpu_to_be64(high_size),
+        };
+        qemu_fdt_setprop(fdt, "/memory", "reg", mem_reg, sizeof(mem_reg));
+    }
+}
+
 static void rk3588_init(MachineState *ms)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -408,7 +429,7 @@ static void rk3588_init(MachineState *ms)
     uint64_t ram_size = ms->ram_size;
 
     rk3588_ms = ms;
-    uint64_t low_size = MIN(ram_size, 0x100000000ULL - RK3588_RAM_BASE);
+    uint64_t low_size = MIN(ram_size, RK3588_RAM_LOW_TOP - RK3588_RAM_BASE);
     MemoryRegion *lowram = g_new(MemoryRegion, 1);
 
     /* RAM */
@@ -557,6 +578,7 @@ static void rk3588_init(MachineState *ms)
     rk3588_binfo.loader_start = RK3588_RAM_BASE;
     rk3588_binfo.board_id = -1;
     rk3588_binfo.psci_conduit = QEMU_PSCI_CONDUIT_SMC;
+    rk3588_binfo.modify_dtb = rk3588_modify_dtb;
     if (ms->dtb) {
         rk3588_binfo.dtb_filename = ms->dtb;
     } else {
