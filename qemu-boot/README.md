@@ -4,20 +4,95 @@ This directory contains everything needed to run the RK3588 NPU emulator in
 QEMU and test INT8 convolution models on both the mainline Rocket driver and
 the vendor RKNPU driver.
 
-## Prerequisites
+## Building QEMU
 
-Build QEMU from the `qemu-src/` tree (one-time):
+The NPU emulator is a set of source files in `qemu/` that plug into a
+vanilla QEMU 10.x tree. You need to clone QEMU, copy our files in, patch
+two Kconfig/meson.build files, and build.
+
+### 1. Clone QEMU
 
 ```sh
-cd ../qemu-src
+git clone --depth 1 --branch v10.2.0 https://gitlab.com/qemu-project/qemu.git qemu-src
+cd qemu-src
+```
+
+Any QEMU 10.x release should work (tested with 10.2.0).
+
+### 2. Copy NPU source files
+
+From the repo root:
+
+```sh
+# Machine definition
+cp qemu/hw/arm/rk3588.c          qemu-src/hw/arm/
+cp qemu/include/hw/arm/rk3588.h  qemu-src/include/hw/arm/
+
+# NPU + IOMMU device models
+cp qemu/hw/misc/rockchip-npu.c   qemu-src/hw/misc/
+cp qemu/hw/misc/rockchip-npu.h   qemu-src/hw/misc/
+cp qemu/hw/misc/rockchip-iommu.c qemu-src/hw/misc/
+cp qemu/hw/misc/rockchip-iommu.h qemu-src/hw/misc/
+
+# Headers go to both locations (QEMU includes from both)
+cp qemu/hw/misc/rockchip-npu.h   qemu-src/include/hw/misc/
+cp qemu/hw/misc/rockchip-iommu.h qemu-src/include/hw/misc/
+```
+
+### 3. Patch build system
+
+Add our Kconfig entries and meson.build lines. The fragment files
+(`Kconfig.rk3588`, `meson.build.rk3588`, etc.) show exactly what to add.
+
+**hw/arm/Kconfig** — append:
+```
+config ORANGEPI5PLUS
+    bool
+    default y
+    depends on TCG && AARCH64
+    select ARM_GICV3
+    select SERIAL
+    select UNIMP
+    select ROCKCHIP_NPU
+```
+
+**hw/arm/meson.build** — add to the `arm_ss.add(...)` block:
+```meson
+arm_ss.add(when: 'CONFIG_ORANGEPI5PLUS', if_true: files('rk3588.c'))
+```
+
+**hw/misc/Kconfig** — append:
+```
+config ROCKCHIP_NPU
+    bool
+```
+
+**hw/misc/meson.build** — add to the `system_ss.add(...)` block:
+```meson
+system_ss.add(when: 'CONFIG_ROCKCHIP_NPU', if_true: files('rockchip-npu.c', 'rockchip-iommu.c'))
+```
+
+### 4. Configure and build
+
+```sh
+cd qemu-src
 mkdir -p build && cd build
 ../configure --target-list=aarch64-softmmu --disable-docs
 ninja -j$(nproc)
 ```
 
-The binary is `qemu-src/build/qemu-system-aarch64`.
+The binary is `qemu-src/build/qemu-system-aarch64`. Verify the machine is
+registered:
 
-Cross-compile the test binaries (one-time, from the repo root):
+```sh
+./qemu-system-aarch64 -machine help | grep orangepi
+# Expected: orangepi5plus   Rockchip RK3588 (Orange Pi 5 Plus) with NPU
+```
+
+## Cross-Compiling Test Binaries
+
+Requires `aarch64-linux-gnu-gcc` and libdrm headers
+(`libdrm-dev:arm64` or equivalent). Run from the repo root:
 
 ```sh
 # npu_conv_tests (standalone, no dependencies)
@@ -25,14 +100,15 @@ aarch64-linux-gnu-gcc -static -O2 -o qemu-boot/npu_conv_tests \
   qemu/tests/npu_conv_tests.c
 
 # test_mobilenet (librocketnpu, supports both Rocket and RKNPU)
-cd librocketnpu
 aarch64-linux-gnu-gcc -static -O2 -Wall -Wno-unused-function \
-  -I/usr/aarch64-linux-gnu/include/drm -Iinclude -Isrc \
-  -o ../qemu-boot/test_mobilenet \
-  tests/test_mobilenet.c src/rnpu_drm.c src/rnpu_tflite.c \
-  src/rnpu_coefs.c src/rnpu_task.c src/rnpu_regcmd.c \
-  src/rnpu_convert.c src/rnpu_sw_ops.c src/rnpu_model.c -lm
-cd ..
+  -I/usr/aarch64-linux-gnu/include/drm \
+  -Ilibrocketnpu/include -Ilibrocketnpu/src \
+  -o qemu-boot/test_mobilenet \
+  librocketnpu/tests/test_mobilenet.c \
+  librocketnpu/src/rnpu_drm.c librocketnpu/src/rnpu_tflite.c \
+  librocketnpu/src/rnpu_coefs.c librocketnpu/src/rnpu_task.c \
+  librocketnpu/src/rnpu_regcmd.c librocketnpu/src/rnpu_convert.c \
+  librocketnpu/src/rnpu_sw_ops.c librocketnpu/src/rnpu_model.c -lm
 ```
 
 After rebuilding test binaries, copy them into the rootfs trees and
