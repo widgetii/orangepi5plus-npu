@@ -84,6 +84,9 @@ struct rknpu_mem_create {
    uint64_t size;
    uint64_t obj_addr;
    uint64_t dma_addr;
+   uint64_t sram_size;
+   int32_t  iommu_domain_id;
+   uint32_t core_mask;
 };
 
 struct rknpu_mem_map {
@@ -131,9 +134,10 @@ struct rknpu_submit {
    uint32_t task_counter;
    int32_t  priority;
    uint64_t task_obj_addr;
-   uint64_t regcfg_obj_addr;
+   uint32_t iommu_domain_id;
+   uint32_t reserved;
    uint64_t task_base_addr;
-   uint64_t user_data;
+   int64_t  hw_elapse_time;
    uint32_t core_mask;
    int32_t  fence_fd;
    struct rknpu_subcore_task subcore_task[5];
@@ -143,7 +147,11 @@ struct rknpu_submit {
 #define RKNPU_JOB_BLOCK    0
 #define RKNPU_JOB_PINGPONG (1 << 2)
 #define RKNPU_MEM_KERNEL_MAPPING (1 << 3)
+#define RKNPU_MEM_IOMMU          (1 << 4)
 
+struct rknpu_action { uint32_t flags; uint32_t value; };
+#define RKNPU_POWER_ON  20
+#define DRM_IOCTL_RKNPU_ACTION      _IOWR(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x00, struct rknpu_action)
 #define DRM_IOCTL_RKNPU_SUBMIT      _IOWR(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x01, struct rknpu_submit)
 #define DRM_IOCTL_RKNPU_MEM_CREATE  _IOWR(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x02, struct rknpu_mem_create)
 #define DRM_IOCTL_RKNPU_MEM_MAP     _IOWR(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x03, struct rknpu_mem_map)
@@ -182,7 +190,7 @@ int rnpu_bo_create(int fd, uint32_t size, struct rnpu_bo *bo)
       bo->map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
                      fd, req.offset);
    } else {
-      struct rknpu_mem_create mc = { .size = size, .flags = 0 };
+      struct rknpu_mem_create mc = { .size = size, .flags = 0, .iommu_domain_id = 0 };
       if (ioctl(fd, DRM_IOCTL_RKNPU_MEM_CREATE, &mc)) {
          fprintf(stderr, "rnpu: RKNPU MEM_CREATE failed: %s (size=%u)\n",
                  strerror(errno), size);
@@ -298,6 +306,20 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
    /* RKNPU path: submit each job separately in blocking mode.
     * Each job maps to one rknpu_task — the first task in the job triggers
     * the operation, and hardware follows chain pointers for split tasks. */
+
+   /* Ensure NPU is powered on (runtime PM) */
+   static int npu_powered = 0;
+   if (!npu_powered) {
+      struct rknpu_action act = { .flags = RKNPU_POWER_ON };
+      ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &act);
+      npu_powered = 1;
+   }
+
+   /* The RKNPU driver initializes per-core CNA and core-control registers
+    * before each submit (rknpu_job_commit_pc lines 305-311). We can't write
+    * MMIO from userspace, so these writes happen inside the kernel's submit
+    * handler. However, we need to match the driver's expected task layout. */
+
    for (uint32_t j = 0; j < job_count; j++) {
       struct drm_rocket_job *job = &jobs[j];
       struct drm_rocket_task *first_task =
@@ -306,7 +328,8 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
       /* Allocate task BO with KERNEL_MAPPING — the driver reads the
        * rknpu_task descriptor from kernel space during job scheduling. */
       struct rknpu_mem_create tmc = {
-         .size = 4096, .flags = RKNPU_MEM_KERNEL_MAPPING
+         .size = 4096, .flags = RKNPU_MEM_KERNEL_MAPPING,
+         .iommu_domain_id = 0,
       };
       if (ioctl(fd, DRM_IOCTL_RKNPU_MEM_CREATE, &tmc)) {
          fprintf(stderr, "rnpu: RKNPU task BO alloc failed\n");
@@ -328,7 +351,7 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
       struct rknpu_task *task = (struct rknpu_task *)tmap;
       memset(task, 0, sizeof(*task));
       task->op_idx = j;
-      task->enable_mask = 0xd;
+      task->enable_mask = 0xf;
       task->int_mask = 0x300;
       task->int_clear = 0x1ffff;
       task->regcfg_amount = first_task->regcmd_count -
@@ -340,9 +363,9 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
          .timeout = 6000,
          .task_number = 1,
          .task_obj_addr = tmc.obj_addr,
-         .core_mask = 1,
+         .core_mask = 0x1,
          .fence_fd = -1,
-         .subcore_task = { {0, 1}, {1, 0}, {2, 0}, {0, 0}, {0, 0} },
+         .subcore_task = { {0, 1}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
       };
 
       int ret = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &submit);
