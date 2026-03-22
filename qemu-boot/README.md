@@ -98,7 +98,7 @@ qemu-system-aarch64 \
 
 | Parameter | Value | Why |
 |-----------|-------|-----|
-| `-m` | 3G recommended | 2-3G works fully. 4G+ boots but NPU DMA has issues with high memory (conv tests fail, under investigation) |
+| `-m` | 2G-4G+ | Any size works. RAM >3838 MiB is capped at the MMIO boundary with a warning |
 | `cma=64M` | Required | Default 16MB CMA is too small; the RKNPU driver allocates ~8MB contiguous for the activation buffer |
 | `-dtb vendor.dtb` | Required | Vendor kernel needs the single-node `rockchip,rk3588-rknpu` binding |
 
