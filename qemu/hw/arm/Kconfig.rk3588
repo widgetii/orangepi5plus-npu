@@ -8,4 +8,4 @@ config ORANGEPI5PLUS
     select SERIAL
     select UNIMP
     select ROCKCHIP_NPU
-    select NPCM_GMAC
+    select VIRTIO_MMIO

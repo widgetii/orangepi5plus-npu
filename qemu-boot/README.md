@@ -52,15 +52,14 @@ aarch64-linux-gnu-gcc -static -O2 -Wall -Wno-unused-function \
 After rebuilding test binaries, copy them into the rootfs trees and
 regenerate the initrds (see "Rebuilding Initrds" below).
 
-## Running — Mainline Kernel (Rocket Driver)
+## Running — Minimal Initrd (NPU Tests Only)
 
 ```sh
 qemu-system-aarch64 \
   -M orangepi5plus -m 2G -nographic -smp 4 \
   -kernel Image-6.18 \
   -initrd initrd.gz \
-  -append "console=ttyS0,1500000 earlycon panic=10" \
-  -nic user
+  -append "console=ttyS0,1500000 earlycon panic=10"
 ```
 
 The init script loads the Rocket kernel module, waits for `/dev/accel/accel0`,
@@ -92,8 +91,7 @@ qemu-system-aarch64 \
   -kernel Image-vendor \
   -initrd initrd-vendor.gz \
   -dtb vendor.dtb \
-  -append "console=ttyS0,1500000 earlycon panic=10 cma=64M" \
-  -nic user
+  -append "console=ttyS0,1500000 earlycon panic=10 cma=64M"
 ```
 
 **Important constraints:**
@@ -120,6 +118,34 @@ RESULT: PASS (bit-exact)
 
 The `test_dmesg` sub-test reports PARTIAL (dmesg format parsing), which is
 harmless.
+
+## Running — Full Ubuntu Rootfs
+
+For a full system with networking, package management, and SSH:
+
+```sh
+qemu-system-aarch64 \
+  -M orangepi5plus -m 2G -nographic -smp 4 \
+  -kernel Image-6.18 \
+  -append "console=ttyS0,1500000 earlycon panic=10 root=/dev/vda rw" \
+  -drive file=rootfs.img,format=raw,if=none,id=hd0 \
+  -device virtio-blk-device,drive=hd0 \
+  -netdev user,id=net0 -device virtio-net-device,netdev=net0
+```
+
+The rootfs image (`rootfs.img`) is an ext4 disk image with Ubuntu 24.04
+(debootstrap minbase). It needs:
+
+- Kernel modules in `/lib/modules/6.18.10-current-rockchip64/` (from the
+  Armbian `linux-image-current-rockchip64` deb)
+- Our custom `qemu_reset.ko` and `qemu_iommu.ko` in the modules tree
+- Auto-load config in `/etc/modules-load.d/qemu.conf`
+
+With this setup:
+- **Networking**: `eth0` via virtio-net, DHCP at `10.0.2.x`, full internet
+- **NPU**: All 3 Rocket cores probe, `/dev/accel/accel0` available
+- **Root disk**: virtio-blk at `/dev/vda`
+- Login: `root` / `root` on serial console
 
 ## File Inventory
 
@@ -176,7 +202,7 @@ The QEMU machine (`orangepi5plus`) emulates:
 - GRF/IOC stubs (for vendor kernel built-in drivers)
 - 3× NPU cores at 0xfdab0000/0xfdac0000/0xfdad0000
 - Rockchip IOMMU v2 (page-table walk)
-- GMAC1 Ethernet at 0xfe1b0000 (Synopsys DWMAC4, reuses NPCM GMAC model)
+- 8× virtio-mmio transports (for virtio-blk root disk and virtio-net)
 
 The NPU model executes INT8 convolutions in software (C loops) inside the
 MMIO write handler for `PC_OPERATION_ENABLE`, then defers the completion IRQ
@@ -189,17 +215,14 @@ the same hardware registers — the emulator handles both transparently.
 
 ## Networking
 
-The machine includes a GMAC1 Ethernet controller at `0xfe1b0000` (Synopsys
-DWC DWMAC 4.20a), emulated using QEMU's existing NPCM GMAC model. Add
-`-nic user` to enable NAT networking with DHCP (guest gets `10.0.2.x`).
+Networking uses **virtio-net** via the virtio-mmio transports. Add
+`-netdev user,id=net0 -device virtio-net-device,netdev=net0` for NAT
+networking with DHCP (guest gets `10.0.2.x`).
 
-The Linux `stmmac` driver probes via the `"snps,dwmac-4.20a"` DT compatible.
-If the kernel has `stmmac` built-in or as a loaded module, `eth0` will appear
-and support basic TCP/UDP/ICMP traffic.
-
-**Limitations:** no real MDIO/PHY (stub returns link-up at 1 Gbps), no PTP,
-single DMA queue only. The 2× RTL8125 PCIe NICs on the real board are not
-emulated (would require PCIe host bridge emulation).
+The real RK3588 GMAC (Synopsys DWMAC 4.20a) is not emulated — QEMU's
+NPCM GMAC model implements DWMAC3 registers which are incompatible with
+the DWMAC4 DMA layout that the Linux `stmmac` driver expects. Virtio-net
+is the practical solution and works reliably.
 
 ## Known Issues
 

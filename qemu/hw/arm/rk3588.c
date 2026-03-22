@@ -35,7 +35,6 @@
 
 #include "hw/misc/rockchip-npu.h"
 #include "hw/misc/rockchip-iommu.h"
-#include "hw/net/npcm_gmac.h"
 
 #define GIC_NUM_SPI 256
 
@@ -186,32 +185,29 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
     qemu_fdt_setprop_cell(fdt, node, "reg-shift", 2);
     qemu_fdt_setprop_cell(fdt, node, "reg-io-width", 4);
 
-    /* Ethernet — GMAC1 (Synopsys DWC DWMAC 4.20a) */
-    qemu_fdt_add_subnode(fdt, "/ethernet@fe1b0000");
-    {
-        char *compat[] = {
-            (char *)"rockchip,rk3588-gmac",
-            (char *)"snps,dwmac-4.20a",
+    /* Virtio-MMIO transports
+     *
+     * These provide virtio-blk (root disk) and virtio-net (networking).
+     * The real RK3588 GMAC (Synopsys DWMAC 4.20a) cannot be emulated via
+     * QEMU's NPCM GMAC model — NPCM implements DWMAC3 registers while
+     * stmmac expects DWMAC4 DMA at different offsets. Virtio-net is the
+     * practical solution for QEMU networking.
+     */
+    for (int i = 0; i < RK3588_NUM_VIRTIO; i++) {
+        hwaddr base = RK3588_VIRTIO_BASE + i * RK3588_VIRTIO_SIZE;
+        snprintf(node, sizeof(node), "/virtio_mmio@%" PRIx64, (uint64_t)base);
+        qemu_fdt_add_subnode(fdt, node);
+        qemu_fdt_setprop_string(fdt, node, "compatible", "virtio,mmio");
+        uint64_t vio_reg[2] = {
+            cpu_to_be64(base), cpu_to_be64(RK3588_VIRTIO_SIZE),
         };
-        qemu_fdt_setprop_string_array(fdt, "/ethernet@fe1b0000",
-                                      "compatible", compat, 2);
+        qemu_fdt_setprop(fdt, node, "reg", vio_reg, sizeof(vio_reg));
+        uint32_t vio_irq[3] = {
+            cpu_to_be32(0), cpu_to_be32(RK3588_VIRTIO_IRQ + i),
+            cpu_to_be32(1),
+        };
+        qemu_fdt_setprop(fdt, node, "interrupts", vio_irq, sizeof(vio_irq));
     }
-    uint64_t gmac_reg[2] = {
-        cpu_to_be64(RK3588_GMAC1_BASE), cpu_to_be64(RK3588_GMAC1_SIZE),
-    };
-    qemu_fdt_setprop(fdt, "/ethernet@fe1b0000", "reg",
-                     gmac_reg, sizeof(gmac_reg));
-    uint32_t gmac_irq[3] = {
-        cpu_to_be32(0), cpu_to_be32(RK3588_GMAC1_IRQ), cpu_to_be32(4),
-    };
-    qemu_fdt_setprop(fdt, "/ethernet@fe1b0000", "interrupts",
-                     gmac_irq, sizeof(gmac_irq));
-    qemu_fdt_setprop_string(fdt, "/ethernet@fe1b0000",
-                            "interrupt-names", "macirq");
-    qemu_fdt_setprop_string(fdt, "/ethernet@fe1b0000",
-                            "phy-mode", "rgmii");
-    qemu_fdt_setprop_string(fdt, "/ethernet@fe1b0000",
-                            "status", "okay");
 
     /* Fixed clock for NPU (1 GHz dummy) */
     int clk_phandle = qemu_fdt_alloc_phandle(fdt);
@@ -516,14 +512,12 @@ static void rk3588_init(MachineState *ms)
                                 RK3588_UART2_BASE + 0x20,
                                 RK3588_UART2_SIZE - 0x20);
 
-    /* GMAC1 — Synopsys DWC DWMAC4 (reuse NPCM GMAC model) */
-    {
-        DeviceState *gmac = qdev_new(TYPE_NPCM_GMAC);
-        qemu_configure_nic_device(gmac, true, NULL);
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(gmac), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(gmac), 0, RK3588_GMAC1_BASE);
-        sysbus_connect_irq(SYS_BUS_DEVICE(gmac), 0,
-                           qdev_get_gpio_in(gicdev, RK3588_GMAC1_IRQ));
+    /* Virtio-MMIO transports */
+    for (int i = 0; i < RK3588_NUM_VIRTIO; i++) {
+        hwaddr base = RK3588_VIRTIO_BASE + i * RK3588_VIRTIO_SIZE;
+        sysbus_create_simple("virtio-mmio", base,
+                             qdev_get_gpio_in(gicdev,
+                                              RK3588_VIRTIO_IRQ + i));
     }
 
     /* CRU stub with PLL lock bits */
