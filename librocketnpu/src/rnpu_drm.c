@@ -303,39 +303,53 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
       struct drm_rocket_task *first_task =
          (struct drm_rocket_task *)(uintptr_t)job->tasks;
 
-      /* Allocate task BO for the RKNPU task descriptor */
-      struct rnpu_bo task_bo;
-      if (rnpu_bo_create(fd, 4096, &task_bo)) {
+      /* Allocate task BO with KERNEL_MAPPING — the driver reads the
+       * rknpu_task descriptor from kernel space during job scheduling. */
+      struct rknpu_mem_create tmc = {
+         .size = 4096, .flags = RKNPU_MEM_KERNEL_MAPPING
+      };
+      if (ioctl(fd, DRM_IOCTL_RKNPU_MEM_CREATE, &tmc)) {
          fprintf(stderr, "rnpu: RKNPU task BO alloc failed\n");
          return -1;
       }
+      struct rknpu_mem_map tmm = { .handle = tmc.handle };
+      if (ioctl(fd, DRM_IOCTL_RKNPU_MEM_MAP, &tmm)) {
+         struct rknpu_mem_destroy tmd = { .handle = tmc.handle, .obj_addr = tmc.obj_addr };
+         ioctl(fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &tmd);
+         return -1;
+      }
+      void *tmap = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, tmm.offset);
+      if (tmap == MAP_FAILED) {
+         struct rknpu_mem_destroy tmd = { .handle = tmc.handle, .obj_addr = tmc.obj_addr };
+         ioctl(fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &tmd);
+         return -1;
+      }
 
-      struct rknpu_task *task = (struct rknpu_task *)task_bo.map;
+      struct rknpu_task *task = (struct rknpu_task *)tmap;
       memset(task, 0, sizeof(*task));
-      task->flags = 0;
       task->op_idx = j;
       task->enable_mask = 0xd;
       task->int_mask = 0x300;
       task->int_clear = 0x1ffff;
-      task->int_status = 0;
       task->regcfg_amount = first_task->regcmd_count -
                             (RKNPU_PC_DATA_EXTRA_AMOUNT + 4);
-      task->regcfg_offset = 0;
       task->regcmd_addr = first_task->regcmd;
 
       struct rknpu_submit submit = {
          .flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG,
          .timeout = 6000,
-         .task_start = 0,
          .task_number = 1,
-         .task_obj_addr = task_bo.obj_addr,
+         .task_obj_addr = tmc.obj_addr,
          .core_mask = 1,
          .fence_fd = -1,
          .subcore_task = { {0, 1}, {1, 0}, {2, 0}, {0, 0}, {0, 0} },
       };
 
       int ret = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &submit);
-      rnpu_bo_destroy(fd, &task_bo);
+
+      munmap(tmap, 4096);
+      struct rknpu_mem_destroy tmd = { .handle = tmc.handle, .obj_addr = tmc.obj_addr };
+      ioctl(fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &tmd);
 
       if (ret) {
          fprintf(stderr, "rnpu: RKNPU SUBMIT failed: %s (job %u/%u)\n",
