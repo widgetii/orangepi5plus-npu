@@ -242,6 +242,151 @@ int ioctl(int fd, unsigned long request, ...) {
                 submit_count, s->flags, s->task_number,
                 (unsigned long long)s->task_obj_addr, s->core_mask);
 
+        /* Mode BRDMA: Dump BRDMA data (bias+scale) from each task's BS_BASE_ADDR */
+        if (submit_count == 1 && getenv("DUMP_BRDMA")) {
+            uint64_t task_obj = s->task_obj_addr;
+            uint32_t task_handle = 0;
+            uint64_t task_bo_size = 0;
+            for (int i = 0; i < bo_count; i++) {
+                if (bo_table[i].obj == task_obj) {
+                    task_handle = bo_table[i].handle;
+                    task_bo_size = bo_table[i].size;
+                    break;
+                }
+            }
+            if (!task_handle) {
+                fprintf(stderr, "BRDMA: cannot find task BO\n");
+                return real_ioctl(fd, request, arg);
+            }
+            struct rknpu_mem_map tm = { .handle = task_handle };
+            void *task_map = NULL;
+            if (real_ioctl(fd, IOCTL_MEM_MAP, &tm) == 0)
+                task_map = mmap(NULL, task_bo_size, PROT_READ, MAP_SHARED, fd, tm.offset);
+            if (!task_map || task_map == MAP_FAILED) {
+                fprintf(stderr, "BRDMA: cannot mmap task BO\n");
+                return real_ioctl(fd, request, arg);
+            }
+
+            /* Create output directory */
+            system("mkdir -p /tmp/rknn_brdma");
+
+            struct rknpu_task *tasks = (struct rknpu_task *)task_map;
+            fprintf(stderr, "BRDMA: %u tasks, scanning for BS_BASE_ADDR...\n", s->task_number);
+
+            for (uint32_t t = 0; t < s->task_number; t++) {
+                uint64_t rc_addr = tasks[t].regcmd_addr;
+                uint32_t rc_amount = tasks[t].regcfg_amount;
+
+                /* Find and mmap regcmd BO */
+                uint64_t rc_bo_dma = 0, rc_bo_size = 0;
+                uint32_t rc_handle = 0;
+                for (int i = 0; i < bo_count; i++) {
+                    if (rc_addr >= bo_table[i].dma &&
+                        rc_addr < bo_table[i].dma + bo_table[i].size) {
+                        rc_bo_dma = bo_table[i].dma;
+                        rc_bo_size = bo_table[i].size;
+                        rc_handle = bo_table[i].handle;
+                        break;
+                    }
+                }
+                if (!rc_handle) continue;
+
+                struct rknpu_mem_map rm = { .handle = rc_handle };
+                void *rc_map = NULL;
+                if (real_ioctl(fd, IOCTL_MEM_MAP, &rm) == 0)
+                    rc_map = mmap(NULL, rc_bo_size, PROT_READ, MAP_SHARED, fd, rm.offset);
+                if (!rc_map || rc_map == MAP_FAILED) continue;
+
+                uint64_t off = rc_addr - rc_bo_dma;
+                uint64_t *entries = (uint64_t *)((uint8_t *)rc_map + off);
+                unsigned total = rc_amount + 4;
+
+                uint32_t bs_base = 0, bs_cfg = 0, bs_mul_cfg = 0;
+                uint32_t out_cvt_scale = 0, out_cvt_shift = 0;
+                uint32_t cube_ch = 0, brdma_cfg = 0;
+
+                for (unsigned e = 0; e < total; e++) {
+                    uint64_t entry = entries[e];
+                    uint16_t reg = entry & 0xFFFF;
+                    uint32_t val = (entry >> 16) & 0xFFFFFFFF;
+                    switch (reg) {
+                    case 0x5020: bs_base = val; break;
+                    case 0x4040: bs_cfg = val; break;
+                    case 0x4048: bs_mul_cfg = val; break;
+                    case 0x4084: out_cvt_scale = val; break;
+                    case 0x4088: out_cvt_shift = val; break;
+                    case 0x403c: cube_ch = val; break;
+                    case 0x501c: brdma_cfg = val; break;
+                    }
+                }
+
+                unsigned oc = (cube_ch & 0x1fff) + 1;
+
+                fprintf(stderr, "TASK[%u]: BS_ADDR=0x%x BS_CFG=0x%x MUL=0x%x "
+                        "OC=%u CVT_S=%u CVT_SH=%u BRDMA=0x%x\n",
+                        t, bs_base, bs_cfg, bs_mul_cfg, oc,
+                        out_cvt_scale, out_cvt_shift, brdma_cfg);
+
+                /* Dump BRDMA data if BS_BASE_ADDR != 0 */
+                if (bs_base != 0) {
+                    /* Find BO containing bs_base address */
+                    uint64_t bs_bo_dma = 0, bs_bo_size = 0;
+                    uint32_t bs_handle = 0;
+                    for (int i = 0; i < bo_count; i++) {
+                        if (bs_base >= bo_table[i].dma &&
+                            bs_base < bo_table[i].dma + bo_table[i].size) {
+                            bs_bo_dma = bo_table[i].dma;
+                            bs_bo_size = bo_table[i].size;
+                            bs_handle = bo_table[i].handle;
+                            break;
+                        }
+                    }
+                    if (bs_handle) {
+                        struct rknpu_mem_map bm = { .handle = bs_handle };
+                        void *bs_map = NULL;
+                        if (real_ioctl(fd, IOCTL_MEM_MAP, &bm) == 0)
+                            bs_map = mmap(NULL, bs_bo_size, PROT_READ, MAP_SHARED, fd, bm.offset);
+                        if (bs_map && bs_map != MAP_FAILED) {
+                            uint64_t bs_off = bs_base - bs_bo_dma;
+                            /* Dump enough data: OC_padded * (4 + 2) bytes or more.
+                             * Use 8*OC bytes as conservative upper bound. */
+                            unsigned oc_pad = ((oc + 15) / 16) * 16;
+                            if (oc_pad < 32) oc_pad = 32;
+                            unsigned dump_sz = oc_pad * 8;
+                            if (bs_off + dump_sz > bs_bo_size)
+                                dump_sz = bs_bo_size - bs_off;
+
+                            char fname[128];
+                            snprintf(fname, sizeof(fname), "/tmp/rknn_brdma/task_%03u.bin", t);
+                            FILE *bf = fopen(fname, "wb");
+                            if (bf) {
+                                fwrite((uint8_t *)bs_map + bs_off, 1, dump_sz, bf);
+                                fclose(bf);
+                                fprintf(stderr, "  -> dumped %u bytes to %s (oc_pad=%u)\n",
+                                        dump_sz, fname, oc_pad);
+                            }
+
+                            /* Also dump metadata */
+                            snprintf(fname, sizeof(fname), "/tmp/rknn_brdma/task_%03u.meta", t);
+                            bf = fopen(fname, "w");
+                            if (bf) {
+                                fprintf(bf, "oc=%u\noc_pad=%u\nbs_cfg=0x%x\nbs_mul_cfg=0x%x\n"
+                                        "brdma_cfg=0x%x\nout_cvt_scale=%u\nout_cvt_shift=%u\n"
+                                        "bs_base=0x%x\n",
+                                        oc, oc_pad, bs_cfg, bs_mul_cfg,
+                                        brdma_cfg, out_cvt_scale, out_cvt_shift, bs_base);
+                                fclose(bf);
+                            }
+                            munmap(bs_map, bs_bo_size);
+                        }
+                    }
+                }
+                munmap(rc_map, rc_bo_size);
+            }
+            munmap(task_map, task_bo_size);
+            return real_ioctl(fd, request, arg);
+        }
+
         /* Mode 0: Dump all task regcmd register values on first SUBMIT */
         if (submit_count == 1 && getenv("DUMP_REGCMD")) {
             /* Find and mmap the task BO */

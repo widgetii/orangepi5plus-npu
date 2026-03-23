@@ -370,8 +370,14 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                          * MIN2(wt_oc, NPU_WEIGHT_ATOMIC_SIZE)
                          * MIN2(wt_ic, wt_ic_group);
 
-    bool bias_from_dma = (task->brdma_cfg & 0x1e) == 0x02;
-    uint32_t bias_buf_size = out_c * sizeof(int32_t);
+    uint32_t brdma_data_use = (task->brdma_cfg >> 1) & 0xf;
+    bool bias_from_dma = (brdma_data_use >= 1);
+    bool mul_from_dma = (brdma_data_use >= 3);
+    uint32_t oc_pad = ALIGN_UP(MAX2(out_c, 32), 16);
+    uint32_t bias_buf_size = oc_pad * sizeof(int32_t);
+
+    /* Per-channel MUL scale buffer (int16, from BRDMA) */
+    int16_t *mul_scale_buf = NULL;
 
     bool ew_bypass = (task->ew_cfg & 0x01);
     bool ew_op_bypass = (task->ew_cfg >> 1) & 1;
@@ -391,7 +397,23 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     npu_dma_read(s, task->weight_addr, wt_buf, wt_buf_size);
 
     if (bias_from_dma && task->bias_addr != 0) {
-        npu_dma_read(s, task->bias_addr, bias_buf, bias_buf_size);
+        if (mul_from_dma) {
+            /* RKNN BRDMA layout: groups of 8 channels per 64-byte chunk.
+             * [0..31]: 8 × int32 bias, [32..47]: padding, [48..63]: 8 × int16 mul */
+            uint32_t num_groups = oc_pad / 8;
+            uint32_t total_brdma = num_groups * 64;
+            uint8_t *brdma_raw = g_malloc0(total_brdma);
+            npu_dma_read(s, task->bias_addr, brdma_raw, total_brdma);
+            mul_scale_buf = g_malloc0(oc_pad * sizeof(int16_t));
+            for (uint32_t g = 0; g < num_groups; g++) {
+                uint8_t *chunk = brdma_raw + g * 64;
+                memcpy(&bias_buf[g * 8], chunk, 8 * sizeof(int32_t));
+                memcpy(&mul_scale_buf[g * 8], chunk + 48, 8 * sizeof(int16_t));
+            }
+            g_free(brdma_raw);
+        } else {
+            npu_dma_read(s, task->bias_addr, bias_buf, out_c * sizeof(int32_t));
+        }
     }
 
     if (ew_active && erdma_enabled && task->ew_base_addr != 0) {
@@ -457,8 +479,17 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                     bool bs_alu_src = (task->bs_cfg >> 8) & 1;
                     int32_t bs_alu_op = bs_alu_src ? bias_buf[oc]
                                                    : task->bs_alu_cfg;
+
+                    /* Per-channel MUL: when MUL_SRC=DMA (bit 0 of bs_mul_cfg),
+                     * override the scalar mul operand with per-channel value */
+                    uint32_t eff_bs_mul_cfg = task->bs_mul_cfg;
+                    if (mul_scale_buf && (task->bs_mul_cfg & 1)) {
+                        int16_t per_ch_mul = mul_scale_buf[oc];
+                        eff_bs_mul_cfg = (eff_bs_mul_cfg & 0x0000ffff) |
+                                         ((uint32_t)(uint16_t)per_ch_mul << 16);
+                    }
                     acc = apply_sdp_x_stage(acc, task->bs_cfg, bs_alu_op,
-                                             task->bs_mul_cfg,
+                                             eff_bs_mul_cfg,
                                              (int32_t)task->bs_relux_cmp);
                 }
 
@@ -539,6 +570,7 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     g_free(in_buf);
     g_free(wt_buf);
     g_free(bias_buf);
+    g_free(mul_scale_buf);
     g_free(ew_buf);
     g_free(out_buf);
 }

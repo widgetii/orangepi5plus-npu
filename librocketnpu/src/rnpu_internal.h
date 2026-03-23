@@ -230,6 +230,14 @@ struct rnpu_operation {
    unsigned *group_channel_indices;
    int32_t per_channel_bias;
 
+   /* RKNPU full-conv per-channel: BS MUL with DMA source */
+   bool use_brdma_per_channel;
+   uint32_t brdma_offset;
+   uint32_t brdma_size;
+   unsigned brdma_mul_shift;    /* BS_MUL_CFG shift (dynamic per op) */
+   float *per_channel_scales;
+   unsigned per_channel_scale_count;
+
    /* Offsets into shared BOs */
    uint32_t weight_offset;
    uint32_t weight_size;
@@ -293,6 +301,7 @@ struct rnpu_model {
    struct rnpu_bo bias_bo;
    struct rnpu_bo regcmd_bo;
    struct rnpu_bo activation_bo;
+   struct rnpu_bo brdma_bo;  /* RKNPU: per-channel bias+mul_scale data */
 
    /* Tensors */
    struct rnpu_npu_tensor *tensors;

@@ -44,4 +44,16 @@ int32_t rnpu_compute_bias_scalar(const struct rnpu_tfl_model *tfl,
                                  const struct rnpu_tfl_op *op,
                                  unsigned channel);
 
+/* Fill BRDMA data (bias+MUL scale) for RKNPU per-channel requantization.
+ * Returns ref_conv_scale for use in uniform OUT_CVT_SCALE/SHIFT.
+ * Writes *out_mul_shift with the BS_MUL shift to use in regcmd. */
+float rnpu_fill_brdma_data(const struct rnpu_tfl_model *tfl,
+                            const struct rnpu_tfl_op *op,
+                            const struct rnpu_operation *npu_op,
+                            uint8_t *dst, unsigned dst_size,
+                            unsigned *out_mul_shift);
+
+/* Compute BRDMA buffer size for one op with given output channels. */
+unsigned rnpu_calc_brdma_size(unsigned oc);
+
 #endif /* RNPU_COEFS_H */

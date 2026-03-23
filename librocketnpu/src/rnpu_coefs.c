@@ -251,3 +251,92 @@ int32_t rnpu_compute_bias_scalar(const struct rnpu_tfl_model *tfl,
    int32_t corr = calc_bias_correction(tfl, op, channel);
    return biases_in[channel] - corr;
 }
+
+/*
+ * Fill BRDMA data for RKNPU per-channel requantization.
+ *
+ * The RKNN runtime uses BRDMA_DATA_USE=7 which loads both bias (for BS ALU ADD)
+ * and MUL scale (for BS MUL) in one DMA transfer. Layout is determined by
+ * Phase 1 analysis — initially using Layout A: [bias int32 x oc_pad] [mul int16 x oc_pad].
+ *
+ * Returns the max conv_scale (input_scale * max_weight_scale / output_scale)
+ * which is used for the uniform OUT_CVT_SCALE/SHIFT.
+ */
+float rnpu_fill_brdma_data(const struct rnpu_tfl_model *tfl,
+                            const struct rnpu_tfl_op *op,
+                            const struct rnpu_operation *npu_op,
+                            uint8_t *dst, unsigned dst_size,
+                            unsigned *out_mul_shift)
+{
+   unsigned oc = tfl->tensors[op->outputs[0]].shape[3];
+   unsigned oc_pad = ALIGN_UP(MAX2(oc, 32), 16);
+   int wt_idx = op->inputs[1];
+   const struct rnpu_tfl_tensor *wt = &tfl->tensors[wt_idx];
+   int bias_idx = op->inputs[2];
+   const struct rnpu_tfl_buffer *bias_buf = &tfl->buffers[tfl->tensors[bias_idx].buffer_index];
+   const int32_t *biases_in = (const int32_t *)bias_buf->data;
+
+   float input_scale = tfl->tensors[op->inputs[0]].quant.scale;
+   float output_scale = tfl->tensors[op->outputs[0]].quant.scale;
+
+   /* Find max weight scale */
+   float max_ws = wt->quant.scales[0];
+   for (unsigned i = 1; i < wt->quant.num_scales; i++)
+      if (wt->quant.scales[i] > max_ws) max_ws = wt->quant.scales[i];
+
+   float max_conv_scale = (input_scale * max_ws) / output_scale;
+
+   /* MUL shift from BS_MUL_CFG — RKNN uses shift=14 */
+   unsigned mul_shift = 14;
+
+   /* Truncation bits — already computed by compile_weights_and_biases */
+   unsigned truncate = npu_op->truncate_bits;
+
+   /* Store mul_shift in op for regcmd generation */
+   /* We encode it via the return value and the npu_op structure.
+    * For now, store mul_shift in a field we can access from regcmd.
+    * Use per_channel_scale_count as a carrier (ugly but functional). */
+
+   /* RKNN BRDMA layout: groups of 8 channels per 64-byte chunk.
+    * Each 64-byte chunk:
+    *   [0..31]: 8 × int32 bias (32 bytes)
+    *   [32..47]: padding (16 bytes, zeros)
+    *   [48..63]: 8 × int16 mul_scale (16 bytes)
+    *
+    * MUL reference is min_ws: MUL[c] = ws[c]/min_ws * 2^mul_shift
+    * OUT_CVT uses min_conv_scale = input_scale * min_ws / output_scale
+    */
+   memset(dst, 0, dst_size);
+
+   unsigned num_groups = oc_pad / 8;
+   for (unsigned g = 0; g < num_groups; g++) {
+      uint8_t *chunk = dst + g * 64;
+      int32_t *bias_grp = (int32_t *)(chunk);         /* offset 0 */
+      int16_t *mul_grp = (int16_t *)(chunk + 48);     /* offset 48 (matches RKNN dump) */
+
+      for (unsigned i = 0; i < 8; i++) {
+         unsigned c = g * 8 + i;
+         if (c < oc) {
+            int32_t corr = calc_bias_correction(tfl, op, c);
+            int32_t bv = biases_in[c];
+            if (max_ws != 0.0f)
+               bv = (int32_t)roundf(bv * (wt->quant.scales[c] / max_ws));
+            bias_grp[i] = (bv - corr) / (1 << truncate);
+
+            float ratio = wt->quant.scales[c] / max_ws;
+            mul_grp[i] = (int16_t)roundf(ratio * (float)(1 << mul_shift));
+         }
+      }
+   }
+
+   if (out_mul_shift) *out_mul_shift = mul_shift;
+   return max_conv_scale;
+}
+
+/* Compute BRDMA buffer size for one operation.
+ * RKNN layout: ceil(oc_pad/8) groups × 64 bytes each. */
+unsigned rnpu_calc_brdma_size(unsigned oc)
+{
+   unsigned oc_pad = ALIGN_UP(MAX2(oc, 32), 16);
+   return (oc_pad / 8) * 64;
+}

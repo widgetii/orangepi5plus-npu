@@ -432,12 +432,15 @@ static void compile_weights_and_biases(struct rnpu_model *m)
       struct rnpu_operation *op = &m->ops[i];
       if (op->type != RNPU_OP_CONV) continue;
 
-      /* Find the TFLite op for this operation */
+      /* Find the TFLite op for this operation.
+       * Match by output tensor, or by input tensor (handles ADD-fused CONVs
+       * where output_tensor was changed to the ADD's output). */
       const struct rnpu_tfl_op *top = NULL;
       for (unsigned j = 0; j < m->tfl.op_count; j++) {
          if (m->tfl.ops[j].builtin_code == TFLITE_OP_CONV_2D ||
              m->tfl.ops[j].builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D) {
             if (m->tfl.ops[j].outputs[0] == (int)op->output_tensor ||
+                m->tfl.ops[j].inputs[0] == (int)op->input_tensor ||
                 (op->output_tensor_channels > 0 &&
                  m->tfl.tensors[m->tfl.ops[j].outputs[0]].shape[3] ==
                  (int)op->output_tensor_channels)) {
@@ -471,6 +474,60 @@ static void compile_weights_and_biases(struct rnpu_model *m)
    /* Flush weight and bias BOs to NPU */
    if (m->weight_bo.handle) rnpu_bo_fini(m->fd, &m->weight_bo);
    if (m->bias_bo.handle) rnpu_bo_fini(m->fd, &m->bias_bo);
+}
+
+static void compile_brdma_data(struct rnpu_model *m)
+{
+   /* First pass: compute total BRDMA size across all per-axis BRDMA ops */
+   uint32_t total_brdma = 0;
+   for (unsigned i = 0; i < m->op_count; i++) {
+      struct rnpu_operation *op = &m->ops[i];
+      if (!op->use_brdma_per_channel) continue;
+      unsigned sz = rnpu_calc_brdma_size(op->output_channels);
+      op->brdma_offset = total_brdma;
+      op->brdma_size = sz;
+      total_brdma += ALIGN_UP(sz, 64);
+   }
+   if (total_brdma == 0) return;
+
+   /* Create BRDMA BO */
+   if (rnpu_bo_create(m->fd, total_brdma, &m->brdma_bo) < 0) {
+      fprintf(stderr, "rnpu: failed to create BRDMA BO (%u bytes)\n", total_brdma);
+      return;
+   }
+
+   /* Second pass: fill BRDMA data for each op */
+   for (unsigned i = 0; i < m->op_count; i++) {
+      struct rnpu_operation *op = &m->ops[i];
+      if (!op->use_brdma_per_channel) continue;
+
+      /* Find TFLite op for this operation (same lookup as compile_weights) */
+      const struct rnpu_tfl_op *top = NULL;
+      for (unsigned j = 0; j < m->tfl.op_count; j++) {
+         if (m->tfl.ops[j].builtin_code == TFLITE_OP_CONV_2D ||
+             m->tfl.ops[j].builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D) {
+            if (m->tfl.ops[j].outputs[0] == (int)op->output_tensor ||
+                m->tfl.ops[j].inputs[0] == (int)op->input_tensor) {
+               top = &m->tfl.ops[j];
+               break;
+            }
+         }
+      }
+      if (!top) continue;
+
+      uint8_t *dst = (uint8_t *)m->brdma_bo.map + op->brdma_offset;
+      unsigned ms = 14;
+      rnpu_fill_brdma_data(&m->tfl, top, op, dst, op->brdma_size, &ms);
+      op->brdma_mul_shift = ms;
+   }
+
+   /* Flush to device */
+   rnpu_bo_fini(m->fd, &m->brdma_bo);
+
+   unsigned brdma_ops = 0;
+   for (unsigned i = 0; i < m->op_count; i++)
+      if (m->ops[i].use_brdma_per_channel) brdma_ops++;
+   fprintf(stderr, "rnpu: BRDMA BO %u bytes (%u ops)\n", total_brdma, brdma_ops);
 }
 
 /* Patch a chain pointer from task src to task dst */
@@ -527,7 +584,7 @@ static void compile_regcmds(struct rnpu_model *m)
 
       for (unsigned t = 0; t < op->task_count; t++) {
          uint64_t *dst = (uint64_t *)(base + rc_offset);
-         unsigned count = rnpu_fill_regcmd(m, op, dst, 120, t);
+         unsigned count = rnpu_fill_regcmd(m, op, dst, 140, t);
          unsigned size_bytes = count * sizeof(uint64_t);
 
          struct rnpu_split_task *task = &op->tasks[t];
@@ -608,10 +665,11 @@ static void build_execution_plan(struct rnpu_model *m)
       }
    }
 
+   unsigned handles_per_job = m->brdma_bo.handle ? 4 : 3;
    if (total_jobs > 0) {
       m->jobs = calloc(total_jobs, sizeof(struct drm_rocket_job));
       m->hw_tasks = calloc(total_tasks, sizeof(struct drm_rocket_task));
-      m->in_handles = calloc(total_jobs * 3, sizeof(uint32_t));
+      m->in_handles = calloc(total_jobs * handles_per_job, sizeof(uint32_t));
       m->out_handles = calloc(total_jobs, sizeof(uint32_t));
    }
 
@@ -636,17 +694,19 @@ static void build_execution_plan(struct rnpu_model *m)
          j++;
       } while (1);
 
-      unsigned hi = ji * 3;
+      unsigned hi = ji * handles_per_job;
       m->in_handles[hi] = m->weight_bo.handle;
       m->in_handles[hi + 1] = m->regcmd_bo.handle;
       m->in_handles[hi + 2] = m->bias_bo.handle ? m->bias_bo.handle : m->weight_bo.handle;
+      if (handles_per_job > 3)
+         m->in_handles[hi + 3] = m->brdma_bo.handle;
       m->out_handles[ji] = m->activation_bo.handle;
       struct drm_rocket_job *job = &m->jobs[ji];
       job->task_struct_size = sizeof(struct drm_rocket_task);
       job->tasks = (uint64_t)(uintptr_t)&m->hw_tasks[first_task];
       job->task_count = merged_task_count;
       job->in_bo_handles = (uint64_t)(uintptr_t)&m->in_handles[hi];
-      job->in_bo_handle_count = 3;
+      job->in_bo_handle_count = handles_per_job;
       job->out_bo_handles = (uint64_t)(uintptr_t)&m->out_handles[ji];
       job->out_bo_handle_count = 1;
       ji++;
@@ -804,8 +864,14 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
           top->builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D) {
          const struct rnpu_tfl_tensor *wt = &m->tfl.tensors[top->inputs[1]];
          if (wt->quant.scales && wt->quant.num_scales > 1) {
-            const struct rnpu_tfl_tensor *ot = &m->tfl.tensors[top->outputs[0]];
-            total_ops += DIV_ROUND_UP(ot->shape[3], PER_AXIS_GROUP_SIZE);
+            if (rnpu_active_driver == RNPU_DRIVER_RKNPU) {
+               /* RKNPU: full-conv per-channel, one op per CONV */
+               total_ops++;
+            } else {
+               /* Rocket: GS=1 decomposition */
+               const struct rnpu_tfl_tensor *ot = &m->tfl.tensors[top->outputs[0]];
+               total_ops += DIV_ROUND_UP(ot->shape[3], PER_AXIS_GROUP_SIZE);
+            }
             continue;
          }
       }
@@ -827,7 +893,19 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
       case TFLITE_OP_DEPTHWISE_CONV_2D: {
          const struct rnpu_tfl_tensor *wt = &m->tfl.tensors[top->inputs[1]];
          if (wt->quant.scales && wt->quant.num_scales > 1) {
-            lower_conv_per_group(m, top, &m->ops, &m->op_count);
+            if (rnpu_active_driver == RNPU_DRIVER_RKNPU) {
+               /* RKNPU: full-conv, per-channel via BRDMA BS MUL */
+               lower_conv(m, top, op);
+               op->use_brdma_per_channel = true;
+               op->per_channel_scale_count = wt->quant.num_scales;
+               op->per_channel_scales = malloc(wt->quant.num_scales * sizeof(float));
+               memcpy(op->per_channel_scales, wt->quant.scales,
+                      wt->quant.num_scales * sizeof(float));
+               m->op_count++;
+            } else {
+               /* Rocket: GS=1 per-channel group decomposition */
+               lower_conv_per_group(m, top, &m->ops, &m->op_count);
+            }
          } else {
             lower_conv(m, top, op);
             m->op_count++;
@@ -927,6 +1005,9 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
    /* Compile weights and biases into shared BOs */
    compile_weights_and_biases(m);
 
+   /* Compile BRDMA data for RKNPU per-channel ops */
+   compile_brdma_data(m);
+
    /* Generate register commands */
    compile_regcmds(m);
 
@@ -960,12 +1041,16 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
    for (unsigned i = 0; i < m->op_count; i++)
       if (m->ops[i].type == RNPU_OP_CONV) hw_ops++;
    fprintf(stderr, "rnpu: ready — %u HW ops (%u jobs), %u SW ops, %u BOs "
-           "(W=%uK B=%uK R=%uK A=%uK)\n",
+           "(W=%uK B=%uK R=%uK A=%uK",
            hw_ops, m->job_count, m->op_count - hw_ops,
            (m->weight_bo.handle ? 1u : 0u) + (m->bias_bo.handle ? 1u : 0u) +
-           (m->regcmd_bo.handle ? 1u : 0u) + (m->activation_bo.handle ? 1u : 0u),
+           (m->regcmd_bo.handle ? 1u : 0u) + (m->activation_bo.handle ? 1u : 0u) +
+           (m->brdma_bo.handle ? 1u : 0u),
            m->weight_bo.size / 1024, m->bias_bo.size / 1024,
            m->regcmd_bo.size / 1024, m->activation_bo.size / 1024);
+   if (m->brdma_bo.handle)
+      fprintf(stderr, " BRDMA=%uK", m->brdma_bo.size / 1024);
+   fprintf(stderr, ")\n");
 
    return m;
 }
@@ -1004,12 +1089,17 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
          /* Wait for completion */
          rnpu_bo_prep(m->fd, &m->activation_bo);
 
-         /* Apply per-axis corrections */
-         for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++)
-            rnpu_apply_per_axis_correction(m, &m->ops[j]);
-
-         /* Compact/unsort per-group outputs */
+         /* Apply per-axis corrections (skip for BRDMA per-channel ops —
+          * hardware already handles per-channel requantization) */
          for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
+            if (!m->ops[j].use_brdma_per_channel)
+               rnpu_apply_per_axis_correction(m, &m->ops[j]);
+         }
+
+         /* Compact/unsort per-group outputs (skip for BRDMA per-channel ops —
+          * output is already in correct channel order) */
+         for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
+            if (m->ops[j].use_brdma_per_channel) continue;
             if (m->ops[j].output_tensor_channels == 0) continue;
             unsigned first_g = j;
             unsigned out_idx = m->ops[j].output_tensor;
@@ -1105,6 +1195,7 @@ void rnpu_model_free(rnpu_model_t *m)
       struct rnpu_operation *op = &m->ops[i];
       free(op->per_axis_correction);
       free(op->group_channel_indices);
+      free(op->per_channel_scales);
       free(op->tasks);
       if (op->type == RNPU_OP_CONCAT) {
          free(op->sw.concat.input_tensors);
@@ -1127,12 +1218,15 @@ void rnpu_model_free(rnpu_model_t *m)
    rnpu_bo_prep(m->fd, &m->weight_bo);
    rnpu_bo_prep(m->fd, &m->bias_bo);
    rnpu_bo_prep(m->fd, &m->regcmd_bo);
+   if (m->brdma_bo.handle)
+      rnpu_bo_prep(m->fd, &m->brdma_bo);
 
    /* Destroy BOs */
    rnpu_bo_destroy(m->fd, &m->weight_bo);
    rnpu_bo_destroy(m->fd, &m->bias_bo);
    rnpu_bo_destroy(m->fd, &m->regcmd_bo);
    rnpu_bo_destroy(m->fd, &m->activation_bo);
+   rnpu_bo_destroy(m->fd, &m->brdma_bo);
 
    /* Free TFLite model */
    rnpu_tflite_free(&m->tfl);

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdio.h>
 #include "rnpu_task.h"
 
 static unsigned calc_entries_per_slice(struct rnpu_operation *op)
@@ -170,9 +171,15 @@ void rnpu_split_tasks(struct rnpu_operation *op)
       return;
    }
 
-   /* Multiple tasks needed */
+   /* Multiple tasks needed.
+    * max_tasks estimate: ceil(ih / effective_stride_per_task) + safety.
+    * For strided convs, effective output rows per task = avail_slices / stride,
+    * which means more tasks are needed. Use generous safety margin. */
    unsigned avail_slices = (CBUF_ENTRIES_PER_BANK * avail_ib) / entries_per_slice;
-   unsigned max_tasks = DIV_ROUND_UP(op->input_height, avail_slices) + 2;
+   if (avail_slices == 0) avail_slices = 1;
+   unsigned effective_advance = (avail_slices > op->weights_height) ?
+      avail_slices - op->weights_height + op->stride : op->stride;
+   unsigned max_tasks = DIV_ROUND_UP(op->input_height, effective_advance) + 4;
    op->tasks = calloc(max_tasks, sizeof(struct rnpu_split_task));
    op->task_count = 0;
 
@@ -190,6 +197,14 @@ void rnpu_split_tasks(struct rnpu_operation *op)
       while (slice <= prev->bottom_slice) slice += op->stride;
       if (slice > prev->bottom_slice) slice -= op->stride;
 
+      if (op->task_count >= max_tasks) {
+         fprintf(stderr, "rnpu: task split overflow: task_count=%u >= max=%u "
+                 "(iw=%u ih=%u ic=%u oc=%u stride=%u eps=%u avail_sl=%u)\n",
+                 op->task_count, max_tasks, op->input_width, op->input_height,
+                 op->input_channels, op->output_channels, op->stride,
+                 entries_per_slice, avail_slices);
+         break;
+      }
       t = &op->tasks[op->task_count++];
       memset(t, 0, sizeof(*t));
       t->num = op->task_count - 1;
@@ -209,11 +224,24 @@ void rnpu_split_tasks(struct rnpu_operation *op)
       slice = t->top_slice + op->weights_height - 1;
    }
 
-   /* Trim last task if needed */
-   struct rnpu_split_task *last = &op->tasks[op->task_count - 1];
-   if (last->top_slice >= op->input_height ||
-       last->bottom_slice >= op->input_height + pb)
-      op->task_count--;
+   /* Trim last task if it's out of range or too small for the kernel.
+    * When trimming, extend the previous task to cover the remaining rows. */
+   while (op->task_count > 1) {
+      struct rnpu_split_task *last = &op->tasks[op->task_count - 1];
+      unsigned last_ih = last->bottom_slice - last->top_slice + 1;
+      if (last->top_slice >= op->input_height ||
+          last->bottom_slice >= op->input_height + pb ||
+          last_ih + last->pad_top + last->pad_bottom < op->weights_height) {
+         /* Extend previous task to cover these rows */
+         if (op->task_count >= 2) {
+            struct rnpu_split_task *prev = &op->tasks[op->task_count - 2];
+            prev->bottom_slice = MIN2(last->bottom_slice, op->input_height - 1);
+            prev->pad_bottom = last->pad_bottom;
+         }
+         op->task_count--;
+      } else
+         break;
+   }
 
    /* Overlap slices */
    for (unsigned i = 1; i < op->task_count; i++) {
