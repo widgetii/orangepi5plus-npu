@@ -33,6 +33,16 @@ static bool tfl_is_depthwise(const struct rnpu_tfl_model *tfl,
    return ic > 1 && oc > 1;
 }
 
+/* Convert TFLite zero point to uint8 domain for NPU.
+ * INT8 tensors (type=9): zp is in [-128,127], need +128 for uint8 domain.
+ * UINT8 tensors (type=3): zp is already in uint8 domain.
+ * This matches RKNN's convention (e.g., int8 ozp=-128 → uint8 0). */
+static uint8_t tfl_zp_u8(const struct rnpu_tfl_tensor *t)
+{
+   return (t->type == 9) ? (uint8_t)(t->quant.zero_point + 128)
+                         : (uint8_t)t->quant.zero_point;
+}
+
 /* ---- Op lowering (TFLite → internal ops) ---- */
 
 static void lower_conv(struct rnpu_model *m, const struct rnpu_tfl_op *top,
@@ -55,14 +65,14 @@ static void lower_conv(struct rnpu_model *m, const struct rnpu_tfl_op *top,
    op->input_width = it->shape[1];
    op->input_height = it->shape[2];
    op->input_channels = it->shape[3];
-   op->input_zero_point = (uint8_t)it->quant.zero_point;
+   op->input_zero_point = tfl_zp_u8(it);
    op->input_scale = it->quant.scale;
 
    op->output_tensor = top->outputs[0];
    op->output_width = ot->shape[1];
    op->output_height = ot->shape[2];
    op->output_channels = ot->shape[3];
-   op->output_zero_point = (uint8_t)ot->quant.zero_point;
+   op->output_zero_point = tfl_zp_u8(ot);
    op->output_scale = ot->quant.scale;
 
    op->weights_width = wt->shape[1];
@@ -94,13 +104,13 @@ static void lower_sw_op(struct rnpu_model *m, const struct rnpu_tfl_op *top,
    op->input_width = it->shape[1];
    op->input_height = it->shape[2];
    op->input_channels = it->shape[3];
-   op->input_zero_point = (uint8_t)it->quant.zero_point;
+   op->input_zero_point = tfl_zp_u8(it);
    op->input_scale = it->quant.scale;
    op->output_tensor = top->outputs[0];
    op->output_width = ot->shape[1];
    op->output_height = ot->shape[2];
    op->output_channels = ot->shape[3];
-   op->output_zero_point = (uint8_t)ot->quant.zero_point;
+   op->output_zero_point = tfl_zp_u8(ot);
    op->output_scale = ot->quant.scale;
 }
 
@@ -169,7 +179,7 @@ static void lower_sw_op_auto(struct rnpu_model *m, const struct rnpu_tfl_op *top
       op->input_height = 1;
       op->input_channels = it->shape[1];
    }
-   op->input_zero_point = (uint8_t)it->quant.zero_point;
+   op->input_zero_point = tfl_zp_u8(it);
    op->input_scale = it->quant.scale;
 
    op->output_tensor = top->outputs[0];
@@ -182,7 +192,7 @@ static void lower_sw_op_auto(struct rnpu_model *m, const struct rnpu_tfl_op *top
       op->output_height = 1;
       op->output_channels = ot->shape[1];
    }
-   op->output_zero_point = (uint8_t)ot->quant.zero_point;
+   op->output_zero_point = tfl_zp_u8(ot);
    op->output_scale = ot->quant.scale;
 }
 

@@ -151,9 +151,13 @@ static int32_t calc_bias_correction(const struct rnpu_tfl_model *tfl,
    const struct rnpu_tfl_tensor *wt = &tfl->tensors[wt_idx];
    const struct rnpu_tfl_buffer *buf = &tfl->buffers[wt->buffer_index];
    unsigned ic = tfl->tensors[op->inputs[0]].shape[3];
-   int izp = (uint8_t)tfl->tensors[op->inputs[0]].quant.zero_point;
+   const struct rnpu_tfl_tensor *it = &tfl->tensors[op->inputs[0]];
+   /* Input/output zero points: int8 tensors need +128 for uint8 NPU domain */
+   int izp = (it->type == 9) ? (uint8_t)(it->quant.zero_point + 128)
+                              : (uint8_t)it->quant.zero_point;
    unsigned ww = wt->shape[1];
    unsigned wh = wt->shape[2];
+   /* Weight zero point stays in raw domain (used for weight arithmetic) */
    int wzp = (uint8_t)wt->quant.zero_point;
    bool dw = is_depthwise(tfl, op);
    const uint8_t *w = buf->data;
