@@ -318,15 +318,10 @@ static unsigned fill_standard_regcmd(const struct rnpu_model *model,
       EMIT(REG_DPU_RDMA_RDMA_EW_SURF_NOTCH, 0);
    }
 
-   /* Chain pointer: tasks 0..N-2 get patched to point to next task.
-    * The LAST task (or single-task ops) gets a null entry (no chain).
-    * IMPORTANT: emit PC_BASE_ADDRESS(0) only for non-last tasks.
-    * A null BASE_ADDRESS of 0x0 would chain to IOVA 0 (valid in our
-    * address space), causing the PC to read garbage → NPU timeout. */
-   if (task_num < num_tasks - 1)
-      EMIT(REG_PC_BASE_ADDRESS, 0);  /* patched later with next task addr */
-   else
-      *dst++ = 0x0;  /* null = no chain */
+   /* Chain pointer: always emit a proper PC_BASE_ADDRESS(0) so cross-op
+    * chain patching (patch_chain) can OR in the next task's address.
+    * PC_REGISTER_AMOUNTS(0) ensures the PC won't follow a null chain. */
+   EMIT(REG_PC_BASE_ADDRESS, 0);
    EMIT(REG_PC_REGISTER_AMOUNTS, 0);
    *dst++ = 0x0041000000000000ULL;
    emit_raw(&dst, 0x81, REG_PC_OPERATION_ENABLE,
@@ -491,10 +486,7 @@ static unsigned fill_per_channel_regcmd(const struct rnpu_model *model,
    EMIT(REG_DPU_RDMA_RDMA_WEIGHT, 0);
    EMIT(REG_DPU_RDMA_RDMA_EW_SURF_NOTCH, 0);
 
-   if (task_num < num_tasks - 1)
-      EMIT(REG_PC_BASE_ADDRESS, 0);
-   else
-      *dst++ = 0x0;
+   EMIT(REG_PC_BASE_ADDRESS, 0);
    EMIT(REG_PC_REGISTER_AMOUNTS, 0);
    *dst++ = 0x0041000000000000ULL;
    emit_raw(&dst, 0x81, REG_PC_OPERATION_ENABLE,
@@ -869,10 +861,7 @@ static unsigned fill_hybrid_regcmd(const struct rnpu_model *model,
 
    EMIT(REG_DPU_RDMA_RDMA_EW_SURF_NOTCH, 0);
 
-   if (task_num < num_tasks - 1)
-      EMIT(REG_PC_BASE_ADDRESS, 0);
-   else
-      *dst++ = 0x0;
+   EMIT(REG_PC_BASE_ADDRESS, 0);
    EMIT(REG_PC_REGISTER_AMOUNTS, 0);
    *dst++ = 0x0041000000000000ULL;
    emit_raw(&dst, 0x81, REG_PC_OPERATION_ENABLE,
