@@ -897,7 +897,7 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
           top->builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D) {
          const struct rnpu_tfl_tensor *wt = &m->tfl.tensors[top->inputs[1]];
          if (wt->quant.scales && wt->quant.num_scales > 1) {
-            if (rnpu_active_driver == RNPU_DRIVER_RKNPU) {
+            if (rnpu_active_driver == RNPU_DRIVER_RKNPU && !getenv("RNPU_NO_BRDMA")) {
                /* RKNPU: full-conv per-channel via requant groups, one op */
                total_ops++;
             } else {
@@ -926,7 +926,7 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
       case TFLITE_OP_DEPTHWISE_CONV_2D: {
          const struct rnpu_tfl_tensor *wt = &m->tfl.tensors[top->inputs[1]];
          if (wt->quant.scales && wt->quant.num_scales > 1) {
-            if (rnpu_active_driver == RNPU_DRIVER_RKNPU) {
+            if (rnpu_active_driver == RNPU_DRIVER_RKNPU && !getenv("RNPU_NO_BRDMA")) {
                /* Check if scales are all identical (effectively per-tensor) */
                float min_s = wt->quant.scales[0], max_s = wt->quant.scales[0];
                for (unsigned j = 1; j < wt->quant.num_scales; j++) {

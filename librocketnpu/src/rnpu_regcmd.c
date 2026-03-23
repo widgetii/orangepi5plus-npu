@@ -1067,7 +1067,7 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
                                DPU_BS_OW_CFG_SIZE_E_1(1) |
                                DPU_BS_OW_CFG_SIZE_E_0(1));
    }
-   EMIT(REG_DPU_BS_OW_OP, 0);
+   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_0, DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_1, DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
                               DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
