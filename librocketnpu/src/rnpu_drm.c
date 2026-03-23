@@ -311,9 +311,8 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
       return ret;
    }
 
-   /* RKNPU path: submit each job separately in blocking mode.
-    * Each job maps to one rknpu_task — the first task in the job triggers
-    * the operation, and hardware follows chain pointers for split tasks. */
+   /* RKNPU path: submit each job in blocking mode.
+    * Uses a cached task BO to avoid per-job alloc/free overhead. */
 
    /* Ensure NPU is powered on (runtime PM) */
    static int npu_powered = 0;
@@ -323,30 +322,43 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
       npu_powered = 1;
    }
 
-   /* The RKNPU driver initializes per-core CNA and core-control registers
-    * before each submit (rknpu_job_commit_pc lines 305-311). We can't write
-    * MMIO from userspace, so these writes happen inside the kernel's submit
-    * handler. However, we need to match the driver's expected task layout. */
+   /* Cached task BO — grows as needed, never shrinks */
+   static struct {
+      uint32_t handle;
+      uint64_t obj_addr;
+      void *map;
+      uint32_t size;
+      int fd;
+   } task_bo_cache = {0};
 
-   for (uint32_t j = 0; j < job_count; j++) {
-      struct drm_rocket_job *job = &jobs[j];
-      struct drm_rocket_task *first_task =
-         (struct drm_rocket_task *)(uintptr_t)job->tasks;
+   /* Find max tasks across all jobs to size the cached BO */
+   uint32_t max_tasks = 0;
+   for (uint32_t j = 0; j < job_count; j++)
+      if (jobs[j].task_count > max_tasks)
+         max_tasks = jobs[j].task_count;
 
-      /* Allocate task BO with KERNEL_MAPPING — the driver reads the
-       * rknpu_task descriptor from kernel space during job scheduling. */
-      uint32_t ntasks = job->task_count;
-      uint32_t task_bo_size = ((ntasks * sizeof(struct rknpu_task)) + 4095) & ~4095u;
-      if (task_bo_size < 4096) task_bo_size = 4096;
+   uint32_t needed_size = ((max_tasks * sizeof(struct rknpu_task)) + 4095) & ~4095u;
+   if (needed_size < 4096) needed_size = 4096;
 
+   /* Grow cached BO if needed or if fd changed */
+   if (task_bo_cache.size < needed_size || task_bo_cache.fd != fd) {
+      if (task_bo_cache.map) {
+         munmap(task_bo_cache.map, task_bo_cache.size);
+         struct rknpu_mem_destroy tmd = {
+            .handle = task_bo_cache.handle,
+            .obj_addr = task_bo_cache.obj_addr
+         };
+         ioctl(task_bo_cache.fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &tmd);
+         memset(&task_bo_cache, 0, sizeof(task_bo_cache));
+      }
       struct rknpu_mem_create tmc = {
-         .size = task_bo_size,
+         .size = needed_size,
          .flags = RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_CACHEABLE
                   | RKNPU_MEM_KERNEL_MAPPING | RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT,
          .iommu_domain_id = 0,
       };
       if (ioctl(fd, DRM_IOCTL_RKNPU_MEM_CREATE, &tmc)) {
-         fprintf(stderr, "rnpu: RKNPU task BO alloc failed\n");
+         fprintf(stderr, "rnpu: RKNPU task BO alloc failed (size=%u)\n", needed_size);
          return -1;
       }
       struct rknpu_mem_map tmm = { .handle = tmc.handle };
@@ -355,15 +367,25 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
          ioctl(fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &tmd);
          return -1;
       }
-      void *tmap = mmap(NULL, task_bo_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, tmm.offset);
+      void *tmap = mmap(NULL, needed_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, tmm.offset);
       if (tmap == MAP_FAILED) {
          struct rknpu_mem_destroy tmd = { .handle = tmc.handle, .obj_addr = tmc.obj_addr };
          ioctl(fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &tmd);
          return -1;
       }
+      task_bo_cache.handle = tmc.handle;
+      task_bo_cache.obj_addr = tmc.obj_addr;
+      task_bo_cache.map = tmap;
+      task_bo_cache.size = needed_size;
+      task_bo_cache.fd = fd;
+   }
 
-      struct rknpu_task *task = (struct rknpu_task *)tmap;
-      /* Fill task array for ALL tasks in this job */
+   for (uint32_t j = 0; j < job_count; j++) {
+      struct drm_rocket_job *job = &jobs[j];
+      uint32_t ntasks = job->task_count;
+
+      /* Fill task descriptors into cached BO */
+      struct rknpu_task *task = (struct rknpu_task *)task_bo_cache.map;
       for (uint32_t t = 0; t < ntasks; t++) {
          struct drm_rocket_task *rt =
             &((struct drm_rocket_task *)(uintptr_t)job->tasks)[t];
@@ -381,21 +403,16 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
          .flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG,
          .timeout = 6000,
          .task_number = ntasks,
-         .task_obj_addr = tmc.obj_addr,
+         .task_obj_addr = task_bo_cache.obj_addr,
          .core_mask = 0x0,
          .fence_fd = -1,
          .subcore_task = { {0, ntasks}, {0, ntasks}, {0, ntasks}, {0, ntasks}, {0, ntasks} },
       };
 
       int ret = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &submit);
-
-      munmap(tmap, task_bo_size);
-      struct rknpu_mem_destroy tmd = { .handle = tmc.handle, .obj_addr = tmc.obj_addr };
-      ioctl(fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &tmd);
-
       if (ret) {
-         fprintf(stderr, "rnpu: RKNPU SUBMIT failed: %s (job %u/%u)\n",
-                 strerror(errno), j, job_count);
+         fprintf(stderr, "rnpu: RKNPU SUBMIT failed: %s (job %u/%u, tasks=%u)\n",
+                 strerror(errno), j, job_count, ntasks);
          return ret;
       }
    }

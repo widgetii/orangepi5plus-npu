@@ -473,6 +473,32 @@ static void compile_weights_and_biases(struct rnpu_model *m)
    if (m->bias_bo.handle) rnpu_bo_fini(m->fd, &m->bias_bo);
 }
 
+/* Patch a chain pointer from task src to task dst */
+static void patch_chain(struct rnpu_model *m,
+                        struct rnpu_operation *src_op, unsigned src_task_idx,
+                        struct rnpu_operation *dst_op, unsigned dst_task_idx)
+{
+   struct rnpu_split_task *src = &src_op->tasks[src_task_idx];
+   struct rnpu_split_task *dst = &dst_op->tasks[dst_task_idx];
+
+   uint8_t *base = (uint8_t *)m->regcmd_bo.map + src_op->regcmd_offset;
+   uint32_t rc_off = 0;
+   for (unsigned t = 0; t < src_task_idx; t++)
+      rc_off += ALIGN_UP(src_op->tasks[t].regcfg_amount * sizeof(uint64_t), 64);
+
+   uint64_t *regs = (uint64_t *)(base + rc_off);
+   unsigned count = src->regcfg_amount;
+
+   uint64_t *chain_addr = &regs[count - 4];
+   uint64_t *chain_count = &regs[count - 3];
+
+   *chain_addr |= (uint64_t)dst->regcfg_addr << 16;
+
+   unsigned regs_to_fetch = dst->regcfg_amount - 4;
+   regs_to_fetch = ALIGN_UP(regs_to_fetch / 2, 2);
+   *chain_count |= (uint64_t)regs_to_fetch << 16;
+}
+
 static void compile_regcmds(struct rnpu_model *m)
 {
    /* First pass: split tasks and estimate regcmd sizes */
@@ -508,35 +534,52 @@ static void compile_regcmds(struct rnpu_model *m)
          task->regcfg_amount = count;
          task->regcfg_addr = (uint32_t)(m->regcmd_bo.dma_addr +
                                         op->regcmd_offset + rc_offset);
-         /* Chain pointers patched in second pass below */
 
          rc_offset += ALIGN_UP(size_bytes, 64);
       }
 
-      /* Patch chain pointers between tasks */
-      rc_offset = 0;
-      for (unsigned t = 0; t < op->task_count - 1; t++) {
-         struct rnpu_split_task *task = &op->tasks[t];
-         struct rnpu_split_task *next = &op->tasks[t + 1];
-         uint64_t *regs = (uint64_t *)(base + rc_offset);
-         unsigned count = task->regcfg_amount;
+      /* Patch chain pointers between tasks within this op */
+      for (unsigned t = 0; t < op->task_count - 1; t++)
+         patch_chain(m, op, t, op, t + 1);
+   }
 
-         uint64_t *chain_addr = &regs[count - 4];
-         uint64_t *chain_count = &regs[count - 3];
-
-         *chain_addr |= (uint64_t)next->regcfg_addr << 16;
-
-         unsigned regs_to_fetch = next->regcfg_amount - 4;
-         regs_to_fetch = ALIGN_UP(regs_to_fetch / 2, 2);
-         *chain_count |= (uint64_t)regs_to_fetch << 16;
-
-         rc_offset += ALIGN_UP(count * sizeof(uint64_t), 64);
+   /* Third pass: patch cross-operation chain pointers for RKNPU batching.
+    * For consecutive per-channel ops (GS=1, same output_tensor), chain the
+    * last task of op[N] to the first task of op[N+1]. This enables the
+    * RKNPU driver to execute all tasks in one submit with PC task chaining. */
+   if (rnpu_active_driver == RNPU_DRIVER_RKNPU) {
+      for (unsigned i = 0; i + 1 < m->op_count; i++) {
+         struct rnpu_operation *op = &m->ops[i];
+         struct rnpu_operation *next = &m->ops[i + 1];
+         if (op->type != RNPU_OP_CONV || next->type != RNPU_OP_CONV)
+            continue;
+         if (op->output_tensor_channels == 0 || next->output_tensor_channels == 0)
+            continue;
+         if (op->output_tensor != next->output_tensor)
+            continue;
+         /* Chain last task of op → first task of next */
+         patch_chain(m, op, op->task_count - 1, next, 0);
       }
    }
 
-
-
    rnpu_bo_fini(m->fd, &m->regcmd_bo);
+}
+
+/* Check if ops i and i+1 can be merged into one multi-task RKNPU job.
+ * Only merge consecutive per-channel GS=1 ops that share the same output tensor. */
+static bool can_merge_rknpu(struct rnpu_model *m, unsigned i)
+{
+   if (rnpu_active_driver != RNPU_DRIVER_RKNPU)
+      return false;
+   if (i + 1 >= m->op_count)
+      return false;
+   struct rnpu_operation *a = &m->ops[i];
+   struct rnpu_operation *b = &m->ops[i + 1];
+   if (a->type != RNPU_OP_CONV || b->type != RNPU_OP_CONV)
+      return false;
+   if (a->output_tensor_channels == 0 || b->output_tensor_channels == 0)
+      return false;
+   return a->output_tensor == b->output_tensor;
 }
 
 static void build_execution_plan(struct rnpu_model *m)
@@ -553,33 +596,46 @@ static void build_execution_plan(struct rnpu_model *m)
    m->segments = calloc(ns, sizeof(struct rnpu_exec_segment));
    m->segment_count = ns;
 
-   /* Count HW resources */
-   unsigned total_hw_ops = 0, total_tasks = 0;
+   /* Count HW resources — for RKNPU, merge per-channel groups into one job */
+   unsigned total_jobs = 0, total_tasks = 0;
    for (unsigned i = 0; i < m->op_count; i++) {
       if (m->ops[i].type == RNPU_OP_CONV) {
-         total_hw_ops++;
          total_tasks += m->ops[i].task_count;
+         total_jobs++;
+         /* Skip merged ops — they share the same job */
+         while (can_merge_rknpu(m, i))
+            { total_tasks += m->ops[i + 1].task_count; i++; }
       }
    }
 
-   /* One job per CONV operation */
-   if (total_hw_ops > 0) {
-      m->jobs = calloc(total_hw_ops, sizeof(struct drm_rocket_job));
+   if (total_jobs > 0) {
+      m->jobs = calloc(total_jobs, sizeof(struct drm_rocket_job));
       m->hw_tasks = calloc(total_tasks, sizeof(struct drm_rocket_task));
-      m->in_handles = calloc(total_hw_ops * 3, sizeof(uint32_t));
-      m->out_handles = calloc(total_hw_ops, sizeof(uint32_t));
+      m->in_handles = calloc(total_jobs * 3, sizeof(uint32_t));
+      m->out_handles = calloc(total_jobs, sizeof(uint32_t));
    }
 
    unsigned ji = 0, ti = 0;
    for (unsigned i = 0; i < m->op_count; i++) {
       if (m->ops[i].type != RNPU_OP_CONV) continue;
-      struct rnpu_operation *op = &m->ops[i];
+
       unsigned first_task = ti;
-      for (unsigned t = 0; t < op->task_count; t++) {
-         m->hw_tasks[ti].regcmd = op->tasks[t].regcfg_addr;
-         m->hw_tasks[ti].regcmd_count = op->tasks[t].regcfg_amount;
-         ti++;
-      }
+      unsigned merged_task_count = 0;
+
+      /* Collect tasks from this op and any mergeable successors */
+      unsigned j = i;
+      do {
+         struct rnpu_operation *op = &m->ops[j];
+         for (unsigned t = 0; t < op->task_count; t++) {
+            m->hw_tasks[ti].regcmd = op->tasks[t].regcfg_addr;
+            m->hw_tasks[ti].regcmd_count = op->tasks[t].regcfg_amount;
+            ti++;
+            merged_task_count++;
+         }
+         if (!can_merge_rknpu(m, j)) break;
+         j++;
+      } while (1);
+
       unsigned hi = ji * 3;
       m->in_handles[hi] = m->weight_bo.handle;
       m->in_handles[hi + 1] = m->regcmd_bo.handle;
@@ -588,16 +644,18 @@ static void build_execution_plan(struct rnpu_model *m)
       struct drm_rocket_job *job = &m->jobs[ji];
       job->task_struct_size = sizeof(struct drm_rocket_task);
       job->tasks = (uint64_t)(uintptr_t)&m->hw_tasks[first_task];
-      job->task_count = op->task_count;
+      job->task_count = merged_task_count;
       job->in_bo_handles = (uint64_t)(uintptr_t)&m->in_handles[hi];
       job->in_bo_handle_count = 3;
       job->out_bo_handles = (uint64_t)(uintptr_t)&m->out_handles[ji];
       job->out_bo_handle_count = 1;
       ji++;
-   }
-   m->job_count = total_hw_ops;
 
-   /* Build segments */
+      i = j; /* skip merged ops */
+   }
+   m->job_count = ji;
+
+   /* Build segments — count merged jobs per segment */
    unsigned si = 0;
    for (unsigned i = 0; i < m->op_count;) {
       if (m->ops[i].type == RNPU_OP_CONV) {
@@ -605,11 +663,15 @@ static void build_execution_plan(struct rnpu_model *m)
          seg->is_hw = true;
          seg->first_op = i;
          seg->op_count = 0;
+         unsigned seg_jobs = 0;
          while (i < m->op_count && m->ops[i].type == RNPU_OP_CONV) {
+            /* This op starts a new job unless it was merged with previous */
+            if (seg->op_count == 0 || !can_merge_rknpu(m, i - 1))
+               seg_jobs++;
             seg->op_count++;
             i++;
          }
-         seg->job_count = seg->op_count;
+         seg->job_count = seg_jobs;
       } else {
          struct rnpu_exec_segment *seg = &m->segments[si++];
          seg->is_hw = false;
@@ -621,7 +683,10 @@ static void build_execution_plan(struct rnpu_model *m)
    }
 
    /* Detect sw_only */
-   m->sw_only = (total_hw_ops == 0);
+   m->sw_only = (total_jobs == 0);
+
+   fprintf(stderr, "rnpu: execution plan — %u jobs (%u tasks merged from %u ops)\n",
+           ji, total_tasks, m->op_count);
 }
 
 /* ---- Public API implementation ---- */
