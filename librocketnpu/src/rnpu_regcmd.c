@@ -7,6 +7,21 @@
 #include <stdio.h>
 #include "rnpu_regcmd.h"
 #include "rnpu_registers.h"
+#include "rnpu_drm.h"
+
+/* NVDLA-style round-half-away-from-zero for positive, round-toward-zero
+ * for negative exact halves.  Matches QEMU rockchip-npu.c:277. */
+static inline int64_t nvdla_shift_right_round64(int64_t value, unsigned shift)
+{
+   if (shift == 0)
+      return value;
+   int64_t sign = (value < 0) ? 1 : 0;
+   uint64_t guide = (value >> (shift - 1)) & 1;
+   uint64_t sticky = (shift > 1)
+       ? ((value & ((1ULL << (shift - 1)) - 1)) != 0) : 0;
+   int64_t round_up = guide & ((!sign) | sticky);
+   return (value >> shift) + round_up;
+}
 
 static void emit_raw(uint64_t **p, uint32_t target, uint32_t reg, uint32_t value)
 {
@@ -337,8 +352,11 @@ static unsigned fill_per_channel_regcmd(const struct rnpu_model *model,
    uint64_t *dst = out;
    const struct rnpu_split_task *task = &op->tasks[task_num];
    unsigned num_tasks = op->task_count;
+   unsigned ozp = task->output_zero_point;
+   unsigned wzp = task->weights_zero_point;
    uint64_t act_base = model->activation_bo.dma_addr;
    uint64_t wt_base = model->weight_bo.dma_addr;
+   uint64_t bias_base = model->bias_bo.dma_addr;
 
    uint32_t con0 = CNA_CBUF_CON0_WEIGHT_BANK(task->weights_banks) |
                    CNA_CBUF_CON0_DATA_BANK(task->input_banks);
@@ -444,13 +462,17 @@ static unsigned fill_per_channel_regcmd(const struct rnpu_model *model,
    EMIT(REG_DPU_EW_CVT_SCALE_VALUE, DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE(1));
    EMIT(REG_DPU_EW_RELUX_CMP_VALUE, 0);
 
-   unsigned ofs = task->output_zero_point - 0x80;
-   EMIT(REG_DPU_OUT_CVT_OFFSET, ofs);
    float cs = (task->input_scale * task->weights_scale) / task->output_scale;
    uint32_t sb = fui(cs);
    unsigned shift = 127 + 31 - 32 - (sb >> 23) + 16;
    unsigned scale = ((sb >> 9) & 0x7fff) + 1;
    if (scale < 1 << 14) scale |= 1 << 14;
+
+   /* BS bypassed — fold bias into OUT_CVT_OFFSET (inexact due to ReLU ordering) */
+   int32_t base_ofs = (int32_t)(ozp - 0x80);
+   int64_t bias_x_scale = (int64_t)op->per_channel_bias * (int64_t)scale;
+   int32_t bias_out = (int32_t)nvdla_shift_right_round64(bias_x_scale, shift - 1);
+   EMIT(REG_DPU_OUT_CVT_OFFSET, (uint32_t)(base_ofs + bias_out));
    EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(scale));
    EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(shift - 1));
 
@@ -786,7 +808,7 @@ static unsigned fill_hybrid_regcmd(const struct rnpu_model *model,
    int32_t final_offset = (int32_t)offset;
    if ((mask & (1u << 2)) && op->per_channel_bias != 0) {
       int64_t bias_scaled = (int64_t)op->per_channel_bias * (int64_t)scale;
-      int32_t bias_contribution = (int32_t)(bias_scaled >> (shift - 1));
+      int32_t bias_contribution = (int32_t)nvdla_shift_right_round64(bias_scaled, shift - 1);
       final_offset += bias_contribution;
    }
    EMIT(REG_DPU_OUT_CVT_OFFSET, (uint32_t)final_offset);
@@ -879,6 +901,12 @@ unsigned rnpu_fill_regcmd(const struct rnpu_model *model,
                           uint64_t *dst, unsigned max_regs,
                           unsigned task_num)
 {
+   /* For RKNPU per-channel ops (GS=1), use per-channel regcmd with
+    * BN-stage bias addition. Standard regcmd doesn't work for GS=1 on RKNPU. */
+   if (rnpu_active_driver == RNPU_DRIVER_RKNPU &&
+       op->output_channels == 1 && op->output_tensor_channels > 0)
+      return fill_per_channel_regcmd(model, op, dst, task_num);
+
    if (rnpu_hybrid_mask == UINT32_MAX)
       return fill_standard_regcmd(model, op, dst, task_num);
 

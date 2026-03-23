@@ -86,16 +86,30 @@ int main(int argc, char **argv)
    inputs[0].size = input_size;
    inputs[0].pass_through = 0;
 
+   /* Query all output attrs */
+   rknn_tensor_attr out_attrs[16];
+   for (unsigned i = 0; i < io_num.n_output && i < 16; i++) {
+      memset(&out_attrs[i], 0, sizeof(out_attrs[i]));
+      out_attrs[i].index = i;
+      rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &out_attrs[i], sizeof(out_attrs[i]));
+      printf("Output %u: %ux%ux%ux%u, type=%s\n", i,
+             out_attrs[i].dims[0], out_attrs[i].dims[1],
+             out_attrs[i].dims[2], out_attrs[i].dims[3],
+             get_type_string(out_attrs[i].type));
+   }
+
    /* Warmup */
    printf("Warmup...\n");
    rknn_inputs_set(ctx, 1, inputs);
    rknn_run(ctx, NULL);
-   rknn_output outputs[1];
+   rknn_output outputs[16];
    memset(outputs, 0, sizeof(outputs));
-   outputs[0].index = 0;
-   outputs[0].want_float = 0;
-   rknn_outputs_get(ctx, 1, outputs, NULL);
-   rknn_outputs_release(ctx, 1, outputs);
+   for (unsigned i = 0; i < io_num.n_output && i < 16; i++) {
+      outputs[i].index = i;
+      outputs[i].want_float = 0;
+   }
+   rknn_outputs_get(ctx, io_num.n_output, outputs, NULL);
+   rknn_outputs_release(ctx, io_num.n_output, outputs);
 
    /* Benchmark */
    printf("Running %d iterations...\n", num_runs);
@@ -108,11 +122,27 @@ int main(int argc, char **argv)
       double dt = now_ms() - start;
 
       memset(outputs, 0, sizeof(outputs));
-      outputs[0].index = 0;
-      outputs[0].want_float = 0;
-      rknn_outputs_get(ctx, 1, outputs, NULL);
-      rknn_outputs_release(ctx, 1, outputs);
+      for (unsigned j = 0; j < io_num.n_output && j < 16; j++) {
+         outputs[j].index = j;
+         outputs[j].want_float = 0;
+      }
+      rknn_outputs_get(ctx, io_num.n_output, outputs, NULL);
 
+      /* Save golden output on last iteration */
+      if (i == num_runs - 1) {
+         for (unsigned j = 0; j < io_num.n_output && j < 16; j++) {
+            char fname[64];
+            snprintf(fname, sizeof(fname), "rknn_golden_%u.bin", j);
+            FILE *gf = fopen(fname, "wb");
+            if (gf) {
+               fwrite(outputs[j].buf, 1, outputs[j].size, gf);
+               fclose(gf);
+               printf("Saved %s (%u bytes)\n", fname, outputs[j].size);
+            }
+         }
+      }
+
+      rknn_outputs_release(ctx, io_num.n_output, outputs);
       total += dt;
       if (dt < min_ms) min_ms = dt;
    }
