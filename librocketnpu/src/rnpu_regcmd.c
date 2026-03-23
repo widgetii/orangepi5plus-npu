@@ -1097,7 +1097,7 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
    }
 
    /* OUT_CVT: uniform scale from max_conv_scale */
-   unsigned offset = ozp - 0x80;
+   int offset = (int)ozp - 0x80;
    float conv_scale = (task->input_scale * task->weights_scale) / task->output_scale;
    uint32_t scale_bits = fui(conv_scale);
    unsigned shift = 127 + 31 - 32 - (scale_bits >> 23) + 16;
@@ -1105,7 +1105,7 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
    unsigned scale = ((scale_bits >> 9) & 0x7fff) + 1;
    if (scale < 1 << 14) scale |= 1 << 14;
 
-   EMIT(REG_DPU_OUT_CVT_OFFSET, offset);
+   EMIT(REG_DPU_OUT_CVT_OFFSET, (uint32_t)offset);
    EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(scale));
    EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(shift - 1));
 

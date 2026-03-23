@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdio.h>
 #include <math.h>
 #include "rnpu_coefs.h"
 
@@ -157,19 +158,25 @@ static int32_t calc_bias_correction(const struct rnpu_tfl_model *tfl,
    bool dw = is_depthwise(tfl, op);
    const uint8_t *w = buf->data;
 
+   /* Compute bias correction: compensates for (izp - 0x80) offset in CNA input.
+    * The weight difference (w_q - wzp) must be computed in the TFLite quantized
+    * domain, not in NPU offset-binary domain. For uint8 weights (wzp=128):
+    * w_q - wzp = w_byte - 128. For int8 weights (wzp=0): w_q - wzp = (int8_t)w_byte. */
    int32_t corr = 0;
    if (dw) {
       for (unsigned x = 0; x < ww; x++)
          for (unsigned y = 0; y < wh; y++) {
             unsigned flat = x * wh * ic + y * ic + oc;
-            corr += (w[flat] - wzp) * (izp - 0x80);
+            int32_t wd = (int32_t)(int8_t)w[flat] - (int32_t)(int8_t)wzp;
+            corr += wd * (izp - 0x80);
          }
    } else {
       for (unsigned x = 0; x < ww; x++)
          for (unsigned y = 0; y < wh; y++)
             for (unsigned i = 0; i < ic; i++) {
                unsigned flat = oc * ww * wh * ic + x * wh * ic + y * ic + i;
-               corr += (w[flat] - wzp) * (izp - 0x80);
+               int32_t wd = (int32_t)(int8_t)w[flat] - (int32_t)(int8_t)wzp;
+               corr += wd * (izp - 0x80);
             }
    }
    return corr;
@@ -330,6 +337,9 @@ float rnpu_fill_brdma_data(const struct rnpu_tfl_model *tfl,
    }
 
    if (out_mul_shift) *out_mul_shift = mul_shift;
+
+   /* Debug: print first op's BRDMA parameters */
+
    return max_conv_scale;
 }
 
