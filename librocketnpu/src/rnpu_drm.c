@@ -335,8 +335,12 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
 
       /* Allocate task BO with KERNEL_MAPPING — the driver reads the
        * rknpu_task descriptor from kernel space during job scheduling. */
+      uint32_t ntasks = job->task_count;
+      uint32_t task_bo_size = ((ntasks * sizeof(struct rknpu_task)) + 4095) & ~4095u;
+      if (task_bo_size < 4096) task_bo_size = 4096;
+
       struct rknpu_mem_create tmc = {
-         .size = 4096,
+         .size = task_bo_size,
          .flags = RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_CACHEABLE
                   | RKNPU_MEM_KERNEL_MAPPING | RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT,
          .iommu_domain_id = 0,
@@ -351,17 +355,16 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
          ioctl(fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &tmd);
          return -1;
       }
-      void *tmap = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, tmm.offset);
+      void *tmap = mmap(NULL, task_bo_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, tmm.offset);
       if (tmap == MAP_FAILED) {
          struct rknpu_mem_destroy tmd = { .handle = tmc.handle, .obj_addr = tmc.obj_addr };
          ioctl(fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &tmd);
          return -1;
       }
 
-      uint32_t ntasks = job->task_count;
       struct rknpu_task *task = (struct rknpu_task *)tmap;
-      /* Fill task array for ALL tasks in this operation */
-      for (uint32_t t = 0; t < ntasks && t < 100; t++) {
+      /* Fill task array for ALL tasks in this job */
+      for (uint32_t t = 0; t < ntasks; t++) {
          struct drm_rocket_task *rt =
             &((struct drm_rocket_task *)(uintptr_t)job->tasks)[t];
          struct rknpu_task *tp = &task[t];
@@ -386,7 +389,7 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
 
       int ret = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &submit);
 
-      munmap(tmap, 4096);
+      munmap(tmap, task_bo_size);
       struct rknpu_mem_destroy tmd = { .handle = tmc.handle, .obj_addr = tmc.obj_addr };
       ioctl(fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &tmd);
 

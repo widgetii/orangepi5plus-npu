@@ -60,7 +60,7 @@ struct drm_rocket_submit {
 #define ATOMIC_K_SIZE         16
 #endif
 
-#define PER_AXIS_GROUP_SIZE   16
+#define PER_AXIS_GROUP_SIZE   1
 
 #ifndef ALIGN_UP
 #define ALIGN_UP(x, a)  (((x) + (a) - 1) & ~((a) - 1))
@@ -282,6 +282,7 @@ struct rnpu_exec_segment {
    bool is_hw;
    unsigned first_op;
    unsigned op_count;
+   unsigned job_count;  /* number of merged jobs in this HW segment */
 };
 
 struct rnpu_model {

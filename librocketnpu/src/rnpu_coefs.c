@@ -23,8 +23,10 @@ unsigned rnpu_calc_weight_size(unsigned ww, unsigned wh,
                                bool depthwise)
 {
    ic = MAX2(ic, FEATURE_ATOMIC_SIZE);
-   oc = ALIGN_UP(oc, 2);
-   if (depthwise) oc = 1;
+   if (depthwise)
+      oc = 1;
+   else
+      oc = ALIGN_UP(MAX2(oc, WEIGHT_ATOMIC_SIZE), 2);
    return ww * wh * oc * ALIGN_UP(ic, WEIGHT_ATOMIC_SIZE) * 2;
 }
 
@@ -104,7 +106,7 @@ unsigned rnpu_fill_weights_group(const struct rnpu_tfl_model *tfl,
    unsigned ic = MAX2(ic_real, FEATURE_ATOMIC_SIZE);
    uint8_t zp = (uint8_t)wt->quant.zero_point;
 
-   unsigned oc_pad = ALIGN_UP(MAX2(group_count, 2), 2);
+   unsigned oc_pad = ALIGN_UP(MAX2(group_count, WEIGHT_ATOMIC_SIZE), 2);
    unsigned ic1 = DIV_ROUND_UP(ic, WEIGHT_ATOMIC_SIZE);
    unsigned ic2 = MIN2(ic, WEIGHT_ATOMIC_SIZE);
 

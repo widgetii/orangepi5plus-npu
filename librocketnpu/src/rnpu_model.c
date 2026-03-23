@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -267,9 +268,8 @@ static unsigned lower_conv_per_group(struct rnpu_model *m,
       qsort_r(sorted, full_oc, sizeof(unsigned), cmp_scale_idx,
               (void *)wt->quant.scales);
 
-   /* Grow ops array */
+   /* ops array is pre-allocated with enough space */
    unsigned base = *op_count;
-   *ops_out = realloc(*ops_out, (base + ng) * sizeof(struct rnpu_operation));
 
    for (unsigned g = 0; g < ng; g++) {
       struct rnpu_operation *op = &(*ops_out)[base + g];
@@ -314,19 +314,88 @@ static unsigned lower_conv_per_group(struct rnpu_model *m,
 
 static void allocate_tensors(struct rnpu_model *m)
 {
-   /* Simple allocation: lay all tensors sequentially in activation_bo.
-    * A proper memory planner would reuse space for non-overlapping lifetimes. */
-   uint32_t offset = 0;
+   /* Compute tensor lifetimes: [first_use, last_use] in op index space.
+    * Tensors with non-overlapping lifetimes can share activation BO space. */
+   unsigned *first_use = calloc(m->tensor_count, sizeof(unsigned));
+   unsigned *last_use = calloc(m->tensor_count, sizeof(unsigned));
    for (unsigned i = 0; i < m->tensor_count; i++) {
-      if (m->tensors[i].size == 0) continue;
-      m->tensors[i].offset = offset;
-      offset += ALIGN_UP(m->tensors[i].size, 64);
+      first_use[i] = UINT32_MAX;
+      last_use[i] = 0;
+   }
+   for (unsigned i = 0; i < m->op_count; i++) {
+      struct rnpu_operation *op = &m->ops[i];
+      unsigned it = op->input_tensor;
+      unsigned ot = op->output_tensor;
+      if (first_use[it] > i) first_use[it] = i;
+      if (last_use[it] < i) last_use[it] = i;
+      if (first_use[ot] > i) first_use[ot] = i;
+      if (last_use[ot] < i) last_use[ot] = i;
+      /* Add tensor (element-wise addition input) */
+      if (op->add_tensor >= 0 && op->add_tensor < (int)m->tensor_count) {
+         unsigned at = op->add_tensor;
+         if (first_use[at] > i) first_use[at] = i;
+         if (last_use[at] < i) last_use[at] = i;
+      }
+      /* Concat additional inputs */
+      if (op->type == RNPU_OP_CONCAT) {
+         for (unsigned j = 0; j < op->sw.concat.input_count; j++) {
+            unsigned ci = op->sw.concat.input_tensors[j];
+            if (first_use[ci] > i) first_use[ci] = i;
+            if (last_use[ci] < i) last_use[ci] = i;
+         }
+      }
    }
 
+   /* Mark graph output tensors as live until the end */
+   for (unsigned i = 0; i < m->tfl.output_count; i++) {
+      unsigned ot = m->tfl.graph_outputs[i];
+      last_use[ot] = m->op_count;
+   }
+   /* Mark graph input as live from the start */
+   unsigned git = m->tfl.graph_inputs[0];
+   first_use[git] = 0;
+
+   /* Greedy offset assignment: for each tensor (in first_use order),
+    * find the lowest offset where it doesn't overlap any live tensor. */
+   unsigned *order = malloc(m->tensor_count * sizeof(unsigned));
+   unsigned active_count = 0;
+   for (unsigned i = 0; i < m->tensor_count; i++) {
+      if (m->tensors[i].size == 0 || first_use[i] == UINT32_MAX) continue;
+      order[active_count++] = i;
+   }
+   /* Sort by first_use */
+   for (unsigned i = 0; i < active_count; i++)
+      for (unsigned j = i + 1; j < active_count; j++)
+         if (first_use[order[i]] > first_use[order[j]]) {
+            unsigned tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+         }
+
+   uint32_t total = 0;
+   for (unsigned a = 0; a < active_count; a++) {
+      unsigned ti = order[a];
+      uint32_t sz = ALIGN_UP(m->tensors[ti].size, 64);
+
+      /* Find lowest non-overlapping offset */
+      uint32_t best_offset = 0;
+      for (unsigned b = 0; b < a; b++) {
+         unsigned bj = order[b];
+         if (last_use[bj] < first_use[ti] || first_use[bj] > last_use[ti])
+            continue; /* no overlap */
+         uint32_t bend = m->tensors[bj].offset + ALIGN_UP(m->tensors[bj].size, 64);
+         if (bend > best_offset) best_offset = bend;
+      }
+      m->tensors[ti].offset = best_offset;
+      if (best_offset + sz > total) total = best_offset + sz;
+   }
+
+   free(order);
+   free(first_use);
+   free(last_use);
+
    /* Create activation BO */
-   if (offset > 0) {
-      if (rnpu_bo_create(m->fd, offset, &m->activation_bo) < 0) {
-         fprintf(stderr, "rnpu: failed to create activation BO (%u bytes)\n", offset);
+   if (total > 0) {
+      if (rnpu_bo_create(m->fd, total, &m->activation_bo) < 0) {
+         fprintf(stderr, "rnpu: failed to create activation BO (%u bytes)\n", total);
       }
    }
 }
@@ -346,12 +415,10 @@ static void compile_weights_and_biases(struct rnpu_model *m)
       op->weight_size = ws;
       total_weight += ALIGN_UP(ws, 64);
 
-      if (op->output_channels > 1 || op->output_tensor_channels == 0) {
-         unsigned bs = op->output_channels * sizeof(uint32_t);
-         op->bias_offset = total_bias;
-         op->bias_size = bs;
-         total_bias += ALIGN_UP(bs, 64);
-      }
+      unsigned bs = MAX2(op->output_channels, WEIGHT_ATOMIC_SIZE) * sizeof(uint32_t);
+      op->bias_offset = total_bias;
+      op->bias_size = op->output_channels * sizeof(uint32_t);
+      total_bias += ALIGN_UP(bs, 64);
    }
 
    /* Create BOs */
@@ -391,7 +458,7 @@ static void compile_weights_and_biases(struct rnpu_model *m)
 
       if (op->bias_size > 0) {
          uint8_t *bdst = (uint8_t *)m->bias_bo.map + op->bias_offset;
-         if (op->group_channel_indices && op->output_channels > 1) {
+         if (op->group_channel_indices) {
             rnpu_fill_biases_group(&m->tfl, top, op->group_channel_indices,
                                    op->output_channels, &op->truncate_bits,
                                    bdst, op->bias_size);
@@ -469,11 +536,6 @@ static void compile_regcmds(struct rnpu_model *m)
 
 
 
-   /* Note: do NOT chain regcmds across operations. The kernel submits
-    * each task individually to the PC DMA engine. Cross-op chaining
-    * would cause the PC to process all ops from task 0's chain, then
-    * the kernel would re-submit tasks 1-N causing double-processing. */
-
    rnpu_bo_fini(m->fd, &m->regcmd_bo);
 }
 
@@ -500,13 +562,11 @@ static void build_execution_plan(struct rnpu_model *m)
       }
    }
 
-   /* One job per CONV operation (like Mesa). Each job's tasks are the
-    * split tasks within that operation. The DRM scheduler distributes
-    * jobs across NPU cores for parallelism. */
+   /* One job per CONV operation */
    if (total_hw_ops > 0) {
       m->jobs = calloc(total_hw_ops, sizeof(struct drm_rocket_job));
       m->hw_tasks = calloc(total_tasks, sizeof(struct drm_rocket_task));
-      m->in_handles = calloc(total_hw_ops * 3, sizeof(uint32_t)); /* weight + regcmd + bias */
+      m->in_handles = calloc(total_hw_ops * 3, sizeof(uint32_t));
       m->out_handles = calloc(total_hw_ops, sizeof(uint32_t));
    }
 
@@ -520,7 +580,6 @@ static void build_execution_plan(struct rnpu_model *m)
          m->hw_tasks[ti].regcmd_count = op->tasks[t].regcfg_amount;
          ti++;
       }
-      /* Input handles: weight, regcmd, bias (all read by NPU DMA) */
       unsigned hi = ji * 3;
       m->in_handles[hi] = m->weight_bo.handle;
       m->in_handles[hi + 1] = m->regcmd_bo.handle;
@@ -550,11 +609,13 @@ static void build_execution_plan(struct rnpu_model *m)
             seg->op_count++;
             i++;
          }
+         seg->job_count = seg->op_count;
       } else {
          struct rnpu_exec_segment *seg = &m->segments[si++];
          seg->is_hw = false;
          seg->first_op = i;
          seg->op_count = 1;
+         seg->job_count = 0;
          i++;
       }
    }
@@ -670,9 +731,25 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
       m->tensors[i].zero_point = t->quant.zero_point;
    }
 
+   /* Pre-scan to compute total internal ops needed */
+   unsigned total_ops = 0;
+   for (unsigned i = 0; i < m->tfl.op_count; i++) {
+      const struct rnpu_tfl_op *top = &m->tfl.ops[i];
+      if (top->builtin_code == TFLITE_OP_CONV_2D ||
+          top->builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D) {
+         const struct rnpu_tfl_tensor *wt = &m->tfl.tensors[top->inputs[1]];
+         if (wt->quant.scales && wt->quant.num_scales > 1) {
+            const struct rnpu_tfl_tensor *ot = &m->tfl.tensors[top->outputs[0]];
+            total_ops += DIV_ROUND_UP(ot->shape[3], PER_AXIS_GROUP_SIZE);
+            continue;
+         }
+      }
+      total_ops++;
+   }
+
    /* Lower TFLite ops to internal ops */
    m->op_count = 0;
-   m->ops = calloc(m->tfl.op_count * 64, sizeof(struct rnpu_operation)); /* over-allocate for per-group */
+   m->ops = calloc(total_ops, sizeof(struct rnpu_operation));
 
    for (unsigned i = 0; i < m->tfl.op_count; i++) {
       const struct rnpu_tfl_op *top = &m->tfl.ops[i];
@@ -817,10 +894,13 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
    unsigned hw_ops = 0;
    for (unsigned i = 0; i < m->op_count; i++)
       if (m->ops[i].type == RNPU_OP_CONV) hw_ops++;
-   fprintf(stderr, "rnpu: ready — %u HW ops, %u SW ops, %u BOs\n",
-           hw_ops, m->op_count - hw_ops,
+   fprintf(stderr, "rnpu: ready — %u HW ops (%u jobs), %u SW ops, %u BOs "
+           "(W=%uK B=%uK R=%uK A=%uK)\n",
+           hw_ops, m->job_count, m->op_count - hw_ops,
            (m->weight_bo.handle ? 1u : 0u) + (m->bias_bo.handle ? 1u : 0u) +
-           (m->regcmd_bo.handle ? 1u : 0u) + (m->activation_bo.handle ? 1u : 0u));
+           (m->regcmd_bo.handle ? 1u : 0u) + (m->activation_bo.handle ? 1u : 0u),
+           m->weight_bo.size / 1024, m->bias_bo.size / 1024,
+           m->regcmd_bo.size / 1024, m->activation_bo.size / 1024);
 
    return m;
 }
@@ -849,10 +929,10 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
    for (unsigned s = 0; s < m->segment_count; s++) {
       struct rnpu_exec_segment *seg = &m->segments[s];
       if (seg->is_hw) {
-         /* Submit all ops in this segment as one batch (like Mesa) */
-         int ret = rnpu_submit(m->fd, &m->jobs[hw_job_idx], seg->op_count);
+         /* Submit all jobs in this segment */
+         int ret = rnpu_submit(m->fd, &m->jobs[hw_job_idx], seg->job_count);
          if (ret) {
-            fprintf(stderr, "rnpu: segment submit failed (%u jobs)\n", seg->op_count);
+            fprintf(stderr, "rnpu: segment submit failed (%u jobs)\n", seg->job_count);
             return ret;
          }
 
@@ -879,7 +959,7 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
          if (s + 1 < m->segment_count)
             rnpu_bo_fini(m->fd, &m->activation_bo);
 
-         hw_job_idx += seg->op_count;
+         hw_job_idx += seg->job_count;
       } else {
          rnpu_execute_sw_op(m, seg->first_op);
          if (s + 1 < m->segment_count && m->segments[s+1].is_hw)

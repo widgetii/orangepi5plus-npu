@@ -21,7 +21,7 @@ OBJS = $(SRCS:.c=.o)
 
 .PHONY: all clean test
 
-all: librocketnpu.so test_mobilenet test_yolo test_debug test_sw_ops test_rknpu_abi
+all: librocketnpu.so test_mobilenet test_yolo test_debug test_sw_ops test_rknpu_abi test_hybrid_regcmd
 
 librocketnpu.so: $(OBJS)
 	$(CC) -shared -o $@ $^ $(LDFLAGS)
@@ -43,6 +43,12 @@ test_sw_ops: tests/test_sw_ops.c librocketnpu.so
 
 test_rknpu_abi: tests/test_rknpu_abi.c librocketnpu.so
 	$(CC) $(CFLAGS) -o $@ $< -L. -lrocketnpu -Wl,-rpath,'$$ORIGIN' $(LDFLAGS)
+
+test_hybrid_regcmd: tests/test_hybrid_regcmd.c librocketnpu.so
+	$(CC) $(CFLAGS) -o $@ $< -L. -lrocketnpu -Wl,-rpath,'$$ORIGIN' $(LDFLAGS)
+
+capture_rknn_golden: tests/capture_rknn_golden.c
+	$(CC) $(CFLAGS) -o $@ $< -ldl -lm
 
 test: test_sw_ops test_rknpu_abi
 	@LD_LIBRARY_PATH=. ./test_sw_ops

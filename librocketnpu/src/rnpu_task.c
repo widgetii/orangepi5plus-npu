@@ -73,11 +73,7 @@ static void fill_task(struct rnpu_operation *op, struct rnpu_split_task *task)
    task->output_height = op->output_height;
    task->output_channels_real = op->output_channels;
 
-   if (op->output_channels == 1 && op->output_tensor_channels > 0) {
-      task->output_channels = 2;
-   } else {
-      task->output_channels = ALIGN_UP(MAX2(op->output_channels, 32), 32);
-   }
+   task->output_channels = ALIGN_UP(MAX2(op->output_channels, 32), 32);
    if (op->depthwise) {
       if (task->output_channels_real <= 32)
          task->output_channels *= 2;
