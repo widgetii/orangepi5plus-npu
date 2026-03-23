@@ -201,7 +201,7 @@ static unsigned fill_standard_regcmd(const struct rnpu_model *model,
                                DPU_BS_OW_CFG_SIZE_E_1(1) |
                                DPU_BS_OW_CFG_SIZE_E_0(1));
    }
-   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(0x80 - wzp));
+   EMIT(REG_DPU_BS_OW_OP, 0);
    EMIT(REG_DPU_WDMA_SIZE_0, DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_1, DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
                               DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
@@ -758,7 +758,7 @@ static unsigned fill_hybrid_regcmd(const struct rnpu_model *model,
    if (mask & (1u << 5))
       EMIT(REG_DPU_BS_OW_OP, 0);
    else
-      EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(0x80 - wzp));
+      EMIT(REG_DPU_BS_OW_OP, 0);
 
    /* Bit 6: DPU_WDMA_SIZE_0 */
    if (mask & (1u << 6))
@@ -1067,7 +1067,7 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
                                DPU_BS_OW_CFG_SIZE_E_1(1) |
                                DPU_BS_OW_CFG_SIZE_E_0(1));
    }
-   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(0x80 - wzp));
+   EMIT(REG_DPU_BS_OW_OP, 0);
    EMIT(REG_DPU_WDMA_SIZE_0, DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_1, DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
                               DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
@@ -1137,8 +1137,12 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
    /* BRDMA_CFG: DATA_USE=7 → loads bias + MUL data (0x0e = DATA_USE(7) << 1) */
    EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, 0x0e);
 
-   /* BS_BASE_ADDR: points to BRDMA data (combined bias+mul buffer) */
-   EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR, (uint32_t)(brdma_base + op->brdma_offset));
+   /* BS_BASE_ADDR: points to BRDMA data. For requant groups, each task points
+    * to its group's BRDMA buffer via brdma_group_offset. */
+   if (task->brdma_group_offset)
+      EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR, (uint32_t)(brdma_base + task->brdma_group_offset));
+   else
+      EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR, (uint32_t)(brdma_base + op->brdma_offset));
 
    EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, 0);
    EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR, 0);

@@ -20,4 +20,15 @@ void rnpu_compact_unsort_output(struct rnpu_model *m,
                                 unsigned first_group_op,
                                 unsigned num_group_ops);
 
+/* Scatter requant group outputs: pick correctly-scaled channels from each
+ * group's full output copy into the final output tensor. */
+void rnpu_scatter_requant_output(struct rnpu_model *m,
+                                  struct rnpu_operation *op);
+
+/* Apply per-channel MUL quantization correction for BRDMA ops.
+ * Corrects the residual error from int16 MUL rounding: for each channel,
+ * correction = exact_ratio / (round(exact_ratio * 2^shift) / 2^shift). */
+void rnpu_apply_brdma_correction(struct rnpu_model *m,
+                                  struct rnpu_operation *op);
+
 #endif /* RNPU_SW_OPS_H */

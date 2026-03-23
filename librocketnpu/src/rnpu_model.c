@@ -483,10 +483,17 @@ static void compile_brdma_data(struct rnpu_model *m)
    for (unsigned i = 0; i < m->op_count; i++) {
       struct rnpu_operation *op = &m->ops[i];
       if (!op->use_brdma_per_channel) continue;
-      unsigned sz = rnpu_calc_brdma_size(op->output_channels);
+      unsigned per_group_sz = rnpu_calc_brdma_size(op->output_channels);
+      unsigned ng = op->requant_group_count > 1 ? op->requant_group_count : 1;
       op->brdma_offset = total_brdma;
-      op->brdma_size = sz;
-      total_brdma += ALIGN_UP(sz, 64);
+      op->brdma_size = per_group_sz; /* size per group */
+      if (ng > 1) {
+         op->requant_brdma_offsets = malloc(ng * sizeof(uint32_t));
+         op->requant_mul_shifts = malloc(ng * sizeof(unsigned));
+         for (unsigned g = 0; g < ng; g++)
+            op->requant_brdma_offsets[g] = total_brdma + g * ALIGN_UP(per_group_sz, 64);
+      }
+      total_brdma += ng * ALIGN_UP(per_group_sz, 64);
    }
    if (total_brdma == 0) return;
 
@@ -501,7 +508,7 @@ static void compile_brdma_data(struct rnpu_model *m)
       struct rnpu_operation *op = &m->ops[i];
       if (!op->use_brdma_per_channel) continue;
 
-      /* Find TFLite op for this operation (same lookup as compile_weights) */
+      /* Find TFLite op */
       const struct rnpu_tfl_op *top = NULL;
       for (unsigned j = 0; j < m->tfl.op_count; j++) {
          if (m->tfl.ops[j].builtin_code == TFLITE_OP_CONV_2D ||
@@ -515,10 +522,26 @@ static void compile_brdma_data(struct rnpu_model *m)
       }
       if (!top) continue;
 
-      uint8_t *dst = (uint8_t *)m->brdma_bo.map + op->brdma_offset;
-      unsigned ms = 14;
-      rnpu_fill_brdma_data(&m->tfl, top, op, dst, op->brdma_size, &ms);
-      op->brdma_mul_shift = ms;
+      if (op->requant_group_count > 1) {
+         /* Fill per-group BRDMA data */
+         for (unsigned g = 0; g < op->requant_group_count; g++) {
+            uint8_t *dst = (uint8_t *)m->brdma_bo.map + op->requant_brdma_offsets[g];
+            unsigned ms = 14;
+            rnpu_fill_brdma_data_group(&m->tfl, top, op,
+                                        op->group_channel_indices,
+                                        op->requant_group_ch_offset[g],
+                                        op->requant_group_sizes[g],
+                                        op->requant_group_max_ws[g],
+                                        dst, op->brdma_size, &ms);
+            op->requant_mul_shifts[g] = ms;
+         }
+         op->brdma_mul_shift = 14; /* default for regcmd that reads from op */
+      } else {
+         uint8_t *dst = (uint8_t *)m->brdma_bo.map + op->brdma_offset;
+         unsigned ms = 14;
+         rnpu_fill_brdma_data(&m->tfl, top, op, dst, op->brdma_size, &ms);
+         op->brdma_mul_shift = ms;
+      }
    }
 
    /* Flush to device */
@@ -865,7 +888,7 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
          const struct rnpu_tfl_tensor *wt = &m->tfl.tensors[top->inputs[1]];
          if (wt->quant.scales && wt->quant.num_scales > 1) {
             if (rnpu_active_driver == RNPU_DRIVER_RKNPU) {
-               /* RKNPU: full-conv per-channel, one op per CONV */
+               /* RKNPU: full-conv per-channel via requant groups, one op */
                total_ops++;
             } else {
                /* Rocket: GS=1 decomposition */
@@ -894,13 +917,94 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
          const struct rnpu_tfl_tensor *wt = &m->tfl.tensors[top->inputs[1]];
          if (wt->quant.scales && wt->quant.num_scales > 1) {
             if (rnpu_active_driver == RNPU_DRIVER_RKNPU) {
-               /* RKNPU: full-conv, per-channel via BRDMA BS MUL */
+               /* Check if scales are all identical (effectively per-tensor) */
+               float min_s = wt->quant.scales[0], max_s = wt->quant.scales[0];
+               for (unsigned j = 1; j < wt->quant.num_scales; j++) {
+                  if (wt->quant.scales[j] < min_s) min_s = wt->quant.scales[j];
+                  if (wt->quant.scales[j] > max_s) max_s = wt->quant.scales[j];
+               }
+               if (min_s > 0 && max_s / min_s <= 1.001f) {
+                  /* Effectively per-tensor — use standard path */
+                  lower_conv(m, top, op);
+                  m->op_count++;
+                  break;
+               }
+
+               /* RKNPU: full-conv, per-channel via BRDMA BS MUL + requant groups */
                lower_conv(m, top, op);
                op->use_brdma_per_channel = true;
                op->per_channel_scale_count = wt->quant.num_scales;
                op->per_channel_scales = malloc(wt->quant.num_scales * sizeof(float));
                memcpy(op->per_channel_scales, wt->quant.scales,
                       wt->quant.num_scales * sizeof(float));
+
+               /* Compute requant groups: sort channels by conv_scale,
+                * greedily group where max/min ratio <= 2.0 */
+               unsigned oc = wt->quant.num_scales;
+               unsigned *sorted = malloc(oc * sizeof(unsigned));
+               for (unsigned j = 0; j < oc; j++) sorted[j] = j;
+               /* Sort by weight scale ascending */
+               for (unsigned a = 0; a < oc; a++)
+                  for (unsigned b = a + 1; b < oc; b++)
+                     if (wt->quant.scales[sorted[a]] > wt->quant.scales[sorted[b]]) {
+                        unsigned tmp = sorted[a]; sorted[a] = sorted[b]; sorted[b] = tmp;
+                     }
+
+               /* Greedy grouping */
+               unsigned max_groups = oc; /* worst case: every channel is its own group */
+               unsigned *group_starts = malloc(max_groups * sizeof(unsigned));
+               unsigned *group_sizes_tmp = malloc(max_groups * sizeof(unsigned));
+               float *group_max_ws_tmp = malloc(max_groups * sizeof(float));
+               unsigned ng = 0;
+               unsigned gi = 0;
+               while (gi < oc) {
+                  unsigned gs = gi;
+                  float min_s = wt->quant.scales[sorted[gi]];
+                  float max_s = min_s;
+                  unsigned ge = gi + 1;
+                  while (ge < oc) {
+                     float s = wt->quant.scales[sorted[ge]];
+                     float new_max = s > max_s ? s : max_s;
+                     float requant_ratio = getenv("RNPU_REQUANT_RATIO") ?
+                        atof(getenv("RNPU_REQUANT_RATIO")) : 2.0f;
+                     if (min_s > 0 && new_max / min_s > requant_ratio) break;
+                     max_s = new_max;
+                     ge++;
+                  }
+                  group_starts[ng] = gs;
+                  group_sizes_tmp[ng] = ge - gs;
+                  group_max_ws_tmp[ng] = max_s;
+                  ng++;
+                  gi = ge;
+               }
+
+               if (ng > 1) {
+                  op->requant_group_count = ng;
+                  op->requant_group_sizes = malloc(ng * sizeof(unsigned));
+                  op->requant_group_ch_offset = malloc(ng * sizeof(unsigned));
+                  op->requant_group_max_ws = malloc(ng * sizeof(float));
+                  memcpy(op->requant_group_sizes, group_sizes_tmp, ng * sizeof(unsigned));
+                  memcpy(op->requant_group_max_ws, group_max_ws_tmp, ng * sizeof(float));
+                  unsigned ch_off = 0;
+                  for (unsigned g = 0; g < ng; g++) {
+                     op->requant_group_ch_offset[g] = ch_off;
+                     ch_off += group_sizes_tmp[g];
+                  }
+                  /* Store sorted channel indices in group_channel_indices */
+                  op->group_channel_indices = malloc(oc * sizeof(unsigned));
+                  memcpy(op->group_channel_indices, sorted, oc * sizeof(unsigned));
+                  /* weights_scale = global max (used for weight/bias filling) */
+                  op->weights_scale = group_max_ws_tmp[ng - 1];
+
+                  fprintf(stderr, "rnpu: op %u: %u requant groups for %u OC "
+                          "(ratio %.1f)\n", m->op_count, ng, oc,
+                          group_max_ws_tmp[ng-1] / group_max_ws_tmp[0]);
+               }
+               free(group_starts);
+               free(group_sizes_tmp);
+               free(group_max_ws_tmp);
+               free(sorted);
+
                m->op_count++;
             } else {
                /* Rocket: GS=1 per-channel group decomposition */
@@ -985,6 +1089,9 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
       unsigned osz = rnpu_calc_raw_output_size(op->output_width, op->output_height,
                                                op->output_channels,
                                                op->output_tensor_channels);
+      /* Requant groups: each group writes a full copy of the output tensor */
+      if (op->requant_group_count > 1)
+         osz *= op->requant_group_count;
       if (m->tensors[op->output_tensor].size < osz)
          m->tensors[op->output_tensor].size = osz;
 
@@ -1074,6 +1181,9 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
    /* Flush input to NPU */
    rnpu_bo_fini(m->fd, &m->activation_bo);
 
+   /* Debug: per-op output tracing */
+   bool trace_ops = getenv("RNPU_TRACE_OPS") != NULL;
+
    /* Execute segments — one job per CONV operation */
    unsigned hw_job_idx = 0;
    for (unsigned s = 0; s < m->segment_count; s++) {
@@ -1096,6 +1206,18 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
                rnpu_apply_per_axis_correction(m, &m->ops[j]);
          }
 
+         /* Scatter requant group outputs for BRDMA per-channel ops */
+         for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
+            if (m->ops[j].use_brdma_per_channel && m->ops[j].requant_group_count > 1)
+               rnpu_scatter_requant_output(m, &m->ops[j]);
+         }
+
+         /* Apply BRDMA MUL quantization correction after scatter */
+         for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
+            if (m->ops[j].use_brdma_per_channel)
+               rnpu_apply_brdma_correction(m, &m->ops[j]);
+         }
+
          /* Compact/unsort per-group outputs (skip for BRDMA per-channel ops —
           * output is already in correct channel order) */
          for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
@@ -1110,6 +1232,37 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
             rnpu_compact_unsort_output(m, first_g, j - first_g + 1);
          }
 
+         /* Debug: trace per-op output stats */
+         if (trace_ops) {
+            for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
+               struct rnpu_operation *dop = &m->ops[j];
+               unsigned ti = dop->output_tensor;
+               unsigned tw = dop->output_width, th = dop->output_height, tc = dop->output_channels;
+               unsigned sz = tw * th * tc;
+               uint8_t *buf = malloc(sz);
+               rnpu_convert_output(buf, (uint8_t *)m->activation_bo.map + m->tensors[ti].offset,
+                                   tw, th, tc);
+               unsigned hist[256] = {0};
+               for (unsigned k = 0; k < sz; k++) hist[buf[k]]++;
+               unsigned unique = 0;
+               for (unsigned k = 0; k < 256; k++) if (hist[k]) unique++;
+               /* Find min/max/first non-zero sample values */
+               uint8_t vmin = 255, vmax = 0;
+               for (unsigned k = 0; k < sz; k++) {
+                  if (buf[k] < vmin) vmin = buf[k];
+                  if (buf[k] > vmax) vmax = buf[k];
+               }
+               fprintf(stderr, "  op %2u [%s%s] t%u %ux%ux%u: %u unique [%u..%u]",
+                       j, dop->type == RNPU_OP_CONV ? "CONV" : "SW",
+                       dop->use_brdma_per_channel ? "/BRDMA" : "",
+                       ti, tw, th, tc, unique, vmin, vmax);
+               if (dop->requant_group_count > 1)
+                  fprintf(stderr, " (%u rqg)", dop->requant_group_count);
+               fprintf(stderr, "\n");
+               free(buf);
+            }
+         }
+
          /* Flush corrections back if there are more segments */
          if (s + 1 < m->segment_count)
             rnpu_bo_fini(m->fd, &m->activation_bo);
@@ -1117,6 +1270,25 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
          hw_job_idx += seg->job_count;
       } else {
          rnpu_execute_sw_op(m, seg->first_op);
+         if (trace_ops) {
+            struct rnpu_operation *dop = &m->ops[seg->first_op];
+            unsigned ti = dop->output_tensor;
+            unsigned tw = dop->output_width, th = dop->output_height, tc = dop->output_channels;
+            unsigned sz = tw * th * tc;
+            uint8_t *buf = malloc(sz);
+            if (m->sw_only)
+               memcpy(buf, (uint8_t *)m->activation_bo.map + m->tensors[ti].offset, sz);
+            else
+               rnpu_convert_output(buf, (uint8_t *)m->activation_bo.map + m->tensors[ti].offset,
+                                   tw, th, tc);
+            unsigned hist[256] = {0};
+            for (unsigned k = 0; k < sz; k++) hist[buf[k]]++;
+            unsigned unique = 0;
+            for (unsigned k = 0; k < 256; k++) if (hist[k]) unique++;
+            fprintf(stderr, "  op %2u [SW/%d] t%u %ux%ux%u: %u unique\n",
+                    seg->first_op, dop->type, ti, tw, th, tc, unique);
+            free(buf);
+         }
          if (s + 1 < m->segment_count && m->segments[s+1].is_hw)
             rnpu_bo_fini(m->fd, &m->activation_bo);
       }
@@ -1196,6 +1368,11 @@ void rnpu_model_free(rnpu_model_t *m)
       free(op->per_axis_correction);
       free(op->group_channel_indices);
       free(op->per_channel_scales);
+      free(op->requant_group_sizes);
+      free(op->requant_group_ch_offset);
+      free(op->requant_group_max_ws);
+      free(op->requant_brdma_offsets);
+      free(op->requant_mul_shifts);
       free(op->tasks);
       if (op->type == RNPU_OP_CONCAT) {
          free(op->sw.concat.input_tensors);

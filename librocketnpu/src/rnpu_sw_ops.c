@@ -414,6 +414,107 @@ void rnpu_apply_per_axis_correction(struct rnpu_model *m,
    }
 }
 
+void rnpu_scatter_requant_output(struct rnpu_model *m,
+                                  struct rnpu_operation *op)
+{
+   if (op->requant_group_count <= 1) return;
+
+   unsigned w = op->output_width, h = op->output_height;
+   unsigned oc = op->output_channels;
+   unsigned hw_groups = DIV_ROUND_UP(oc, FEATURE_ATOMIC_SIZE) * 2;
+   unsigned full_out_per_group = w * h * hw_groups * FEATURE_ATOMIC_SIZE;
+   unsigned px_count = w * h;
+   unsigned gp = h * w * FEATURE_ATOMIC_SIZE; /* bytes per NPU channel group plane */
+   uint8_t *data = tensor_ptr(m, op->output_tensor);
+   /* Final output goes into group 0's position. Scatter from each requant
+    * group's output copy, picking only that group's channels. */
+   uint8_t *final_buf = malloc(full_out_per_group);
+   memset(final_buf, 0, full_out_per_group);
+
+   for (unsigned g = 0; g < op->requant_group_count; g++) {
+      unsigned ch_off = op->requant_group_ch_offset[g];
+      unsigned gsz = op->requant_group_sizes[g];
+      uint8_t *group_out = data + g * full_out_per_group;
+
+      for (unsigned ci = 0; ci < gsz; ci++) {
+         unsigned orig_ch = op->group_channel_indices[ch_off + ci];
+         unsigned src_g16 = orig_ch / FEATURE_ATOMIC_SIZE;
+         unsigned src_c16 = orig_ch % FEATURE_ATOMIC_SIZE;
+         for (unsigned p = 0; p < px_count; p++) {
+            final_buf[src_g16 * gp + p * FEATURE_ATOMIC_SIZE + src_c16] =
+               group_out[src_g16 * gp + p * FEATURE_ATOMIC_SIZE + src_c16];
+         }
+      }
+   }
+
+   memcpy(data, final_buf, full_out_per_group);
+   free(final_buf);
+}
+
+void rnpu_apply_brdma_correction(struct rnpu_model *m,
+                                  struct rnpu_operation *op)
+{
+   if (!op->use_brdma_per_channel || !op->per_channel_scales)
+      return;
+
+   unsigned w = op->output_width, h = op->output_height;
+   unsigned oc = op->output_channels;
+   int ozp = (int)(uint8_t)op->output_zero_point - 0x80;
+   uint8_t *data = tensor_ptr(m, op->output_tensor);
+   unsigned groups = DIV_ROUND_UP(oc, FEATURE_ATOMIC_SIZE);
+
+   /* Build per-channel correction factors from MUL quantization residual */
+   float *correction = malloc(oc * sizeof(float));
+
+   if (op->requant_group_count > 1) {
+      /* Multi-group: each group has its own reference scale and mul_shift */
+      for (unsigned g = 0; g < op->requant_group_count; g++) {
+         float ref_ws = op->requant_group_max_ws[g];
+         unsigned ms = op->requant_mul_shifts[g];
+         float md = (float)(1 << ms);
+         unsigned ch_off = op->requant_group_ch_offset[g];
+         unsigned gsz = op->requant_group_sizes[g];
+         for (unsigned i = 0; i < gsz; i++) {
+            unsigned orig_ch = op->group_channel_indices[ch_off + i];
+            float exact = op->per_channel_scales[orig_ch] / ref_ws;
+            float quantized = roundf(exact * md) / md;
+            correction[orig_ch] = (quantized > 0) ? exact / quantized : 1.0f;
+         }
+      }
+   } else {
+      /* Single group: reference is global max weight scale */
+      float ref_ws = op->weights_scale;
+      unsigned ms = op->brdma_mul_shift;
+      float md = (float)(1 << ms);
+      for (unsigned c = 0; c < oc; c++) {
+         float exact = op->per_channel_scales[c] / ref_ws;
+         float quantized = roundf(exact * md) / md;
+         correction[c] = (quantized > 0) ? exact / quantized : 1.0f;
+      }
+   }
+
+   /* Apply corrections to NPU-format output */
+   for (unsigned g = 0; g < groups; g++) {
+      unsigned bc = g * FEATURE_ATOMIC_SIZE;
+      unsigned rc = MIN2(FEATURE_ATOMIC_SIZE, oc - bc);
+      for (unsigned y = 0; y < h; y++)
+         for (unsigned x = 0; x < w; x++) {
+            uint8_t *px = data + NPU_OFFSET(g, x, y, w, h);
+            for (unsigned c = 0; c < rc; c++) {
+               float corr = correction[bc + c];
+               if (corr == 1.0f) continue;
+               int val = (int)(int8_t)px[c] - ozp;
+               val = (int)roundf(val * corr) + ozp;
+               if (val < -128) val = -128;
+               if (val > 127) val = 127;
+               px[c] = (uint8_t)(int8_t)val;
+            }
+         }
+   }
+
+   free(correction);
+}
+
 void rnpu_compact_unsort_output(struct rnpu_model *m,
                                 unsigned first_op,
                                 unsigned num_ops)

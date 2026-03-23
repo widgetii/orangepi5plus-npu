@@ -75,12 +75,12 @@ unsigned rnpu_fill_weights(const struct rnpu_tfl_model *tfl,
                         dst[n++] = 0x0;
                      else if (ic >= input_channels_real) {
                         if (i2 < 16 || (input_channels_real % 32) > 16)
-                           dst[n++] = zero_point - 0x80;
+                           dst[n++] = 0;  /* zero weight for padded channels */
                      } else {
                         unsigned flat = oc * weights_width * weights_height * input_channels_real
                                       + x * weights_height * input_channels_real
                                       + y * input_channels_real + ic;
-                        dst[n++] = w_in[flat] - 0x80;
+                        dst[n++] = (int8_t)w_in[flat] - (int8_t)zero_point;
                      }
                   }
                }
@@ -127,12 +127,12 @@ unsigned rnpu_fill_weights_group(const struct rnpu_tfl_model *tfl,
                         if (oc_local < oc_pad) dst[n++] = 0x0;
                      } else if (icc >= ic_real) {
                         if (i2 < 16 || (ic_real % 32) > 16)
-                           dst[n++] = zp - 0x80;
+                           dst[n++] = 0;  /* zero weight for padded channels */
                      } else {
                         unsigned oc_global = channel_indices[oc_local];
                         unsigned flat = oc_global * ww * wh * ic_real
                                       + x * wh * ic_real + y * ic_real + icc;
-                        dst[n++] = w_in[flat] - 0x80;
+                        dst[n++] = (int8_t)w_in[flat] - (int8_t)zp;
                      }
                   }
                }
@@ -325,9 +325,10 @@ float rnpu_fill_brdma_data(const struct rnpu_tfl_model *tfl,
          unsigned c = g * 8 + i;
          if (c < oc) {
             int32_t corr = calc_bias_correction(tfl, op, c);
+            /* Bias is NOT rescaled — the MUL unit will scale both the
+             * accumulator and bias by ws[c]/max_ws, providing the correct
+             * per-channel effective scale. */
             int32_t bv = biases_in[c];
-            if (max_ws != 0.0f)
-               bv = (int32_t)roundf(bv * (wt->quant.scales[c] / max_ws));
             bias_grp[i] = (bv - corr) / (1 << truncate);
 
             float ratio = wt->quant.scales[c] / max_ws;
@@ -338,9 +339,63 @@ float rnpu_fill_brdma_data(const struct rnpu_tfl_model *tfl,
 
    if (out_mul_shift) *out_mul_shift = mul_shift;
 
-   /* Debug: print first op's BRDMA parameters */
-
    return max_conv_scale;
+}
+
+/* Fill BRDMA data for a specific requant group within a per-channel op.
+ * Only the channels in this group get their true MUL ratio;
+ * all channels outside the group get MUL=0 (zeroed output).
+ * group_max_ws is the reference scale for this group's OUT_CVT. */
+float rnpu_fill_brdma_data_group(const struct rnpu_tfl_model *tfl,
+                                   const struct rnpu_tfl_op *op,
+                                   const struct rnpu_operation *npu_op,
+                                   const unsigned *sorted_channels,
+                                   unsigned group_ch_offset,
+                                   unsigned group_size,
+                                   float group_max_ws,
+                                   uint8_t *dst, unsigned dst_size,
+                                   unsigned *out_mul_shift)
+{
+   unsigned oc = tfl->tensors[op->outputs[0]].shape[3];
+   unsigned oc_pad = ALIGN_UP(MAX2(oc, 32), 16);
+   int wt_idx = op->inputs[1];
+   const struct rnpu_tfl_tensor *wt = &tfl->tensors[wt_idx];
+   int bias_idx = op->inputs[2];
+   const struct rnpu_tfl_buffer *bias_buf = &tfl->buffers[tfl->tensors[bias_idx].buffer_index];
+   const int32_t *biases_in = (const int32_t *)bias_buf->data;
+   unsigned truncate = npu_op->truncate_bits;
+   unsigned mul_shift = 14;
+
+   /* Build a set of channels in this group for fast lookup */
+   bool *in_group = calloc(oc, sizeof(bool));
+   for (unsigned i = 0; i < group_size; i++)
+      in_group[sorted_channels[group_ch_offset + i]] = true;
+
+   memset(dst, 0, dst_size);
+
+   unsigned num_chunks = oc_pad / 8;
+   for (unsigned g = 0; g < num_chunks; g++) {
+      uint8_t *chunk = dst + g * 64;
+      int32_t *bias_grp = (int32_t *)(chunk);
+      int16_t *mul_grp = (int16_t *)(chunk + 48);
+
+      for (unsigned i = 0; i < 8; i++) {
+         unsigned c = g * 8 + i;
+         if (c < oc) {
+            int32_t corr = calc_bias_correction(tfl, op, c);
+            /* Bias is NOT rescaled — MUL handles per-channel correction */
+            int32_t bv = biases_in[c];
+            bias_grp[i] = (bv - corr) / (1 << truncate);
+
+            float ratio = wt->quant.scales[c] / group_max_ws;
+            mul_grp[i] = (int16_t)roundf(ratio * (float)(1 << mul_shift));
+         }
+      }
+   }
+
+   free(in_group);
+   if (out_mul_shift) *out_mul_shift = mul_shift;
+   return (npu_op->input_scale * group_max_ws) / npu_op->output_scale;
 }
 
 /* Compute BRDMA buffer size for one operation.
