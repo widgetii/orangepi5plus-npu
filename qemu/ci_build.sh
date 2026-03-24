@@ -203,7 +203,6 @@ cp "$BOOT/npu_conv_tests" "$ROOTFS_V/bin/" 2>/dev/null || true
 cp "$BOOT/test_mobilenet" "$ROOTFS_V/bin/" 2>/dev/null || true
 if [ -f "$MODEL" ]; then cp "$MODEL" "$ROOTFS_V/model.tflite"; fi
 if [ -f "$GOLDEN" ]; then cp "$GOLDEN" "$ROOTFS_V/golden.bin"; fi
-if [ -f "$INPUT_IMG" ]; then cp "$INPUT_IMG" "$ROOTFS_V/input.bin"; fi
 cp "$BOOT/rootfs-vendor/init" "$ROOTFS_V/init"
 chmod +x "$ROOTFS_V/init"
 
