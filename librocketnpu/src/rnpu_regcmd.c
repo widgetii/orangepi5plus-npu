@@ -1011,12 +1011,7 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
 
    EMIT(REG_CNA_CVT_CON5, task->input_channels_real == 1 ? 65535 : 0);
 
-   int32_t pad_con1;
-   if (task->weights_width >= 3 && task->input_zero_point == 0x0)
-      pad_con1 = 0xffff8080;
-   else
-      pad_con1 = task->input_zero_point - 0x80;
-   EMIT(REG_CNA_PAD_CON1, pad_con1);
+   EMIT(REG_CNA_PAD_CON1, (int32_t)task->input_zero_point - 0x80);
 
    uint32_t misc_cfg = CORE_MISC_CFG_QD_EN(1);
    if (op->depthwise) misc_cfg |= CORE_MISC_CFG_DW_EN(1);
@@ -1067,7 +1062,7 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
                                DPU_BS_OW_CFG_SIZE_E_1(1) |
                                DPU_BS_OW_CFG_SIZE_E_0(1));
    }
-   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(task->output_channels - 1));
+   EMIT(REG_DPU_BS_OW_OP, 0);
    EMIT(REG_DPU_WDMA_SIZE_0, DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_1, DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
                               DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
@@ -1203,6 +1198,194 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
    return (unsigned)(dst - out);
 }
 
+/* BRDMA continuation task regcmd — matches RKNN's spatial split format.
+ * DPU registers are set to zero/bypass (BS_CFG=0, BN=0, etc.) because
+ * the RKNPU hardware reuses the first task's DPU config for chained tasks.
+ * Only CNA (spatial tile), Core (output tile), and minimal DPU/RDMA setup
+ * are needed. ~61 entries vs 130 for full regcmd. */
+static unsigned fill_brdma_continuation_regcmd(const struct rnpu_model *model,
+                                                const struct rnpu_operation *op,
+                                                uint64_t *out, unsigned task_num)
+{
+   uint64_t *dst = out;
+   const struct rnpu_split_task *task = &op->tasks[task_num];
+
+   uint64_t act_base = model->activation_bo.dma_addr;
+   uint64_t wt_base = model->weight_bo.dma_addr;
+
+   uint32_t con0 = CNA_CBUF_CON0_WEIGHT_BANK(task->weights_banks) |
+                   CNA_CBUF_CON0_DATA_BANK(task->input_banks);
+   if (task_num > 0 && op->reuse_weights_cbuf)
+      con0 |= CNA_CBUF_CON0_WEIGHT_REUSE(1);
+
+   /* CNA setup — same as standard regcmd */
+   EMIT(REG_CNA_CBUF_CON0, con0);
+   EMIT(REG_CNA_DCOMP_REGNUM, 0);
+   EMIT(REG_CNA_DCOMP_CTRL, 0);
+
+   uint32_t con1 = 0;
+   if (task->input_channels_real == 1)
+      con1 |= CNA_CONV_CON1_NONALIGN_DMA(1) | CNA_CONV_CON1_GROUP_LINE_OFF(1) |
+              CNA_CONV_CON1_ARGB_IN(8);
+   if (op->depthwise)
+      con1 |= CNA_CONV_CON1_CONV_MODE(3);
+
+   EMIT(REG_CNA_CONV_CON1, con1);
+   EMIT(REG_DPU_S_POINTER, DPU_S_POINTER_POINTER_PP_MODE(1) |
+                            DPU_S_POINTER_EXECUTER_PP_EN(1) |
+                            DPU_S_POINTER_POINTER_PP_EN(1));
+   EMIT(REG_DPU_RDMA_RDMA_S_POINTER,
+        DPU_RDMA_RDMA_S_POINTER_POINTER_PP_MODE(1) |
+        DPU_RDMA_RDMA_S_POINTER_EXECUTER_PP_EN(1) |
+        DPU_RDMA_RDMA_S_POINTER_POINTER_PP_EN(1));
+   EMIT(REG_CNA_CONV_CON1, con1);
+   EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(50 + task->stride_y + 1));
+   EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
+                            CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
+   EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(task->input_width) |
+                             CNA_DATA_SIZE0_DATAIN_HEIGHT(task->input_height));
+   EMIT(REG_CNA_DATA_SIZE1, CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL(task->input_channels_real - 1) |
+                             CNA_DATA_SIZE1_DATAIN_CHANNEL(task->input_channels));
+   EMIT(REG_CNA_DATA_SIZE2, CNA_DATA_SIZE2_DATAOUT_WIDTH(task->output_width));
+   EMIT(REG_CNA_DATA_SIZE3, CNA_DATA_SIZE3_DATAOUT_ATOMICS(task->atomic_count));
+   EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
+                               task->input_channels * task->weights_kernels);
+   EMIT(REG_CNA_WEIGHT_SIZE1, task->weights_width * task->weights_height *
+                               task->input_channels);
+   EMIT(REG_CNA_WEIGHT_SIZE2, CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(task->weights_width) |
+                               CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(task->weights_height) |
+                               CNA_WEIGHT_SIZE2_WEIGHT_KERNELS(task->weights_kernels));
+   EMIT(REG_CNA_CBUF_CON0, con0);
+   EMIT(REG_CNA_CBUF_CON1, CNA_CBUF_CON1_DATA_ENTRIES(task->input_data_entries));
+
+   EMIT(REG_CNA_CVT_CON0, CNA_CVT_CON0_DATA_SIGN(1) | CNA_CVT_CON0_CVT_TYPE(1) |
+                           CNA_CVT_CON0_CVT_BYPASS(1));
+   EMIT(REG_CNA_CVT_CON1, CNA_CVT_CON1_CVT_SCALE0(1));
+   EMIT(REG_CNA_CVT_CON2, CNA_CVT_CON2_CVT_SCALE1(1));
+   EMIT(REG_CNA_CVT_CON3, CNA_CVT_CON3_CVT_SCALE2(1));
+   EMIT(REG_CNA_CVT_CON4, CNA_CVT_CON4_CVT_SCALE3(1));
+
+   EMIT(REG_CNA_FC_CON0, 0);
+   EMIT(REG_CNA_FC_CON1, 0);
+   EMIT(REG_CNA_PAD_CON0, CNA_PAD_CON0_PAD_LEFT(task->pad_left) |
+                           CNA_PAD_CON0_PAD_TOP(task->pad_top));
+
+   uint32_t in_addr = (uint32_t)(act_base + model->tensors[op->input_tensor].offset +
+                                 task->input_offset);
+   EMIT(REG_CNA_FEATURE_DATA_ADDR, in_addr);
+   EMIT(REG_CNA_FC_CON2, 0);
+   EMIT(REG_CNA_DMA_CON0, CNA_DMA_CON0_WEIGHT_BURST_LEN(15) |
+                           CNA_DMA_CON0_DATA_BURST_LEN(15));
+   EMIT(REG_CNA_DMA_CON1, CNA_DMA_CON1_LINE_STRIDE(task->input_line_stride));
+   EMIT(REG_CNA_DMA_CON2, CNA_DMA_CON2_SURF_STRIDE(task->input_surface_stride));
+   EMIT(REG_CNA_FC_DATA_SIZE0, CNA_FC_DATA_SIZE0_DMA_WIDTH(op->input_width) |
+                                CNA_FC_DATA_SIZE0_DMA_HEIGHT(task->input_height));
+   EMIT(REG_CNA_FC_DATA_SIZE1, CNA_FC_DATA_SIZE1_DMA_CHANNEL(task->input_channels));
+   EMIT(REG_CNA_DCOMP_CTRL, 0);
+   EMIT(REG_CNA_DCOMP_REGNUM, 0);
+   EMIT(REG_CNA_DCOMP_ADDR0, (uint32_t)(wt_base + op->weight_offset));
+
+   int32_t pad_con1;
+   if (task->weights_width >= 3 && task->input_zero_point == 0x0)
+      pad_con1 = 0xffff8080;
+   else
+      pad_con1 = task->input_zero_point - 0x80;
+   EMIT(REG_CNA_PAD_CON1, pad_con1);
+
+   /* Core setup */
+   uint32_t misc_cfg = CORE_MISC_CFG_QD_EN(1);
+   if (op->depthwise) misc_cfg |= CORE_MISC_CFG_DW_EN(1);
+   EMIT(REG_CORE_MISC_CFG, misc_cfg);
+   EMIT(REG_CORE_DATAOUT_SIZE_0,
+        CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT(task->output_height - 1) |
+        CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH(task->output_width - 1));
+   EMIT(REG_CORE_DATAOUT_SIZE_1, CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL(task->output_channels - 1));
+   EMIT(REG_CORE_CLIP_TRUNCATE, 0);
+   emit_raw(&dst, CORE | 0x1, 0x3030, 0);
+
+   /* DPU — matching RKNN's continuation task config exactly:
+    * BS_CFG=0x53 (BS fully bypassed), BN=0x53 (BN bypassed), EW=0x383 (EW bypassed)
+    * OUT_CVT with SCALE=1, SHIFT=0 (passthrough — hardware reuses first task's DPU state) */
+   uint32_t fmc = DPU_FEATURE_MODE_CFG_BURST_LEN(15) | DPU_FEATURE_MODE_CFG_OUTPUT_MODE(2);
+   if (op->depthwise) fmc |= DPU_FEATURE_MODE_CFG_CONV_MODE(3);
+   EMIT(REG_DPU_FEATURE_MODE_CFG, fmc);
+   EMIT(REG_DPU_DATA_FORMAT, 0);
+   EMIT(REG_DPU_OFFSET_PEND, 0);
+
+   uint32_t out_addr = (uint32_t)(act_base + model->tensors[op->output_tensor].offset +
+                                  task->output_offset);
+   EMIT(REG_DPU_DST_BASE_ADDR, out_addr);
+   EMIT(REG_DPU_DST_SURF_STRIDE, DPU_DST_SURF_STRIDE_DST_SURF_STRIDE(task->output_surface_stride));
+   EMIT(REG_DPU_DATA_CUBE_WIDTH, DPU_DATA_CUBE_WIDTH_WIDTH(task->output_width - 1));
+   EMIT(REG_DPU_DATA_CUBE_HEIGHT, DPU_DATA_CUBE_HEIGHT_HEIGHT(task->output_height - 1));
+   EMIT(REG_DPU_DATA_CUBE_NOTCH_ADDR, 0);
+   EMIT(REG_DPU_DATA_CUBE_CHANNEL,
+        DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL(task->output_channels_real - 1) |
+        DPU_DATA_CUBE_CHANNEL_CHANNEL(task->output_channels - 1));
+   /* BS=0x53: bypass + ALU bypass + MUL bypass + ReLU bypass */
+   EMIT(REG_DPU_BS_CFG, 0x53);
+   EMIT(REG_DPU_BS_ALU_CFG, 0);
+   EMIT(REG_DPU_BS_MUL_CFG, 0);
+   EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0);
+   EMIT(REG_DPU_BS_OW_CFG, DPU_BS_OW_CFG_SIZE_E_2(1) |
+                             DPU_BS_OW_CFG_SIZE_E_1(1) |
+                             DPU_BS_OW_CFG_SIZE_E_0(1));
+   EMIT(REG_DPU_BS_OW_OP, task->output_channels - 1);
+   EMIT(REG_DPU_WDMA_SIZE_0, DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
+   EMIT(REG_DPU_WDMA_SIZE_1, DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
+                              DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
+   /* BN=0x53: fully bypassed */
+   EMIT(REG_DPU_BN_CFG, 0x53);
+   EMIT(REG_DPU_BN_ALU_CFG, 0);
+   EMIT(REG_DPU_BN_MUL_CFG, 0);
+   EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
+   /* EW=0x383: fully bypassed */
+   EMIT(REG_DPU_EW_CFG, DPU_EW_CFG_EW_RELU_BYPASS(1) | DPU_EW_CFG_EW_OP_CVT_BYPASS(1) |
+                         DPU_EW_CFG_EW_LUT_BYPASS(1) | DPU_EW_CFG_EW_OP_BYPASS(1) |
+                         DPU_EW_CFG_EW_BYPASS(1));
+   EMIT(REG_DPU_EW_CVT_OFFSET_VALUE, 0);
+   EMIT(REG_DPU_EW_CVT_SCALE_VALUE, DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE(1));
+   EMIT(REG_DPU_EW_RELUX_CMP_VALUE, 0);
+   EMIT(REG_DPU_OUT_CVT_OFFSET, 0);
+   EMIT(REG_DPU_OUT_CVT_SCALE, 1);
+   EMIT(REG_DPU_OUT_CVT_SHIFT, 0);
+   EMIT(REG_DPU_EW_OP_VALUE_0, 0); EMIT(REG_DPU_EW_OP_VALUE_1, 0);
+   EMIT(REG_DPU_EW_OP_VALUE_2, 0); EMIT(REG_DPU_EW_OP_VALUE_3, 0);
+   EMIT(REG_DPU_EW_OP_VALUE_4, 0); EMIT(REG_DPU_EW_OP_VALUE_5, 0);
+   EMIT(REG_DPU_EW_OP_VALUE_6, 0); EMIT(REG_DPU_EW_OP_VALUE_7, 0);
+   EMIT(REG_DPU_SURFACE_ADD, DPU_SURFACE_ADD_SURF_ADD(task->surfaces_per_row));
+   emit_raw(&dst, DPU | 0x1, 0x40c4, 0);
+   EMIT(REG_DPU_LUT_ACCESS_CFG, 0); EMIT(REG_DPU_LUT_ACCESS_DATA, 0);
+   EMIT(REG_DPU_LUT_CFG, 0); EMIT(REG_DPU_LUT_INFO, 0);
+   EMIT(REG_DPU_LUT_LE_START, 0); EMIT(REG_DPU_LUT_LE_END, 0);
+   EMIT(REG_DPU_LUT_LO_START, 0); EMIT(REG_DPU_LUT_LO_END, 0);
+   EMIT(REG_DPU_LUT_LE_SLOPE_SCALE, 0); EMIT(REG_DPU_LUT_LE_SLOPE_SHIFT, 0);
+   EMIT(REG_DPU_LUT_LO_SLOPE_SCALE, 0); EMIT(REG_DPU_LUT_LO_SLOPE_SHIFT, 0);
+
+   /* RDMA — all zeroed */
+   EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH(task->output_width - 1));
+   EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT(task->output_height - 1));
+   EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL(task->output_channels - 1));
+   EMIT(REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0);
+   EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, 0);
+   EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR, 0);
+   EMIT(REG_DPU_RDMA_RDMA_ERDMA_CFG, DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DISABLE(1));
+   EMIT(REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,
+        DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) |
+        DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_DISABLE(1));
+   EMIT(REG_DPU_RDMA_RDMA_WEIGHT,
+        DPU_RDMA_RDMA_WEIGHT_E_WEIGHT(1) | DPU_RDMA_RDMA_WEIGHT_N_WEIGHT(1) |
+        DPU_RDMA_RDMA_WEIGHT_B_WEIGHT(1) | DPU_RDMA_RDMA_WEIGHT_M_WEIGHT(1));
+
+   EMIT(REG_PC_BASE_ADDRESS, 0);
+   EMIT(REG_PC_REGISTER_AMOUNTS, 0);
+   *dst++ = 0x0041000000000000ULL;
+   emit_raw(&dst, 0x81, REG_PC_OPERATION_ENABLE,
+            PC_OPERATION_ENABLE_RESERVED_0(14) | PC_OPERATION_ENABLE_OP_EN(1));
+
+   return (unsigned)(dst - out);
+}
+
 /* Global hybrid mask — set via RNPU_HYBRID_MASK env var or programmatically.
  * 0 = standard path, 0x3FFFF = all per-channel, -1 = use standard function. */
 uint32_t rnpu_hybrid_mask = UINT32_MAX;
@@ -1212,9 +1395,16 @@ unsigned rnpu_fill_regcmd(const struct rnpu_model *model,
                           uint64_t *dst, unsigned max_regs,
                           unsigned task_num)
 {
-   /* RKNPU full-conv per-channel: uses BRDMA with bias+MUL DMA data */
-   if (rnpu_active_driver == RNPU_DRIVER_RKNPU && op->use_brdma_per_channel)
-      return fill_brdma_per_channel_regcmd(model, op, dst, task_num);
+   /* RKNPU full-conv per-channel: uses BRDMA with bias+MUL DMA data.
+    * Only the initial tasks (before weight reuse kicks in) get the full
+    * BRDMA regcmd. Continuation tasks (weight reuse) use standard regcmd
+    * — matching RKNN's behavior where spatial splits have BS_CFG=0. */
+   if (rnpu_active_driver == RNPU_DRIVER_RKNPU && op->use_brdma_per_channel) {
+      if (task_num == 0 || !op->reuse_weights_cbuf)
+         return fill_brdma_per_channel_regcmd(model, op, dst, task_num);
+      else
+         return fill_standard_regcmd(model, op, dst, task_num);
+   }
 
    /* For RKNPU per-channel ops (GS=1), use per-channel regcmd with
     * BN-stage bias addition. Standard regcmd doesn't work for GS=1 on RKNPU. */

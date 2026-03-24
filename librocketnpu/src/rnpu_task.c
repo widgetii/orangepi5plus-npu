@@ -138,6 +138,36 @@ static void fill_task(struct rnpu_operation *op, struct rnpu_split_task *task)
    if (op->depthwise) task->surfaces_per_row *= 2;
 }
 
+static void replicate_tasks_for_requant(struct rnpu_operation *op,
+                                        unsigned spatial_count)
+{
+   unsigned ng = op->requant_group_count;
+   if (ng <= 1) return;
+
+   unsigned total = spatial_count * ng;
+   struct rnpu_split_task *new_tasks = calloc(total, sizeof(struct rnpu_split_task));
+
+   for (unsigned g = 0; g < ng; g++) {
+      for (unsigned s = 0; s < spatial_count; s++) {
+         unsigned idx = g * spatial_count + s;
+         new_tasks[idx] = op->tasks[s]; /* copy spatial task */
+         new_tasks[idx].num = idx;
+         new_tasks[idx].weights_scale = op->requant_group_max_ws[g];
+         new_tasks[idx].requant_group_idx = g;
+         new_tasks[idx].brdma_group_offset = op->requant_brdma_offsets[g];
+         /* output_offset for this requant group: shifted by group_idx * full_output_size */
+         unsigned full_out_per_group = op->output_width * op->output_height *
+            DIV_ROUND_UP(op->output_channels, FEATURE_ATOMIC_SIZE) * 2 * FEATURE_ATOMIC_SIZE;
+         new_tasks[idx].output_offset = op->tasks[s].output_offset +
+                                         g * full_out_per_group;
+      }
+   }
+
+   free(op->tasks);
+   op->tasks = new_tasks;
+   op->task_count = total;
+}
+
 void rnpu_split_tasks(struct rnpu_operation *op)
 {
    unsigned entries_per_slice = calc_entries_per_slice(op);
@@ -168,6 +198,8 @@ void rnpu_split_tasks(struct rnpu_operation *op)
       t->pad_top = pt; t->pad_bottom = pb;
       t->pad_left = pl; t->pad_right = pr;
       t->atomic_count = t->output_width * t->output_height;
+
+      replicate_tasks_for_requant(op, 1);
       return;
    }
 
@@ -275,4 +307,7 @@ void rnpu_split_tasks(struct rnpu_operation *op)
       t->output_offset = calc_line_stride(op->output_width) * output_h_done;
       output_h_done += t->output_height;
    }
+
+   unsigned spatial_count = op->task_count;
+   replicate_tasks_for_requant(op, spatial_count);
 }

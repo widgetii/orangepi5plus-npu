@@ -194,6 +194,8 @@ struct rnpu_split_task {
    unsigned atomic_count, surfaces_per_row;
    unsigned regcfg_amount;
    uint32_t regcfg_addr;
+   uint32_t brdma_group_offset;  /* BRDMA BO offset for this task's requant group */
+   unsigned requant_group_idx;   /* which requant group this task belongs to */
 };
 
 struct rnpu_operation {
@@ -237,6 +239,22 @@ struct rnpu_operation {
    unsigned brdma_mul_shift;    /* BS_MUL_CFG shift (dynamic per op) */
    float *per_channel_scales;
    unsigned per_channel_scale_count;
+
+   /* .rknn override: pre-computed BRDMA data and OUT_CVT from RKNN toolkit */
+   bool rknn_brdma_override;
+   uint32_t rknn_out_cvt_scale;
+   uint32_t rknn_out_cvt_shift;
+   int32_t rknn_out_cvt_offset;
+
+   /* Requant groups: multiple OUT_CVT scale groups per BRDMA per-channel op.
+    * Each group runs the full conv with a different OUT_CVT_SCALE, then
+    * CPU scatter picks correct channels from each group's output. */
+   unsigned requant_group_count;       /* 0 = single group (legacy) */
+   unsigned *requant_group_sizes;      /* channels per group */
+   unsigned *requant_group_ch_offset;  /* cumulative channel offset per group */
+   float *requant_group_max_ws;        /* max weight scale per group */
+   uint32_t *requant_brdma_offsets;    /* BRDMA BO offset per group */
+   unsigned *requant_mul_shifts;       /* mul_shift per group */
 
    /* Offsets into shared BOs */
    uint32_t weight_offset;
@@ -330,6 +348,9 @@ struct rnpu_model {
 
    /* TFLite model data (kept alive for weight references) */
    struct rnpu_tfl_model tfl;
+
+   /* Optional .rknn model data for BRDMA override */
+   bool has_rknn;
 };
 
 #endif /* RNPU_INTERNAL_H */

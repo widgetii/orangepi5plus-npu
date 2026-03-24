@@ -53,6 +53,17 @@ float rnpu_fill_brdma_data(const struct rnpu_tfl_model *tfl,
                             uint8_t *dst, unsigned dst_size,
                             unsigned *out_mul_shift);
 
+/* Fill BRDMA data for a specific requant group. */
+float rnpu_fill_brdma_data_group(const struct rnpu_tfl_model *tfl,
+                                   const struct rnpu_tfl_op *op,
+                                   const struct rnpu_operation *npu_op,
+                                   const unsigned *sorted_channels,
+                                   unsigned group_ch_offset,
+                                   unsigned group_size,
+                                   float group_max_ws,
+                                   uint8_t *dst, unsigned dst_size,
+                                   unsigned *out_mul_shift);
+
 /* Compute BRDMA buffer size for one op with given output channels. */
 unsigned rnpu_calc_brdma_size(unsigned oc);
 

@@ -15,6 +15,7 @@ SRCS = src/rnpu_drm.c \
        src/rnpu_regcmd.c \
        src/rnpu_convert.c \
        src/rnpu_sw_ops.c \
+       src/rnpu_rknn.c \
        src/rnpu_model.c
 
 OBJS = $(SRCS:.c=.o)

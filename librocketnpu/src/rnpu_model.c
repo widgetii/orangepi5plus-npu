@@ -21,6 +21,7 @@
 #include "rnpu_regcmd.h"
 #include "rnpu_convert.h"
 #include "rnpu_sw_ops.h"
+#include "rnpu_rknn.h"
 
 /* ---- Helpers ---- */
 
@@ -486,7 +487,8 @@ static void compile_weights_and_biases(struct rnpu_model *m)
    if (m->bias_bo.handle) rnpu_bo_fini(m->fd, &m->bias_bo);
 }
 
-static void compile_brdma_data(struct rnpu_model *m)
+static void compile_brdma_data(struct rnpu_model *m,
+                               struct rnpu_rknn_model *rknn)
 {
    /* First pass: compute total BRDMA size across all per-axis BRDMA ops */
    uint32_t total_brdma = 0;
@@ -514,6 +516,7 @@ static void compile_brdma_data(struct rnpu_model *m)
    }
 
    /* Second pass: fill BRDMA data for each op */
+   unsigned rknn_matched = 0;
    for (unsigned i = 0; i < m->op_count; i++) {
       struct rnpu_operation *op = &m->ops[i];
       if (!op->use_brdma_per_channel) continue;
@@ -532,8 +535,37 @@ static void compile_brdma_data(struct rnpu_model *m)
       }
       if (!top) continue;
 
+      /* Try .rknn override: match by bias values and channel count */
+      if (rknn && rknn->op_count > 0 && op->requant_group_count <= 1) {
+         /* Get raw TFLite biases for matching */
+         int bias_idx = top->inputs[2];
+         const struct rnpu_tfl_buffer *bias_buf =
+            &m->tfl.buffers[m->tfl.tensors[bias_idx].buffer_index];
+         const int32_t *tfl_biases = (const int32_t *)bias_buf->data;
+         unsigned oc = m->tfl.tensors[top->outputs[0]].shape[3];
+
+         int ri = rnpu_rknn_match_op(rknn, tfl_biases, oc);
+         if (ri >= 0) {
+            /* Use .rknn BRDMA data directly */
+            uint8_t *dst = (uint8_t *)m->brdma_bo.map + op->brdma_offset;
+            unsigned copy_sz = op->brdma_size < rknn->ops[ri].brdma_size ?
+                               op->brdma_size : rknn->ops[ri].brdma_size;
+            memcpy(dst, rknn->ops[ri].brdma_data, copy_sz);
+
+            /* Mark as .rknn override — BRDMA MUL correction will be skipped.
+             * OUT_CVT values stay computed from our TFLite scales (same formula
+             * as RKNN uses). The key difference is per-channel MUL values. */
+            op->rknn_brdma_override = true;
+            op->brdma_mul_shift = 14;
+
+            rknn->ops[ri].matched = true;
+            rknn_matched++;
+            continue;
+         }
+      }
+
+      /* Fallback: compute BRDMA data from TFLite scales */
       if (op->requant_group_count > 1) {
-         /* Fill per-group BRDMA data */
          for (unsigned g = 0; g < op->requant_group_count; g++) {
             uint8_t *dst = (uint8_t *)m->brdma_bo.map + op->requant_brdma_offsets[g];
             unsigned ms = 14;
@@ -545,7 +577,7 @@ static void compile_brdma_data(struct rnpu_model *m)
                                         dst, op->brdma_size, &ms);
             op->requant_mul_shifts[g] = ms;
          }
-         op->brdma_mul_shift = 14; /* default for regcmd that reads from op */
+         op->brdma_mul_shift = 14;
       } else {
          uint8_t *dst = (uint8_t *)m->brdma_bo.map + op->brdma_offset;
          unsigned ms = 14;
@@ -560,7 +592,10 @@ static void compile_brdma_data(struct rnpu_model *m)
    unsigned brdma_ops = 0;
    for (unsigned i = 0; i < m->op_count; i++)
       if (m->ops[i].use_brdma_per_channel) brdma_ops++;
-   fprintf(stderr, "rnpu: BRDMA BO %u bytes (%u ops)\n", total_brdma, brdma_ops);
+   fprintf(stderr, "rnpu: BRDMA BO %u bytes (%u ops", total_brdma, brdma_ops);
+   if (rknn_matched > 0)
+      fprintf(stderr, ", %u from .rknn", rknn_matched);
+   fprintf(stderr, ")\n");
 }
 
 /* Patch a chain pointer from task src to task dst */
@@ -1122,8 +1157,38 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
    /* Compile weights and biases into shared BOs */
    compile_weights_and_biases(m);
 
+   /* Try loading sibling .rknn file for BRDMA data override */
+   struct rnpu_rknn_model rknn_model = {0};
+   struct rnpu_rknn_model *rknn_ptr = NULL;
+   {
+      /* Construct .rknn path from .tflite path */
+      size_t plen = strlen(tflite_path);
+      char *rknn_path = malloc(plen + 8);
+      strcpy(rknn_path, tflite_path);
+      /* Replace .tflite extension with .rknn */
+      char *ext = strrchr(rknn_path, '.');
+      if (ext && strcmp(ext, ".tflite") == 0) {
+         strcpy(ext, ".rknn");
+      } else {
+         /* Append .rknn */
+         strcat(rknn_path, ".rknn");
+      }
+      /* Check if file exists */
+      if (access(rknn_path, R_OK) == 0) {
+         if (rnpu_rknn_parse(rknn_path, &rknn_model) == 0 && rknn_model.op_count > 0) {
+            rknn_ptr = &rknn_model;
+            m->has_rknn = true;
+         }
+      }
+      free(rknn_path);
+   }
+
    /* Compile BRDMA data for RKNPU per-channel ops */
-   compile_brdma_data(m);
+   compile_brdma_data(m, rknn_ptr);
+
+   /* Free .rknn model data (BRDMA blobs already copied into BOs) */
+   if (rknn_ptr)
+      rnpu_rknn_free(&rknn_model);
 
    /* Generate register commands */
    compile_regcmds(m);
@@ -1222,9 +1287,10 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
                rnpu_scatter_requant_output(m, &m->ops[j]);
          }
 
-         /* Apply BRDMA MUL quantization correction after scatter */
+         /* Apply BRDMA MUL quantization correction after scatter.
+          * Skip for .rknn-overridden ops — their MUL values are already exact. */
          for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
-            if (m->ops[j].use_brdma_per_channel)
+            if (m->ops[j].use_brdma_per_channel && !m->ops[j].rknn_brdma_override)
                rnpu_apply_brdma_correction(m, &m->ops[j]);
          }
 
