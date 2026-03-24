@@ -300,21 +300,27 @@ Both sim levels are very close to hardware (~0.2 mean diff). The librocketnpu ga
 
 ### Action 6: Build Per-Layer Comparison Tool — DONE
 
-**Status**: COMPLETED. Two components:
+**Status**: COMPLETED. Two components built, plus a key insight.
 
 1. **`RNPU_DUMP_OPS`** env var in `rnpu_model.c` — dumps per-op uint8 NHWC tensors:
    ```bash
    mkdir -p /tmp/op_dump
    RNPU_DUMP_OPS=/tmp/op_dump ./test_yolo model.tflite input0.bin
-   # Creates op_00.bin through op_60.bin (61 CONV ops)
+   # Creates op_00.bin through op_90.bin (91 ops = 61 CONV + 30 SW)
    ```
 
-2. **`compare_per_layer.py`** — compares librocketnpu dumps vs RKNN INT8 references:
-   ```bash
-   python3 compare_per_layer.py --ref per_layer_ref --dump op_dump
-   ```
-   Handles format conversion: librocketnpu uint8 NHWC (+0x80 offset) ↔ RKNN int8 NCHW.
-   Reports per-layer exact%, mean_diff, max_diff and identifies first diverging layer.
+2. **`compare_per_layer.py`** — compares dumps vs references with format conversion.
+   Maps CONV indices to op indices (skipping SW ops) by matching tensor sizes.
+
+**Critical finding**: The per_layer_ref INT8 files from Action 2 are **NOT suitable for
+per-layer comparison** with NPU output. They represent "ideal" FP32→INT8 quantization,
+but real NPU execution operates in INT8 throughout — each layer's quantized output feeds
+the next layer, accumulating error. Conv 0's FP32 reference has range [0,254] which
+quantizes to mostly 127 (saturated), while NPU Conv 0 actually produces varying int8 values.
+
+**For actual per-layer comparison**, we would need RKNN hardware's per-layer INT8 outputs
+(not available without firmware-level intercept). The final-output comparison via
+`compare_outputs.py` (rknn_yolo_i8_*.bin vs yolo_output_*.bin) remains the correct tool.
 
 **Priority**: HIGH — the key debugging tool.
 
