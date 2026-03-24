@@ -1209,17 +1209,99 @@ static int test_bs_ow_op_18(int fd)
  * Main
  * ====================================================================== */
 
+/* ======================================================================
+ * Test 9: MobileNet op0 replica
+ *
+ * Matches MobileNet's first conv exactly:
+ *   - 4x4 input (tiny), 3 real channels (padded to 16)
+ *   - 3x3 kernel, stride 2, oc=12 (padded to 32)
+ *   - BS_OW_OP = -23 (0x80 - 151)
+ *   - padding = SAME (pad_left=1, pad_top=1), pad_value = 0
+ *
+ * If this FAILS in QEMU, the bug is in 3-channel handling.
+ * If this PASSES, the bug is in multi-layer chaining.
+ * ====================================================================== */
+static int test_mobilenet_op0(int fd)
+{
+    struct conv_config cfg;
+    conv_config_defaults(&cfg);
+    cfg.in_w = 4; cfg.in_h = 4; cfg.in_c = 3;
+    cfg.out_c = 12;
+    cfg.filt_w = 3; cfg.filt_h = 3;
+    cfg.stride_x = 2; cfg.stride_y = 2;
+    cfg.pad_left = 1; cfg.pad_top = 1;
+    cfg.pad_value = 0;  /* izp - 0x80 = 128 - 128 = 0 */
+    cfg.truncate_bits = 0;
+    cfg.bs_ow_op = (uint16_t)(int16_t)(0x80 - 151);  /* -23 */
+    cfg.out_cvt_scale = 128;
+    cfg.out_cvt_shift = 14;
+
+    int8_t input[4 * 4 * 3];
+    for (uint32_t i = 0; i < sizeof(input); i++)
+        input[i] = prng_val(i, 42);
+
+    int8_t weights[12 * 3 * 3 * 3];
+    for (uint32_t i = 0; i < sizeof(weights); i++)
+        weights[i] = (int8_t)((i * 7 + 13) % 11 - 5);
+
+    int32_t bias[12];
+    for (int i = 0; i < 12; i++) bias[i] = (i * 37 - 200);
+
+    /* CPU reference WITH BS_OW_OP correction */
+    uint32_t out_w = (cfg.in_w + cfg.pad_left * 2 - cfg.filt_w) / cfg.stride_x + 1;
+    uint32_t out_h = (cfg.in_h + cfg.pad_top * 2 - cfg.filt_h) / cfg.stride_y + 1;
+    int8_t expected[2 * 2 * 12];  /* out_w=2, out_h=2 */
+
+    for (uint32_t oy = 0; oy < out_h; oy++) {
+        for (uint32_t ox = 0; ox < out_w; ox++) {
+            for (uint32_t oc = 0; oc < 12; oc++) {
+                int32_t acc = 0;
+                int32_t sum_in = 0;
+                for (uint32_t ky = 0; ky < 3; ky++) {
+                    for (uint32_t kx = 0; kx < 3; kx++) {
+                        int32_t iy = (int32_t)(oy * 2 + ky) - 1;
+                        int32_t ix = (int32_t)(ox * 2 + kx) - 1;
+                        for (uint32_t ic = 0; ic < 3; ic++) {
+                            int8_t in_val;
+                            if (ix < 0 || ix >= 4 || iy < 0 || iy >= 4)
+                                in_val = 0;  /* pad_value */
+                            else
+                                in_val = input[iy * 4 * 3 + ix * 3 + ic];
+                            int8_t w_val = weights[oc * 3 * 3 * 3 + kx * 3 * 3 + ky * 3 + ic];
+                            acc += (int32_t)in_val * (int32_t)w_val;
+                            sum_in += (int32_t)in_val;
+                        }
+                    }
+                }
+                acc += (int32_t)(int16_t)cfg.bs_ow_op * sum_in;
+                acc = nvdla_truncate(acc, 0);
+                acc += bias[oc];
+                int64_t scaled = nvdla_shift_right_round64(
+                    (int64_t)acc * (int64_t)cfg.out_cvt_scale, cfg.out_cvt_shift);
+                if (scaled > 65535) scaled = 65535;
+                if (scaled < -65536) scaled = -65536;
+                int32_t result = (int32_t)scaled + cfg.out_cvt_offset;
+                if (result < -128) result = -128;
+                if (result > 127) result = 127;
+                expected[oy * out_w * 12 + ox * 12 + oc] = (int8_t)result;
+            }
+        }
+    }
+
+    return run_conv_test(fd, "test_mobilenet_op0", &cfg, input, weights, bias, expected);
+}
+
 int main(void)
 {
     printf("=== NPU Convolution Test Suite ===\n");
 
     int passed = 0;
-    int total = 8;
+    int total = 9;
 
     int (*tests[])(int) = {
         test_matmul_small, test_matmul_medium, test_conv3x3_stride2,
         test_depthwise3x3, test_bias_dma, test_bn_relu,
-        test_bs_ow_op, test_bs_ow_op_18,
+        test_bs_ow_op, test_bs_ow_op_18, test_mobilenet_op0,
     };
 
     /* Detect driver type with a probe open */
