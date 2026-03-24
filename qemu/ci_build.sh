@@ -101,21 +101,18 @@ rm -rf "$KERN_DIR"
 echo ""
 echo "=== Step 3: Download busybox ==="
 if [ ! -f "$BOOT/busybox" ]; then
-    echo "Downloading aarch64 busybox..."
-    # Download from Ubuntu ports pool (busybox package, not busybox-static)
-    BBURL="http://ports.ubuntu.com/pool/universe/b/busybox"
-    BBDEB=$(wget -q -O- "$BBURL/" | grep -oP 'href="\Kbusybox_[^"]*arm64[^"]*\.deb' | sort -V | tail -1)
-    if [ -n "$BBDEB" ]; then
-        wget -q "$BBURL/$BBDEB" -O /tmp/busybox.deb
-        dpkg-deb -x /tmp/busybox.deb /tmp/bb
-        cp /tmp/bb/bin/busybox "$BOOT/busybox"
-        rm -rf /tmp/bb /tmp/busybox.deb
-    else
-        echo "ERROR: Could not find aarch64 busybox in Ubuntu pool"
-        exit 1
-    fi
-    chmod +x "$BOOT/busybox"
-    echo "busybox: $(file "$BOOT/busybox" | grep -o 'ARM.*')"
+    echo "Building aarch64 busybox (static)..."
+    BBVER="1.36.1"
+    wget -q "https://busybox.net/downloads/busybox-${BBVER}.tar.bz2" -O /tmp/busybox.tar.bz2
+    tar xjf /tmp/busybox.tar.bz2 -C /tmp
+    cd "/tmp/busybox-${BBVER}"
+    make CROSS_COMPILE=${CROSS} defconfig >/dev/null 2>&1
+    sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+    make CROSS_COMPILE=${CROSS} -j$(nproc) busybox >/dev/null 2>&1
+    cp busybox "$BOOT/busybox"
+    cd "$REPO_ROOT"
+    rm -rf "/tmp/busybox-${BBVER}" /tmp/busybox.tar.bz2
+    echo "busybox: $(file "$BOOT/busybox" | grep -o 'ARM.*linked')"
 fi
 
 echo ""
