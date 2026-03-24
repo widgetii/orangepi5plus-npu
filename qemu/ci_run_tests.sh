@@ -93,8 +93,8 @@ fi
 # Check conv tests
 if grep -q "CONV TESTS:" "$LOG"; then
     CONV_RESULT=$(grep "CONV TESTS:" "$LOG" | tail -1)
-    if echo "$CONV_RESULT" | grep -q "6/6 passed"; then
-        echo "PASS: Conv tests (6/6)"
+    if echo "$CONV_RESULT" | grep -q "8/8 passed"; then
+        echo "PASS: Conv tests (8/8)"
     else
         echo "FAIL: Conv tests — $CONV_RESULT"
         FAILED=1

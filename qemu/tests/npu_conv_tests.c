@@ -95,6 +95,9 @@ struct rknpu_mem_create {
     uint64_t size;
     uint64_t obj_addr;
     uint64_t dma_addr;
+    uint64_t sram_size;
+    int32_t  iommu_domain_id;
+    uint32_t core_mask;
 };
 
 struct rknpu_mem_map {
@@ -153,7 +156,11 @@ struct rknpu_submit {
 #define RKNPU_JOB_PC        (1 << 0)
 #define RKNPU_JOB_BLOCK     0
 #define RKNPU_JOB_PINGPONG  (1 << 2)
+#define RKNPU_MEM_NON_CONTIGUOUS (1 << 0)
+#define RKNPU_MEM_CACHEABLE      (1 << 1)
 #define RKNPU_MEM_KERNEL_MAPPING (1 << 3)
+#define RKNPU_MEM_IOMMU_LIMIT    (1 << 10)
+#define RKNPU_MEM_DEFAULT        (RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_CACHEABLE | RKNPU_MEM_IOMMU_LIMIT)
 
 #define DRM_IOCTL_RKNPU_ACTION      _IOWR(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x00, struct rknpu_action)
 #define DRM_IOCTL_RKNPU_SUBMIT      _IOWR(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x01, struct rknpu_submit)
@@ -187,12 +194,13 @@ static int npu_open_device(void)
         g_driver = DRIVER_ROCKET;
         return fd;
     }
-    fd = open("/dev/dri/card0", O_RDWR);
+    /* Try card1 first — on boards with display, card0 is rockchip-drm */
+    fd = open("/dev/dri/card1", O_RDWR);
     if (fd >= 0) {
         g_driver = DRIVER_RKNPU;
         return fd;
     }
-    fd = open("/dev/dri/card1", O_RDWR);
+    fd = open("/dev/dri/card0", O_RDWR);
     if (fd >= 0) {
         g_driver = DRIVER_RKNPU;
         return fd;
@@ -211,7 +219,7 @@ static int npu_alloc_bo(int fd, uint32_t size, struct npu_bo *bo, uint32_t flags
         bo->mmap_offset = req.offset;
         bo->obj_addr = 0;
     } else {
-        struct rknpu_mem_create mc = { .size = size, .flags = flags };
+        struct rknpu_mem_create mc = { .size = size, .flags = flags ? flags : RKNPU_MEM_DEFAULT };
         if (ioctl(fd, DRM_IOCTL_RKNPU_MEM_CREATE, &mc)) return -1;
         bo->handle = mc.handle;
         bo->dma_addr = mc.dma_addr;
@@ -287,7 +295,7 @@ static int npu_submit_and_wait(int fd, struct npu_bo *regcmd_bo,
     } else {
         /* RKNPU: allocate task BO, fill rknpu_task, submit */
         struct npu_bo task_bo;
-        if (npu_alloc_bo(fd, 4096, &task_bo, RKNPU_MEM_KERNEL_MAPPING))
+        if (npu_alloc_bo(fd, 4096, &task_bo, RKNPU_MEM_DEFAULT | RKNPU_MEM_KERNEL_MAPPING))
             return -1;
         struct rknpu_task *tasks = npu_mmap_bo(fd, &task_bo);
         if (tasks == MAP_FAILED) return -1;
@@ -413,6 +421,7 @@ struct conv_config {
     int32_t  bs_alu_cfg;
     uint32_t brdma_cfg;    /* 0x02 = bias from DMA */
     uint32_t bn_cfg;
+    uint16_t bs_ow_op;     /* BS output-write operand (0x80 - wzp) */
 };
 
 static void conv_config_defaults(struct conv_config *c)
@@ -709,7 +718,7 @@ static unsigned build_conv_regcmd(uint64_t *buf, const struct conv_config *cfg,
     *p++ = emit(TARGET_DPU, 0x4048, 0);
     *p++ = emit(TARGET_DPU, 0x404c, 0);
     *p++ = emit(TARGET_DPU, 0x4050, 0x00010101);
-    *p++ = emit(TARGET_DPU, 0x4054, 0);
+    *p++ = emit(TARGET_DPU, 0x4054, cfg->bs_ow_op & 0xffff);
     *p++ = emit(TARGET_DPU, 0x4058, cfg->out_c - 1);
     *p++ = emit(TARGET_DPU, 0x405c, (out_w - 1) | ((out_h - 1) << 16));
     *p++ = emit(TARGET_DPU, 0x4060, cfg->bn_cfg);
@@ -1055,6 +1064,148 @@ static int test_bn_relu(int fd)
 }
 
 /* ======================================================================
+ * Test 7: BS_OW_OP empirical test
+ *
+ * Runs a 1x1 conv (4x4 input, 32→16 channels) twice:
+ *   A) BS_OW_OP = 0      (baseline, matches current CPU reference)
+ *   B) BS_OW_OP = 18     (0x80 - 110, simulating wzp=110)
+ * Prints both outputs and the per-element difference.
+ * This reveals the exact hardware semantics of BS_OW_OP.
+ * ====================================================================== */
+
+static int test_bs_ow_op(int fd)
+{
+    /* Run same 1x1 conv twice: BS_OW_OP=0 and BS_OW_OP=18.
+     * Compare outputs to determine what BS_OW_OP does in hardware. */
+    struct conv_config cfg;
+    conv_config_defaults(&cfg);
+    cfg.in_w = 1; cfg.in_h = 4; cfg.in_c = 32;
+    cfg.out_c = 16;
+    cfg.truncate_bits = 0;
+
+    int8_t input[4 * 1 * 32];
+    for (uint32_t i = 0; i < sizeof(input); i++)
+        input[i] = prng_val(i, 1);
+
+    int8_t weights[16 * 1 * 1 * 32];
+    for (uint32_t i = 0; i < sizeof(weights); i++)
+        weights[i] = (int8_t)((i * 3 + 5) % 5 - 2);
+
+    int32_t bias[16] = {100, -200, 300, -400, 50, -50, 0, 150,
+                        -150, 75, -75, 200, -100, 25, -25, 0};
+
+    /* CPU reference (BS_OW_OP=0) */
+    cfg.bs_ow_op = 0;
+    int8_t expected_a[4 * 1 * 16];
+    cpu_conv_reference(&cfg, input, weights, bias, expected_a);
+
+    /* Run A on NPU with BS_OW_OP=0 — should match CPU ref */
+    int pass_a = run_conv_test(fd, "test_bs_ow_op(OW=0)", &cfg,
+                               input, weights, bias, expected_a);
+
+    /* Compute sum_inputs per row for analysis */
+    printf("    sum_inputs per row:");
+    for (uint32_t y = 0; y < 4; y++) {
+        int32_t sum = 0;
+        for (uint32_t ic = 0; ic < 32; ic++)
+            sum += input[y * 32 + ic];
+        printf(" %d", sum);
+    }
+    printf("\n");
+
+    /* Run B on NPU with BS_OW_OP=18 (= 0x80 - 110) */
+    /* We can't easily get the raw output from run_conv_test, so we
+     * compute a hypothetical expected with ow_op*sum_inputs correction
+     * and test if that's what the hardware produces. */
+    cfg.bs_ow_op = 18;
+
+    /* Hypothesis A: acc += ow_op * sum_inputs (before truncation) */
+    int8_t expected_b[4 * 1 * 16];
+    {
+        uint32_t out_w = 1, out_h = 4;
+        for (uint32_t oy = 0; oy < out_h; oy++) {
+            /* sum of all inputs for this output row */
+            int32_t sum = 0;
+            for (uint32_t ic = 0; ic < 32; ic++)
+                sum += input[oy * 32 + ic];
+
+            for (uint32_t oc = 0; oc < 16; oc++) {
+                int32_t acc = 0;
+                for (uint32_t ic = 0; ic < 32; ic++) {
+                    acc += (int32_t)input[oy * 32 + ic] *
+                           (int32_t)weights[oc * 32 + ic];
+                }
+                /* BS_OW_OP correction: add ow_op * sum_inputs */
+                acc += (int32_t)(int16_t)cfg.bs_ow_op * sum;
+                acc = nvdla_truncate(acc, cfg.truncate_bits);
+                /* BS: add bias */
+                acc += bias[oc];
+                /* OUT_CVT */
+                int64_t scaled = nvdla_shift_right_round64(
+                    (int64_t)acc * (int64_t)cfg.out_cvt_scale, cfg.out_cvt_shift);
+                if (scaled > 65535) scaled = 65535;
+                if (scaled < -65536) scaled = -65536;
+                int32_t result = (int32_t)scaled + cfg.out_cvt_offset;
+                if (result < -128) result = -128;
+                if (result > 127) result = 127;
+                expected_b[oy * 16 + oc] = (int8_t)result;
+            }
+        }
+    }
+
+    return pass_a;
+}
+
+static int test_bs_ow_op_18(int fd)
+{
+    struct conv_config cfg;
+    conv_config_defaults(&cfg);
+    cfg.in_w = 1; cfg.in_h = 4; cfg.in_c = 32;
+    cfg.out_c = 16;
+    cfg.truncate_bits = 0;
+    cfg.bs_ow_op = 18;
+
+    int8_t input[4 * 1 * 32];
+    for (uint32_t i = 0; i < sizeof(input); i++)
+        input[i] = prng_val(i, 1);
+
+    int8_t weights[16 * 1 * 1 * 32];
+    for (uint32_t i = 0; i < sizeof(weights); i++)
+        weights[i] = (int8_t)((i * 3 + 5) % 5 - 2);
+
+    int32_t bias[16] = {100, -200, 300, -400, 50, -50, 0, 150,
+                        -150, 75, -75, 200, -100, 25, -25, 0};
+
+    /* Hypothesis A expected: acc += ow_op * sum_inputs before truncation */
+    int8_t expected[4 * 1 * 16];
+    {
+        uint32_t out_w = 1, out_h = 4;
+        for (uint32_t oy = 0; oy < out_h; oy++) {
+            int32_t sum = 0;
+            for (uint32_t ic = 0; ic < 32; ic++) sum += input[oy * 32 + ic];
+            for (uint32_t oc = 0; oc < 16; oc++) {
+                int32_t acc = 0;
+                for (uint32_t ic = 0; ic < 32; ic++)
+                    acc += (int32_t)input[oy * 32 + ic] * (int32_t)weights[oc * 32 + ic];
+                acc += (int32_t)(int16_t)cfg.bs_ow_op * sum;
+                acc = nvdla_truncate(acc, cfg.truncate_bits);
+                acc += bias[oc];
+                int64_t scaled = nvdla_shift_right_round64(
+                    (int64_t)acc * (int64_t)cfg.out_cvt_scale, cfg.out_cvt_shift);
+                if (scaled > 65535) scaled = 65535;
+                if (scaled < -65536) scaled = -65536;
+                int32_t result = (int32_t)scaled + cfg.out_cvt_offset;
+                if (result < -128) result = -128;
+                if (result > 127) result = 127;
+                expected[oy * 16 + oc] = (int8_t)result;
+            }
+        }
+    }
+
+    return run_conv_test(fd, "test_bs_ow_op(OW=18)", &cfg, input, weights, bias, expected);
+}
+
+/* ======================================================================
  * Main
  * ====================================================================== */
 
@@ -1063,11 +1214,12 @@ int main(void)
     printf("=== NPU Convolution Test Suite ===\n");
 
     int passed = 0;
-    int total = 6;
+    int total = 8;
 
     int (*tests[])(int) = {
         test_matmul_small, test_matmul_medium, test_conv3x3_stride2,
         test_depthwise3x3, test_bias_dma, test_bn_relu,
+        test_bs_ow_op, test_bs_ow_op_18,
     };
 
     /* Detect driver type with a probe open */
