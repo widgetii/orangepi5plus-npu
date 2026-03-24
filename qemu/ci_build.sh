@@ -150,7 +150,7 @@ if [ ! -f "$MODEL" ]; then
     echo "Downloading MobileNetV1 INT8 model..."
     wget -q "https://storage.googleapis.com/download.tensorflow.org/models/mobilenet_v1_2018_08_02/mobilenet_v1_1.0_224_quant.tgz" \
          -O /tmp/mobilenet.tgz
-    tar xzf /tmp/mobilenet.tgz -C /tmp mobilenet_v1_1.0_224_quant.tflite
+    tar xzf /tmp/mobilenet.tgz -C /tmp ./mobilenet_v1_1.0_224_quant.tflite
     mv /tmp/mobilenet_v1_1.0_224_quant.tflite "$MODEL"
     rm /tmp/mobilenet.tgz
     echo "Model: $(ls -lh "$MODEL" | awk '{print $5}')"
