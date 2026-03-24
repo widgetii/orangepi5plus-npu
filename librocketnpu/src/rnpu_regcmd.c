@@ -1399,12 +1399,8 @@ unsigned rnpu_fill_regcmd(const struct rnpu_model *model,
     * Only the initial tasks (before weight reuse kicks in) get the full
     * BRDMA regcmd. Continuation tasks (weight reuse) use standard regcmd
     * — matching RKNN's behavior where spatial splits have BS_CFG=0. */
-   if (rnpu_active_driver == RNPU_DRIVER_RKNPU && op->use_brdma_per_channel) {
-      if (task_num == 0 || !op->reuse_weights_cbuf)
-         return fill_brdma_per_channel_regcmd(model, op, dst, task_num);
-      else
-         return fill_standard_regcmd(model, op, dst, task_num);
-   }
+   if (rnpu_active_driver == RNPU_DRIVER_RKNPU && op->use_brdma_per_channel)
+      return fill_brdma_per_channel_regcmd(model, op, dst, task_num);
 
    /* For RKNPU per-channel ops (GS=1), use per-channel regcmd with
     * BN-stage bias addition. Standard regcmd doesn't work for GS=1 on RKNPU. */
