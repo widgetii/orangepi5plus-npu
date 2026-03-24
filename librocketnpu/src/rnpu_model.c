@@ -673,8 +673,7 @@ static void compile_regcmds(struct rnpu_model *m)
 
    /* Third pass: patch cross-operation chain pointers for RKNPU batching.
     * For consecutive per-channel ops (GS=1, same output_tensor), chain the
-    * last task of op[N] to the first task of op[N+1]. This enables the
-    * RKNPU driver to execute all tasks in one submit with PC task chaining. */
+    * last task of op[N] to the first task of op[N+1]. */
    if (rnpu_active_driver == RNPU_DRIVER_RKNPU) {
       for (unsigned i = 0; i + 1 < m->op_count; i++) {
          struct rnpu_operation *op = &m->ops[i];
@@ -829,7 +828,6 @@ static void build_execution_plan(struct rnpu_model *m)
          unsigned seg_jobs = 0;
          while (i < m->op_count && m->ops[i].type == RNPU_OP_CONV) {
             if (m->ops[i].use_brdma_per_channel) {
-               /* BRDMA: each task is its own job */
                seg_jobs += m->ops[i].task_count;
             } else if (seg->op_count == 0 || !can_merge_rknpu(m, i - 1)) {
                seg_jobs++;

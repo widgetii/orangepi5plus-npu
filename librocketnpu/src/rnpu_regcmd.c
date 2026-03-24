@@ -1304,8 +1304,10 @@ static unsigned fill_brdma_continuation_regcmd(const struct rnpu_model *model,
    emit_raw(&dst, CORE | 0x1, 0x3030, 0);
 
    /* DPU — matching RKNN's continuation task config exactly:
-    * BS_CFG=0x53 (BS fully bypassed), BN=0x53 (BN bypassed), EW=0x383 (EW bypassed)
-    * OUT_CVT with SCALE=1, SHIFT=0 (passthrough — hardware reuses first task's DPU state) */
+    * BS_CFG=0x0, BN_CFG=0x0, EW_CFG=0x0, OUT_CVT all zero, DFMT=0x0
+    * All DPU registers zeroed → hardware preserves sticky state from first task.
+    * Only spatial/output registers (DST_BASE_ADDR, dimensions, WDMA, SURFACE_ADD)
+    * are set per-tile. */
    uint32_t fmc = DPU_FEATURE_MODE_CFG_BURST_LEN(15) | DPU_FEATURE_MODE_CFG_OUTPUT_MODE(2);
    if (op->depthwise) fmc |= DPU_FEATURE_MODE_CFG_CONV_MODE(3);
    EMIT(REG_DPU_FEATURE_MODE_CFG, fmc);
@@ -1319,11 +1321,9 @@ static unsigned fill_brdma_continuation_regcmd(const struct rnpu_model *model,
    EMIT(REG_DPU_DATA_CUBE_WIDTH, DPU_DATA_CUBE_WIDTH_WIDTH(task->output_width - 1));
    EMIT(REG_DPU_DATA_CUBE_HEIGHT, DPU_DATA_CUBE_HEIGHT_HEIGHT(task->output_height - 1));
    EMIT(REG_DPU_DATA_CUBE_NOTCH_ADDR, 0);
-   EMIT(REG_DPU_DATA_CUBE_CHANNEL,
-        DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL(task->output_channels_real - 1) |
-        DPU_DATA_CUBE_CHANNEL_CHANNEL(task->output_channels - 1));
-   /* BS=0x53: bypass + ALU bypass + MUL bypass + ReLU bypass */
-   EMIT(REG_DPU_BS_CFG, 0x53);
+   EMIT(REG_DPU_DATA_CUBE_CHANNEL, 0);
+   /* BS_CFG=0x0: all zeroed — hardware preserves sticky DPU state */
+   EMIT(REG_DPU_BS_CFG, 0);
    EMIT(REG_DPU_BS_ALU_CFG, 0);
    EMIT(REG_DPU_BS_MUL_CFG, 0);
    EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0);
@@ -1334,20 +1334,18 @@ static unsigned fill_brdma_continuation_regcmd(const struct rnpu_model *model,
    EMIT(REG_DPU_WDMA_SIZE_0, DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_1, DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
                               DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
-   /* BN=0x53: fully bypassed */
-   EMIT(REG_DPU_BN_CFG, 0x53);
+   /* BN_CFG=0x0: zeroed — hardware preserves sticky state */
+   EMIT(REG_DPU_BN_CFG, 0);
    EMIT(REG_DPU_BN_ALU_CFG, 0);
    EMIT(REG_DPU_BN_MUL_CFG, 0);
    EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
-   /* EW=0x383: fully bypassed */
-   EMIT(REG_DPU_EW_CFG, DPU_EW_CFG_EW_RELU_BYPASS(1) | DPU_EW_CFG_EW_OP_CVT_BYPASS(1) |
-                         DPU_EW_CFG_EW_LUT_BYPASS(1) | DPU_EW_CFG_EW_OP_BYPASS(1) |
-                         DPU_EW_CFG_EW_BYPASS(1));
+   /* EW_CFG=0x0: zeroed */
+   EMIT(REG_DPU_EW_CFG, 0);
    EMIT(REG_DPU_EW_CVT_OFFSET_VALUE, 0);
-   EMIT(REG_DPU_EW_CVT_SCALE_VALUE, DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE(1));
+   EMIT(REG_DPU_EW_CVT_SCALE_VALUE, 0);
    EMIT(REG_DPU_EW_RELUX_CMP_VALUE, 0);
    EMIT(REG_DPU_OUT_CVT_OFFSET, 0);
-   EMIT(REG_DPU_OUT_CVT_SCALE, 1);
+   EMIT(REG_DPU_OUT_CVT_SCALE, 0);
    EMIT(REG_DPU_OUT_CVT_SHIFT, 0);
    EMIT(REG_DPU_EW_OP_VALUE_0, 0); EMIT(REG_DPU_EW_OP_VALUE_1, 0);
    EMIT(REG_DPU_EW_OP_VALUE_2, 0); EMIT(REG_DPU_EW_OP_VALUE_3, 0);
@@ -1362,10 +1360,10 @@ static unsigned fill_brdma_continuation_regcmd(const struct rnpu_model *model,
    EMIT(REG_DPU_LUT_LE_SLOPE_SCALE, 0); EMIT(REG_DPU_LUT_LE_SLOPE_SHIFT, 0);
    EMIT(REG_DPU_LUT_LO_SLOPE_SCALE, 0); EMIT(REG_DPU_LUT_LO_SLOPE_SHIFT, 0);
 
-   /* RDMA — all zeroed */
+   /* RDMA — all zeroed (matching RKNN: RDMA_CH=0, RDMA_WT=0) */
    EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH(task->output_width - 1));
    EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT(task->output_height - 1));
-   EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL(task->output_channels - 1));
+   EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 0);
    EMIT(REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0);
    EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, 0);
    EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR, 0);
@@ -1373,9 +1371,7 @@ static unsigned fill_brdma_continuation_regcmd(const struct rnpu_model *model,
    EMIT(REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,
         DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) |
         DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_DISABLE(1));
-   EMIT(REG_DPU_RDMA_RDMA_WEIGHT,
-        DPU_RDMA_RDMA_WEIGHT_E_WEIGHT(1) | DPU_RDMA_RDMA_WEIGHT_N_WEIGHT(1) |
-        DPU_RDMA_RDMA_WEIGHT_B_WEIGHT(1) | DPU_RDMA_RDMA_WEIGHT_M_WEIGHT(1));
+   EMIT(REG_DPU_RDMA_RDMA_WEIGHT, 0);
 
    EMIT(REG_PC_BASE_ADDRESS, 0);
    EMIT(REG_PC_REGISTER_AMOUNTS, 0);
