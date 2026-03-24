@@ -106,9 +106,13 @@ if [ ! -f "$BOOT/busybox" ]; then
     wget -q "https://busybox.net/downloads/busybox-${BBVER}.tar.bz2" -O /tmp/busybox.tar.bz2
     tar xjf /tmp/busybox.tar.bz2 -C /tmp
     cd "/tmp/busybox-${BBVER}"
-    make CROSS_COMPILE=${CROSS} defconfig >/dev/null 2>&1
+    make CROSS_COMPILE=${CROSS} defconfig >/dev/null
     sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
-    make CROSS_COMPILE=${CROSS} -j$(nproc) busybox >/dev/null 2>&1
+    # Disable features that need extra libs
+    sed -i 's/CONFIG_PAM=y/# CONFIG_PAM is not set/' .config
+    sed -i 's/CONFIG_FEATURE_HAVE_RPC=y/# CONFIG_FEATURE_HAVE_RPC is not set/' .config
+    sed -i 's/CONFIG_FEATURE_INETD_RPC=y/# CONFIG_FEATURE_INETD_RPC is not set/' .config
+    make CROSS_COMPILE=${CROSS} -j$(nproc) busybox 2>&1 | tail -5
     cp busybox "$BOOT/busybox"
     cd "$REPO_ROOT"
     rm -rf "/tmp/busybox-${BBVER}" /tmp/busybox.tar.bz2
