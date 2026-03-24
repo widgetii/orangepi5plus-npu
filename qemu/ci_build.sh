@@ -38,46 +38,43 @@ echo "=== Step 2: Download Armbian kernels ==="
 mkdir -p "$BOOT"
 KERN_DIR=$(mktemp -d)
 
-# Download kernel packages from Armbian
+# Download kernel packages from Armbian pool (direct wget, no apt multiarch needed)
+download_armbian_kernel() {
+    local PKG="$1" DESTDIR="$2"
+    # Scrape the package pool for the latest .deb URL
+    local POOL_URL="$ARMBIAN_REPO/pool/main/l/${PKG}"
+    local DEB_NAME
+    DEB_NAME=$(wget -q -O- "$POOL_URL/" 2>/dev/null | \
+               grep -oP "href=\"\K${PKG}_[^\"]+_arm64\.deb" | sort -V | tail -1)
+    if [ -z "$DEB_NAME" ]; then
+        echo "WARNING: Could not find $PKG in Armbian pool"
+        return 1
+    fi
+    echo "  Downloading $DEB_NAME..."
+    wget -q "$POOL_URL/$DEB_NAME" -O "/tmp/$DEB_NAME"
+    dpkg-deb -x "/tmp/$DEB_NAME" "$DESTDIR"
+    rm -f "/tmp/$DEB_NAME"
+}
+
 if [ ! -f "$BOOT/Image-6.18" ]; then
     echo "Downloading mainline kernel..."
-    # Add Armbian GPG key and download
-    wget -qO- "https://apt.armbian.com/armbian.key" | gpg --dearmor > /tmp/armbian.gpg
-    # Use apt-get download with explicit sources
-    cat > /tmp/armbian.list << EOF
-deb [signed-by=/tmp/armbian.gpg arch=arm64] $ARMBIAN_REPO $ARMBIAN_SUITE main
-EOF
-    apt-get -o Dir::Etc::SourceList=/tmp/armbian.list \
-            -o Dir::Etc::SourceParts=/dev/null \
-            update -qq 2>/dev/null || true
-    apt-get -o Dir::Etc::SourceList=/tmp/armbian.list \
-            -o Dir::Etc::SourceParts=/dev/null \
-            download -qq -o APT::Architecture=arm64 \
-            linux-image-current-rockchip64 2>/dev/null || {
-        echo "WARNING: Could not download mainline kernel from Armbian"
-        echo "Trying direct URL..."
-        # Fallback: check if we have the kernel locally
-    }
-    # Extract vmlinuz from .deb
-    DEB=$(ls linux-image-current-rockchip64*.deb 2>/dev/null | head -1)
-    if [ -n "$DEB" ]; then
-        dpkg-deb -x "$DEB" "$KERN_DIR/mainline"
+    if download_armbian_kernel "linux-image-current-rockchip64" "$KERN_DIR/mainline"; then
         cp "$KERN_DIR/mainline/boot/vmlinuz-"* "$BOOT/Image-6.18"
         echo "Mainline kernel: $(ls -lh "$BOOT/Image-6.18" | awk '{print $5}')"
+    else
+        echo "ERROR: Failed to download mainline kernel"
+        exit 1
     fi
 fi
 
 if [ ! -f "$BOOT/Image-vendor" ]; then
     echo "Downloading vendor kernel..."
-    apt-get -o Dir::Etc::SourceList=/tmp/armbian.list \
-            -o Dir::Etc::SourceParts=/dev/null \
-            download -qq -o APT::Architecture=arm64 \
-            linux-image-vendor-rk35xx 2>/dev/null || true
-    DEB=$(ls linux-image-vendor-rk35xx*.deb 2>/dev/null | head -1)
-    if [ -n "$DEB" ]; then
-        dpkg-deb -x "$DEB" "$KERN_DIR/vendor"
+    if download_armbian_kernel "linux-image-vendor-rk35xx" "$KERN_DIR/vendor"; then
         cp "$KERN_DIR/vendor/boot/vmlinuz-"* "$BOOT/Image-vendor"
         echo "Vendor kernel: $(ls -lh "$BOOT/Image-vendor" | awk '{print $5}')"
+    else
+        echo "ERROR: Failed to download vendor kernel"
+        exit 1
     fi
 fi
 
