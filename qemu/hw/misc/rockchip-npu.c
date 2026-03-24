@@ -431,6 +431,7 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
         for (uint32_t ox = 0; ox < out_w; ox++) {
             for (uint32_t oc = 0; oc < out_c; oc++) {
                 int32_t acc = 0;
+                int32_t sum_inputs = 0;
                 uint32_t ic_limit = depthwise ? 1 : in_c_real;
                 uint32_t ic_base = depthwise ? oc : 0;
 
@@ -468,8 +469,18 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                             }
 
                             acc += (int32_t)in_val * (int32_t)w_val;
+                            sum_inputs += (int32_t)in_val;
                         }
                     }
+                }
+
+                /* BS_OW_OP: weight zero-point compensation.
+                 * Weights are stored as (w - 0x80), but correct is (w - wzp).
+                 * Per output pixel, this introduces error = (wzp - 0x80) * sum(inputs).
+                 * BS_OW_OP = (0x80 - wzp) cancels it: acc += ow_op * sum_inputs. */
+                if (task->bs_ow_op) {
+                    int16_t ow_op = (int16_t)task->bs_ow_op;
+                    acc += (int32_t)ow_op * sum_inputs;
                 }
 
                 acc = nvdla_truncate(acc, task->truncate_bits);
