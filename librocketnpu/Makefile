@@ -20,9 +20,14 @@ SRCS = src/rnpu_drm.c \
 
 OBJS = $(SRCS:.c=.o)
 
+# ONNX parser (optional, needs libprotobuf-c)
+ONNX_SRCS = src/rnpu_onnx.c src/onnx.pb-c.c
+ONNX_OBJS = $(ONNX_SRCS:.c=.o)
+ONNX_LDFLAGS = -lprotobuf-c
+
 .PHONY: all clean test
 
-all: librocketnpu.so test_mobilenet test_yolo test_debug test_sw_ops test_rknpu_abi test_hybrid_regcmd
+all: librocketnpu.so test_mobilenet test_yolo test_debug test_sw_ops test_rknpu_abi test_hybrid_regcmd test_onnx_parse
 
 librocketnpu.so: $(OBJS)
 	$(CC) -shared -o $@ $^ $(LDFLAGS)
@@ -47,6 +52,9 @@ test_rknpu_abi: tests/test_rknpu_abi.c librocketnpu.so
 
 test_hybrid_regcmd: tests/test_hybrid_regcmd.c librocketnpu.so
 	$(CC) $(CFLAGS) -o $@ $< -L. -lrocketnpu -Wl,-rpath,'$$ORIGIN' $(LDFLAGS)
+
+test_onnx_parse: tests/test_onnx_parse.c $(ONNX_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(ONNX_LDFLAGS) -lm
 
 capture_rknn_golden: tests/capture_rknn_golden.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl -lm

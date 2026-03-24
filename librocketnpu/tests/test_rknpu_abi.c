@@ -246,9 +246,10 @@ static int test_regcmd_chain_area(void)
    ASSERT(reg3 == 0x0014,
           "PC_REGISTER_AMOUNTS reg should be 0x0014, got 0x%04x", reg3);
 
-   /* [count-4]: null chain pointer (last task → no chain) → raw 0x0 */
-   ASSERT(buf[count - 4] == 0x0,
-          "last task chain pointer should be 0x0, got 0x%016llx",
+   /* [count-4]: chain pointer — EMIT(PC_BASE_ADDRESS, 0) for last task.
+    * PC_BASE_ADDRESS=0x0010, target=0x0101, value=0 → 0x0101000000000010 */
+   ASSERT(buf[count - 4] == 0x0101000000000010ULL,
+          "last task chain pointer should be EMIT(PC_BASE_ADDRESS,0)=0x0101000000000010, got 0x%016llx",
           (unsigned long long)buf[count - 4]);
 
    return 0;

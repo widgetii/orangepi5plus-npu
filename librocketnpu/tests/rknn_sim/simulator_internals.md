@@ -347,21 +347,17 @@ differ from our separate-operation approach.
 
 **Priority**: LOW — likely not the main source of divergence for QAT model.
 
-### Action 8: Fix Output 2 (20x20) Being All -128
+### Action 8: Fix Output 2 (20x20) Being All -128 — ALREADY FIXED
 
-**Goal**: Fix the hard bug where librocketnpu Output 2 is constant -128.
+**Status**: Bug no longer exists. Fixed in a prior commit (BRDMA/per-channel changes).
 
-This is a separate bug from quantization accuracy — likely a spatial dimension or
-channel count issue in the last YOLO head. The 20x20 head processes the smallest
-spatial size with the most channels.
+Fresh board run (vendor kernel, same input as RKNN):
+```
+Output 2 uint8: unique=89 range=[5,251] mean=132.9
+```
 
-Debugging approach:
-1. Check if the output tensor dimensions match expectations (1x255x20x20)
-2. Verify the last conv feeding this head produces non-constant values
-3. Check for off-by-one in spatial split or channel offset for small feature maps
-
-**Priority**: HIGHEST — this is a correctness bug, not a precision issue. Fix first
-before worrying about quantization accuracy.
+The `yolo_output_2.bin` in `rknn_sim/` was stale data from before the fix.
+Replaced with fresh outputs from board.
 
 
 ## Key Files Reference

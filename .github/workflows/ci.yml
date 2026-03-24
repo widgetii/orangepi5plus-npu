@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'librocketnpu/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'librocketnpu/**'
+      - '.github/workflows/ci.yml'
+
+defaults:
+  run:
+    working-directory: librocketnpu
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdrm-dev libprotobuf-c-dev
+
+      - name: Build library
+        run: make librocketnpu.so
+
+      - name: Build tests
+        run: make test_sw_ops test_rknpu_abi test_onnx_parse
+
+      - name: Run sw_ops tests
+        run: LD_LIBRARY_PATH=. ./test_sw_ops
+
+      - name: Run rknpu_abi tests
+        run: LD_LIBRARY_PATH=. ./test_rknpu_abi
+
+  cross-compile-aarch64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libdrm-dev
+
+      - name: Cross-compile object files for aarch64
+        run: |
+          for f in src/rnpu_drm.c src/rnpu_tflite.c src/rnpu_coefs.c src/rnpu_task.c \
+                   src/rnpu_regcmd.c src/rnpu_convert.c src/rnpu_sw_ops.c src/rnpu_rknn.c \
+                   src/rnpu_model.c; do
+            aarch64-linux-gnu-gcc -O2 -Wall -Wno-unused-function \
+              -Isrc -Iinclude -march=armv8-a -fPIC -c -o /dev/null "$f"
+          done

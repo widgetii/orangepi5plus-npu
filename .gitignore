@@ -1,1 +1,42 @@
 images/
+
+# Build artifacts
+*.o
+*.so
+*.ko
+*.a
+librocketnpu/test_*
+!librocketnpu/tests/
+librocketnpu/capture_rknn_golden
+
+# Large binary files — not suitable for git
+*.bin
+*.onnx
+*.rknn
+*.tflite
+*.gz
+*.tar
+*.tar.gz
+
+# QEMU boot/src directories (large binaries, kernel images)
+qemu-boot/
+qemu-src/
+qemu/hw/misc/*.bak
+
+# Static test binaries
+librocketnpu/test_mobilenet_static
+
+# RKNN sim intermediate data
+librocketnpu/tests/rknn_sim/per_layer_ref/
+librocketnpu/tests/rknn_sim/op_dump/
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
