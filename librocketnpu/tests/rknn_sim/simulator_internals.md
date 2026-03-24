@@ -270,24 +270,18 @@ dequant_tensor(int8_tensor, params, 'float32', 'int8')  # returns float32
 
 **Priority**: HIGH — rounding differences cause ~1 LSB error per layer, accumulating.
 
-### Action 4: Use accuracy_analysis for Automated Per-Layer Comparison
+### Action 4: Use accuracy_analysis for Automated Per-Layer Comparison — NOT VIABLE
 
-**Goal**: Get RKNN's own per-layer FP32 vs quantized comparison.
+**Status**: NOT VIABLE. `accuracy_analysis` requires hardware target for QAT models.
 
-```python
-rknn = RKNN()
-rknn.config(target_platform='rk3588', optimization_level=2)
-rknn.load_tflite('yolov5s_relu_int8.tflite')
-rknn.build(do_quantization=False)  # QAT model, no re-quantization
-
-# This saves per-layer snapshots to disk
-rknn.accuracy_analysis(inputs=['input0.bin'], target=None)
+```
+E accuracy_analysis: The QAT model need set 'target'!
 ```
 
-Note: Failed previously with QAT models — retry with `optimization_level=2`
-(RKNN warned: "QAT model with optimization_level=3 may affect accuracy").
+Tested with `optimization_level=2` — same result. Returns -1.
+Requires `target='rk3588'` (actual hardware), not available in Docker simulator.
 
-**Priority**: MEDIUM — automated but may not work for QAT models.
+Use `per_layer_reference.py` (Action 2) for per-layer comparison instead.
 
 ### Action 5: Test optimization_level=2
 
