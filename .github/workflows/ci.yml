@@ -56,3 +56,15 @@ jobs:
             aarch64-linux-gnu-gcc -O2 -Wall -Wno-unused-function \
               -Isrc -Iinclude -march=armv8-a -fPIC -c -o /dev/null "$f"
           done
+
+  hw-test:
+    # Hardware tests on Orange Pi 5 Plus — only on push (not PRs from forks)
+    if: github.event_name == 'push'
+    needs: build-and-test
+    runs-on: [self-hosted, orangepi5plus]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run hardware smoke tests
+        run: bash tests/ci_hw_smoke.sh
