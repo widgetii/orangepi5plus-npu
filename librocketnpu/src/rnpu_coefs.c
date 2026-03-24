@@ -171,8 +171,7 @@ static int32_t calc_bias_correction(const struct rnpu_tfl_model *tfl,
       for (unsigned x = 0; x < ww; x++)
          for (unsigned y = 0; y < wh; y++) {
             unsigned flat = x * wh * ic + y * ic + oc;
-            int32_t wd = (int32_t)(int8_t)w[flat] - (int32_t)(int8_t)wzp;
-            corr += wd * (izp - 0x80);
+            corr += (w[flat] - wzp) * (izp - 0x80);
          }
    } else {
       for (unsigned x = 0; x < ww; x++)
