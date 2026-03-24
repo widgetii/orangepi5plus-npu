@@ -27,11 +27,7 @@ echo "Running conv test suite..."
 echo "Conv tests exit code: $?"
 
 echo "Running MobileNetV1..."
-if [ -f /input.bin ]; then
-    /bin/test_mobilenet /model.tflite 1 /golden.bin /input.bin 653
-else
-    /bin/test_mobilenet /model.tflite 1 /golden.bin
-fi
+/bin/test_mobilenet /model.tflite 1 /golden.bin
 echo "MobileNetV1 exit code: $?"
 
 echo "--- QEMU NPU TEST COMPLETE ---"
