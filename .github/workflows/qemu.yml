@@ -1,0 +1,43 @@
+name: QEMU NPU Tests
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'qemu/**'
+      - 'librocketnpu/**'
+      - '.github/workflows/qemu.yml'
+  pull_request:
+    paths:
+      - 'qemu/**'
+      - 'librocketnpu/**'
+      - '.github/workflows/qemu.yml'
+
+jobs:
+  qemu-npu-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache QEMU build
+        uses: actions/cache@v4
+        with:
+          path: qemu-src
+          key: qemu-build-${{ hashFiles('qemu/setup.sh', 'qemu/hw/**', 'qemu/include/**') }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build \
+            libglib2.0-dev libfdt-dev libpixman-1-dev \
+            gcc-aarch64-linux-gnu libdrm-dev wget cpio
+
+      - name: Build QEMU and test artifacts
+        run: bash qemu/ci_build.sh
+
+      - name: Run Rocket kernel NPU tests
+        run: bash qemu/ci_run_tests.sh rocket
+
+      - name: Run vendor kernel RKNPU tests
+        run: bash qemu/ci_run_tests.sh vendor

@@ -1,0 +1,231 @@
+#!/bin/bash
+# Build everything needed for QEMU NPU tests from source.
+# Runs on ubuntu-24.04 CI runner with aarch64 cross-compiler.
+#
+# Produces:
+#   qemu-src/build/qemu-system-aarch64  (QEMU binary)
+#   qemu-boot/Image-6.18               (mainline kernel)
+#   qemu-boot/Image-vendor              (vendor kernel)
+#   qemu-boot/initrd.gz                 (Rocket initrd)
+#   qemu-boot/initrd-vendor.gz          (RKNPU initrd)
+#
+# Prerequisites (installed by CI):
+#   build-essential ninja-build libglib2.0-dev libfdt-dev libpixman-1-dev
+#   gcc-aarch64-linux-gnu libdrm-dev wget cpio
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+CROSS=aarch64-linux-gnu-
+BOOT="$REPO_ROOT/qemu-boot"
+ARMBIAN_REPO="http://apt.armbian.com"
+ARMBIAN_SUITE="noble"
+
+echo "=== Step 1: Build QEMU ==="
+if [ -x qemu-src/build/qemu-system-aarch64 ]; then
+    echo "QEMU binary found (cached), re-copying NPU sources..."
+    # Re-copy our sources in case they changed (cache key should prevent this,
+    # but setup.sh handles it gracefully)
+    bash qemu/setup.sh 2>&1 | tail -5
+else
+    bash qemu/setup.sh
+fi
+echo "QEMU: $(qemu-src/build/qemu-system-aarch64 --version | head -1)"
+
+echo ""
+echo "=== Step 2: Download Armbian kernels ==="
+mkdir -p "$BOOT"
+KERN_DIR=$(mktemp -d)
+
+# Download kernel packages from Armbian
+if [ ! -f "$BOOT/Image-6.18" ]; then
+    echo "Downloading mainline kernel..."
+    # Add Armbian GPG key and download
+    wget -qO- "https://apt.armbian.com/armbian.key" | gpg --dearmor > /tmp/armbian.gpg
+    # Use apt-get download with explicit sources
+    cat > /tmp/armbian.list << EOF
+deb [signed-by=/tmp/armbian.gpg arch=arm64] $ARMBIAN_REPO $ARMBIAN_SUITE main
+EOF
+    apt-get -o Dir::Etc::SourceList=/tmp/armbian.list \
+            -o Dir::Etc::SourceParts=/dev/null \
+            update -qq 2>/dev/null || true
+    apt-get -o Dir::Etc::SourceList=/tmp/armbian.list \
+            -o Dir::Etc::SourceParts=/dev/null \
+            download -qq -o APT::Architecture=arm64 \
+            linux-image-current-rockchip64 2>/dev/null || {
+        echo "WARNING: Could not download mainline kernel from Armbian"
+        echo "Trying direct URL..."
+        # Fallback: check if we have the kernel locally
+    }
+    # Extract vmlinuz from .deb
+    DEB=$(ls linux-image-current-rockchip64*.deb 2>/dev/null | head -1)
+    if [ -n "$DEB" ]; then
+        dpkg-deb -x "$DEB" "$KERN_DIR/mainline"
+        cp "$KERN_DIR/mainline/boot/vmlinuz-"* "$BOOT/Image-6.18"
+        echo "Mainline kernel: $(ls -lh "$BOOT/Image-6.18" | awk '{print $5}')"
+    fi
+fi
+
+if [ ! -f "$BOOT/Image-vendor" ]; then
+    echo "Downloading vendor kernel..."
+    apt-get -o Dir::Etc::SourceList=/tmp/armbian.list \
+            -o Dir::Etc::SourceParts=/dev/null \
+            download -qq -o APT::Architecture=arm64 \
+            linux-image-vendor-rk35xx 2>/dev/null || true
+    DEB=$(ls linux-image-vendor-rk35xx*.deb 2>/dev/null | head -1)
+    if [ -n "$DEB" ]; then
+        dpkg-deb -x "$DEB" "$KERN_DIR/vendor"
+        cp "$KERN_DIR/vendor/boot/vmlinuz-"* "$BOOT/Image-vendor"
+        echo "Vendor kernel: $(ls -lh "$BOOT/Image-vendor" | awk '{print $5}')"
+    fi
+fi
+
+# Extract kernel modules (Rocket driver from mainline)
+if [ -d "$KERN_DIR/mainline" ]; then
+    MODDIR=$(find "$KERN_DIR/mainline/lib/modules" -maxdepth 1 -mindepth 1 -type d | head -1)
+    if [ -n "$MODDIR" ]; then
+        echo "Extracting kernel modules from $MODDIR..."
+        mkdir -p "$BOOT/modules"
+        for mod in rocket.ko drm_shmem_helper.ko gpu-sched.ko; do
+            found=$(find "$MODDIR" -name "$mod" | head -1)
+            if [ -n "$found" ]; then
+                cp "$found" "$BOOT/modules/"
+                echo "  $mod: $(ls -lh "$BOOT/modules/$mod" | awk '{print $5}')"
+            else
+                echo "  WARNING: $mod not found"
+            fi
+        done
+    fi
+fi
+rm -rf "$KERN_DIR"
+
+echo ""
+echo "=== Step 3: Download busybox ==="
+if [ ! -f "$BOOT/busybox" ]; then
+    wget -q "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox" \
+         -O /tmp/busybox_x86 || true
+    # We need aarch64 busybox — use a known static build
+    wget -q "https://busybox.net/downloads/binaries/1.35.0-aarch64-linux-musl/busybox" \
+         -O "$BOOT/busybox" || {
+        echo "WARNING: Could not download aarch64 busybox, trying alternative..."
+        # Build from source as fallback
+        apt-get download busybox-static 2>/dev/null || true
+        DEB=$(ls busybox-static*.deb 2>/dev/null | head -1)
+        if [ -n "$DEB" ]; then
+            dpkg-deb -x "$DEB" /tmp/bb
+            cp /tmp/bb/bin/busybox "$BOOT/busybox"
+        fi
+    }
+    chmod +x "$BOOT/busybox"
+fi
+
+echo ""
+echo "=== Step 4: Cross-compile test binaries ==="
+
+# npu_test
+${CROSS}gcc -static -O2 -o "$BOOT/npu_test" qemu/tests/npu_test.c -lm
+echo "npu_test: $(file "$BOOT/npu_test" | grep -o 'ARM aarch64.*linked')"
+
+# npu_conv_tests
+${CROSS}gcc -static -O2 -o "$BOOT/npu_conv_tests" qemu/tests/npu_conv_tests.c -lm
+echo "npu_conv_tests: $(file "$BOOT/npu_conv_tests" | grep -o 'ARM aarch64.*linked')"
+
+# test_mobilenet — needs librocketnpu compiled as .a
+echo "Building librocketnpu (aarch64 static)..."
+LIBSRC="librocketnpu/src"
+OBJDIR=$(mktemp -d)
+for f in rnpu_drm.c rnpu_tflite.c rnpu_coefs.c rnpu_task.c rnpu_regcmd.c \
+         rnpu_convert.c rnpu_sw_ops.c rnpu_rknn.c rnpu_model.c; do
+    ${CROSS}gcc -O2 -Wall -Wno-unused-function \
+        -I"$LIBSRC" -Ilibrocketnpu/include -march=armv8-a \
+        -fPIC -c -o "$OBJDIR/$(basename "$f" .c).o" "$LIBSRC/$f"
+done
+${CROSS}ar rcs "$OBJDIR/librocketnpu.a" "$OBJDIR"/*.o
+echo "librocketnpu.a: $(ls -lh "$OBJDIR/librocketnpu.a" | awk '{print $5}')"
+
+${CROSS}gcc -static -O2 -Ilibrocketnpu/include -Ilibrocketnpu/src \
+    -o "$BOOT/test_mobilenet" librocketnpu/tests/test_mobilenet.c \
+    "$OBJDIR/librocketnpu.a" -lm
+echo "test_mobilenet: $(file "$BOOT/test_mobilenet" | grep -o 'ARM aarch64.*linked')"
+rm -rf "$OBJDIR"
+
+echo ""
+echo "=== Step 5: Pack initrds ==="
+
+# Download MobileNetV1 INT8 model (public TFLite model)
+MODEL="$BOOT/mobilenet_v1.tflite"
+if [ ! -f "$MODEL" ]; then
+    echo "Downloading MobileNetV1 INT8 model..."
+    wget -q "https://storage.googleapis.com/download.tensorflow.org/models/mobilenet_v1_2018_08_02/mobilenet_v1_1.0_224_quant.tgz" \
+         -O /tmp/mobilenet.tgz
+    tar xzf /tmp/mobilenet.tgz -C /tmp mobilenet_v1_1.0_224_quant.tflite
+    mv /tmp/mobilenet_v1_1.0_224_quant.tflite "$MODEL"
+    rm /tmp/mobilenet.tgz
+    echo "Model: $(ls -lh "$MODEL" | awk '{print $5}')"
+fi
+GOLDEN="$BOOT/golden_mobilenet_output.bin"
+
+# Pack Rocket initrd
+echo "Packing Rocket initrd..."
+ROOTFS=$(mktemp -d)
+mkdir -p "$ROOTFS"/{bin,lib/modules,dev,proc,sys,tmp}
+
+# Busybox + symlinks
+cp "$BOOT/busybox" "$ROOTFS/bin/busybox"
+for cmd in sh cat ls mount insmod sleep ln dmesg mknod; do
+    ln -sf busybox "$ROOTFS/bin/$cmd"
+done
+
+# Test binaries
+cp "$BOOT/npu_test" "$ROOTFS/bin/"
+cp "$BOOT/npu_conv_tests" "$ROOTFS/bin/"
+cp "$BOOT/test_mobilenet" "$ROOTFS/bin/"
+
+# Kernel modules
+if [ -d "$BOOT/modules" ]; then
+    cp "$BOOT/modules/"*.ko "$ROOTFS/lib/modules/" 2>/dev/null || true
+fi
+
+# Model + golden
+if [ -f "$MODEL" ]; then
+    cp "$MODEL" "$ROOTFS/model.tflite"
+fi
+if [ -f "$GOLDEN" ]; then
+    cp "$GOLDEN" "$ROOTFS/golden.bin"
+fi
+
+# Init script (from git)
+cp "$BOOT/rootfs/init" "$ROOTFS/init"
+chmod +x "$ROOTFS/init"
+
+(cd "$ROOTFS" && find . | cpio -o -H newc 2>/dev/null | gzip > "$BOOT/initrd.gz")
+echo "initrd.gz: $(ls -lh "$BOOT/initrd.gz" | awk '{print $5}')"
+
+# Pack vendor initrd
+echo "Packing vendor initrd..."
+ROOTFS_V=$(mktemp -d)
+mkdir -p "$ROOTFS_V"/{bin,lib/modules,dev,proc,sys,tmp}
+
+cp "$BOOT/busybox" "$ROOTFS_V/bin/busybox"
+for cmd in sh cat ls mount insmod sleep ln dmesg mknod grep head; do
+    ln -sf busybox "$ROOTFS_V/bin/$cmd"
+done
+
+cp "$BOOT/npu_conv_tests" "$ROOTFS_V/bin/" 2>/dev/null || true
+cp "$BOOT/test_mobilenet" "$ROOTFS_V/bin/" 2>/dev/null || true
+if [ -f "$MODEL" ]; then cp "$MODEL" "$ROOTFS_V/model.tflite"; fi
+if [ -f "$GOLDEN" ]; then cp "$GOLDEN" "$ROOTFS_V/golden.bin"; fi
+cp "$BOOT/rootfs-vendor/init" "$ROOTFS_V/init"
+chmod +x "$ROOTFS_V/init"
+
+(cd "$ROOTFS_V" && find . | cpio -o -H newc 2>/dev/null | gzip > "$BOOT/initrd-vendor.gz")
+echo "initrd-vendor.gz: $(ls -lh "$BOOT/initrd-vendor.gz" | awk '{print $5}')"
+
+rm -rf "$ROOTFS" "$ROOTFS_V"
+
+echo ""
+echo "=== Build complete ==="
+echo "QEMU:    $(ls -lh qemu-src/build/qemu-system-aarch64 | awk '{print $5}')"
+echo "Kernels: $(ls -lh "$BOOT/Image-6.18" "$BOOT/Image-vendor" 2>/dev/null | awk '{print $NF, $5}')"
+echo "Initrds: $(ls -lh "$BOOT/initrd.gz" "$BOOT/initrd-vendor.gz" | awk '{print $NF, $5}')"

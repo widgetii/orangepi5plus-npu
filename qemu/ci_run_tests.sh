@@ -1,0 +1,127 @@
+#!/bin/bash
+# Run QEMU NPU tests for a specific kernel variant.
+# Usage: ci_run_tests.sh [rocket|vendor]
+set -euo pipefail
+
+VARIANT="${1:-rocket}"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BOOT="$REPO_ROOT/qemu-boot"
+QEMU="$REPO_ROOT/qemu-src/build/qemu-system-aarch64"
+LOG="/tmp/qemu_test_${VARIANT}.log"
+
+case "$VARIANT" in
+    rocket)
+        KERNEL="$BOOT/Image-6.18"
+        INITRD="$BOOT/initrd.gz"
+        APPEND="console=ttyS0,1500000 earlycon panic=10"
+        COMPLETE_MARKER="QEMU NPU TEST COMPLETE"
+        ;;
+    vendor)
+        KERNEL="$BOOT/Image-vendor"
+        INITRD="$BOOT/initrd-vendor.gz"
+        APPEND="console=ttyS0,1500000 earlycon panic=10 cma=64M"
+        COMPLETE_MARKER="QEMU RKNPU TEST COMPLETE"
+        ;;
+    *)
+        echo "Usage: $0 [rocket|vendor]"
+        exit 1
+        ;;
+esac
+
+# Check prerequisites
+for f in "$QEMU" "$KERNEL" "$INITRD"; do
+    if [ ! -f "$f" ]; then
+        echo "ERROR: Missing $f — run ci_build.sh first"
+        exit 2
+    fi
+done
+
+echo "=== Running QEMU NPU test: $VARIANT ==="
+echo "Kernel: $KERNEL"
+echo "Initrd: $INITRD"
+echo "Log:    $LOG"
+echo ""
+
+# Run QEMU with timeout
+# -serial file: captures all init script output
+# The init script ends with "exec /bin/sh" which keeps QEMU running,
+# so we need to kill it after detecting the completion marker.
+rm -f "$LOG"
+
+timeout 180 "$QEMU" \
+    -M orangepi5plus -m 2G -nographic -smp 4 \
+    -kernel "$KERNEL" -initrd "$INITRD" \
+    -append "$APPEND" \
+    -serial file:"$LOG" &
+QEMU_PID=$!
+
+# Wait for completion marker or timeout
+echo "Waiting for tests to complete (timeout: 180s)..."
+for i in $(seq 1 180); do
+    if [ -f "$LOG" ] && grep -q "$COMPLETE_MARKER" "$LOG" 2>/dev/null; then
+        echo "Tests completed after ${i}s"
+        break
+    fi
+    sleep 1
+done
+
+# Kill QEMU
+kill "$QEMU_PID" 2>/dev/null || true
+wait "$QEMU_PID" 2>/dev/null || true
+
+# Check log exists and has content
+if [ ! -f "$LOG" ] || [ ! -s "$LOG" ]; then
+    echo "ERROR: No QEMU output — boot may have failed"
+    exit 1
+fi
+
+echo ""
+echo "=== Test output ==="
+# Show relevant lines
+grep -E "PASS|FAIL|RESULT|CONV TESTS|exit code|error|TEST COMPLETE|Running|found after" "$LOG" || true
+
+echo ""
+echo "=== Checking results ==="
+FAILED=0
+
+# Check for completion
+if ! grep -q "$COMPLETE_MARKER" "$LOG"; then
+    echo "FAIL: Test did not complete (no '$COMPLETE_MARKER' marker)"
+    FAILED=1
+fi
+
+# Check conv tests
+if grep -q "CONV TESTS:" "$LOG"; then
+    CONV_RESULT=$(grep "CONV TESTS:" "$LOG" | tail -1)
+    if echo "$CONV_RESULT" | grep -q "6/6 passed"; then
+        echo "PASS: Conv tests (6/6)"
+    else
+        echo "FAIL: Conv tests — $CONV_RESULT"
+        FAILED=1
+    fi
+else
+    echo "SKIP: Conv tests not found in output"
+fi
+
+# Check MobileNetV1
+if grep -q "RESULT:" "$LOG"; then
+    MOBILENET_RESULT=$(grep "RESULT:" "$LOG" | tail -1)
+    if echo "$MOBILENET_RESULT" | grep -q "PASS"; then
+        echo "PASS: MobileNetV1 — $MOBILENET_RESULT"
+    else
+        echo "FAIL: MobileNetV1 — $MOBILENET_RESULT"
+        FAILED=1
+    fi
+else
+    echo "SKIP: MobileNetV1 result not found"
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+    echo ""
+    echo "=== Full log ==="
+    cat "$LOG"
+    exit 1
+fi
+
+echo ""
+echo "=== All $VARIANT tests passed ==="
