@@ -38,16 +38,17 @@ echo "=== Step 2: Download Armbian kernels ==="
 mkdir -p "$BOOT"
 KERN_DIR=$(mktemp -d)
 
-# Download kernel packages from Armbian pool (direct wget, no apt multiarch needed)
+# Download kernel packages from Armbian pool.
+# Armbian pool structure: pool/main/l/linux-<version>/<package>_<version>_arm64__<hash>.deb
+# We search the kernel version directory for the matching package name.
 download_armbian_kernel() {
-    local PKG="$1" DESTDIR="$2"
-    # Scrape the package pool for the latest .deb URL
-    local POOL_URL="$ARMBIAN_REPO/pool/main/l/${PKG}"
+    local PKG="$1" KVER="$2" DESTDIR="$3"
+    local POOL_URL="$ARMBIAN_REPO/pool/main/l/linux-${KVER}"
     local DEB_NAME
     DEB_NAME=$(wget -q -O- "$POOL_URL/" 2>/dev/null | \
-               grep -oP "href=\"\K${PKG}_[^\"]+_arm64\.deb" | sort -V | tail -1)
+               grep -oP "href=\"\./\K${PKG}_[^\"]+_arm64[^\"]*\.deb" | sort -V | tail -1)
     if [ -z "$DEB_NAME" ]; then
-        echo "WARNING: Could not find $PKG in Armbian pool"
+        echo "WARNING: Could not find $PKG in $POOL_URL"
         return 1
     fi
     echo "  Downloading $DEB_NAME..."
@@ -58,7 +59,7 @@ download_armbian_kernel() {
 
 if [ ! -f "$BOOT/Image-6.18" ]; then
     echo "Downloading mainline kernel..."
-    if download_armbian_kernel "linux-image-current-rockchip64" "$KERN_DIR/mainline"; then
+    if download_armbian_kernel "linux-image-current-rockchip64" "6.18.10" "$KERN_DIR/mainline"; then
         cp "$KERN_DIR/mainline/boot/vmlinuz-"* "$BOOT/Image-6.18"
         echo "Mainline kernel: $(ls -lh "$BOOT/Image-6.18" | awk '{print $5}')"
     else
@@ -69,7 +70,7 @@ fi
 
 if [ ! -f "$BOOT/Image-vendor" ]; then
     echo "Downloading vendor kernel..."
-    if download_armbian_kernel "linux-image-vendor-rk35xx" "$KERN_DIR/vendor"; then
+    if download_armbian_kernel "linux-image-vendor-rk35xx" "6.1.115" "$KERN_DIR/vendor"; then
         cp "$KERN_DIR/vendor/boot/vmlinuz-"* "$BOOT/Image-vendor"
         echo "Vendor kernel: $(ls -lh "$BOOT/Image-vendor" | awk '{print $5}')"
     else
