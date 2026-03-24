@@ -59,9 +59,10 @@ test_onnx_parse: tests/test_onnx_parse.c $(ONNX_OBJS)
 capture_rknn_golden: tests/capture_rknn_golden.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl -lm
 
-test: test_sw_ops test_rknpu_abi
+test: test_sw_ops test_rknpu_abi test_onnx_parse
 	@LD_LIBRARY_PATH=. ./test_sw_ops
 	@LD_LIBRARY_PATH=. ./test_rknpu_abi
+	@./test_onnx_parse tests/fixtures/minimal.onnx
 	@echo "Run: LD_LIBRARY_PATH=. ./test_mobilenet <model.tflite>"
 
 clean:
