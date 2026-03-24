@@ -828,9 +828,12 @@ static void build_execution_plan(struct rnpu_model *m)
          seg->op_count = 0;
          unsigned seg_jobs = 0;
          while (i < m->op_count && m->ops[i].type == RNPU_OP_CONV) {
-            /* This op starts a new job unless it was merged with previous */
-            if (seg->op_count == 0 || !can_merge_rknpu(m, i - 1))
+            if (m->ops[i].use_brdma_per_channel) {
+               /* BRDMA: each task is its own job */
+               seg_jobs += m->ops[i].task_count;
+            } else if (seg->op_count == 0 || !can_merge_rknpu(m, i - 1)) {
                seg_jobs++;
+            }
             seg->op_count++;
             i++;
          }
