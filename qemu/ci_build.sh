@@ -178,13 +178,11 @@ if [ -d "$BOOT/modules" ]; then
     cp "$BOOT/modules/"*.ko "$ROOTFS/lib/modules/" 2>/dev/null || true
 fi
 
-# Model + golden
-if [ -f "$MODEL" ]; then
-    cp "$MODEL" "$ROOTFS/model.tflite"
-fi
-if [ -f "$GOLDEN" ]; then
-    cp "$GOLDEN" "$ROOTFS/golden.bin"
-fi
+# Model + golden + input image
+if [ -f "$MODEL" ]; then cp "$MODEL" "$ROOTFS/model.tflite"; fi
+if [ -f "$GOLDEN" ]; then cp "$GOLDEN" "$ROOTFS/golden.bin"; fi
+INPUT_IMG="$BOOT/grace_hopper_224.bin"
+if [ -f "$INPUT_IMG" ]; then cp "$INPUT_IMG" "$ROOTFS/input.bin"; fi
 
 # Init script (from git)
 cp "$BOOT/rootfs/init" "$ROOTFS/init"
@@ -207,6 +205,7 @@ cp "$BOOT/npu_conv_tests" "$ROOTFS_V/bin/" 2>/dev/null || true
 cp "$BOOT/test_mobilenet" "$ROOTFS_V/bin/" 2>/dev/null || true
 if [ -f "$MODEL" ]; then cp "$MODEL" "$ROOTFS_V/model.tflite"; fi
 if [ -f "$GOLDEN" ]; then cp "$GOLDEN" "$ROOTFS_V/golden.bin"; fi
+if [ -f "$INPUT_IMG" ]; then cp "$INPUT_IMG" "$ROOTFS_V/input.bin"; fi
 cp "$BOOT/rootfs-vendor/init" "$ROOTFS_V/init"
 chmod +x "$ROOTFS_V/init"
 
