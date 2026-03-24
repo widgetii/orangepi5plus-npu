@@ -101,20 +101,26 @@ rm -rf "$KERN_DIR"
 echo ""
 echo "=== Step 3: Download busybox ==="
 if [ ! -f "$BOOT/busybox" ]; then
-    wget -q "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox" \
-         -O /tmp/busybox_x86 || true
-    # We need aarch64 busybox — use a known static build
-    wget -q "https://busybox.net/downloads/binaries/1.35.0-aarch64-linux-musl/busybox" \
-         -O "$BOOT/busybox" || {
-        echo "WARNING: Could not download aarch64 busybox, trying alternative..."
-        # Build from source as fallback
-        apt-get download busybox-static 2>/dev/null || true
-        DEB=$(ls busybox-static*.deb 2>/dev/null | head -1)
-        if [ -n "$DEB" ]; then
-            dpkg-deb -x "$DEB" /tmp/bb
-            cp /tmp/bb/bin/busybox "$BOOT/busybox"
-        fi
+    # Download arm64 busybox-static from Ubuntu repos (cross-architecture)
+    echo "Downloading aarch64 busybox-static..."
+    sudo dpkg --add-architecture arm64 2>/dev/null || true
+    sudo apt-get update -qq 2>/dev/null || true
+    apt-get download busybox-static:arm64 2>/dev/null || {
+        # Fallback: direct wget from Ubuntu pool
+        wget -q "http://ports.ubuntu.com/pool/universe/b/busybox/busybox-static_1.36.1-6ubuntu3.1_arm64.deb" \
+             -O busybox-static_arm64.deb 2>/dev/null || \
+        wget -q "http://ports.ubuntu.com/pool/universe/b/busybox/busybox-static_1.36.1-6ubuntu3_arm64.deb" \
+             -O busybox-static_arm64.deb 2>/dev/null
     }
+    DEB=$(ls busybox-static*arm64*.deb 2>/dev/null | head -1)
+    if [ -n "$DEB" ]; then
+        dpkg-deb -x "$DEB" /tmp/bb
+        cp /tmp/bb/bin/busybox "$BOOT/busybox"
+        rm -rf /tmp/bb "$DEB"
+    else
+        echo "ERROR: Could not get aarch64 busybox"
+        exit 1
+    fi
     chmod +x "$BOOT/busybox"
 fi
 
