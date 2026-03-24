@@ -206,21 +206,33 @@ model = onnx.load('check0_base_optimize.onnx')
 
 **Priority**: HIGH — this is the foundation for all other comparisons.
 
-### Action 2: Run Session.run for Per-Layer FP32 Reference
+### Action 2: Run Session.run for Per-Layer FP32 Reference — DONE
 
-**Goal**: Get exact FP32 intermediate values from ONNX Runtime to find first diverging layer.
+**Status**: COMPLETED. Script: `per_layer_reference.py`, output: `per_layer_ref/`
+
+**Key findings on Session API:**
+- `sess.run(input, inters=[...])` does NOT return intermediates (silently ignored)
+- `Session(ir)` creates 154 per-node sub-sessions in `sess_list[]`, but each is per-node
+  (not cumulative) — requires chaining outputs manually (impractical)
+- **Working approach**: Modify ONNX graph to add Conv outputs as extra graph outputs,
+  then pass modified model to `Session(ir, model=modified_onnx_model)`:
 
 ```python
-# Get all intermediate tensor names
-inter_names = [n.output[0] for n in ir.graph.node]
-
-# Run with intermediates
-sess = Session(ir)
-outputs = sess.run(input_dict, inters=inter_names)
+import onnx
+from onnx import helper
+ir.save_onnx('/tmp/base.onnx')
+model = onnx.load('/tmp/base.onnx')
+for name in conv_out_names:
+    model.graph.output.append(helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, None))
+sess = Session(ir, model=model)  # model= takes ONNX model object, NOT path string
+result = sess.run({input_name: input_nchw})
+# result[:N_original] = final outputs, result[N_original:] = conv intermediates
 ```
 
-Compare against our per-layer outputs (from `RNPU_TRACE_OPS=1`) to find the first
-layer where divergence appears.
+- Input: FP32 NCHW (raw uint8 values transposed, no normalization — RKNN handles it)
+- Output: FP32 NCHW per Conv node, quantized to INT8 using check0 QuantizeLinear params
+- Cannot use vanilla onnxruntime — RKNN graph has custom `exDataConvert` ops
+- 61 Conv + 3 final outputs saved to `per_layer_ref/` (FP32 + INT8 binaries)
 
 **Priority**: HIGH — pinpoints where our computation diverges.
 
@@ -355,7 +367,9 @@ before worrying about quantization accuracy.
 | `run_yolo_sim_rknn.py` | RKNN model runner script |
 | `compare_outputs.py` | Output comparison tool |
 | `extract_quant_params.py` | RKNN vs TFLite quant param extraction & comparison |
+| `per_layer_reference.py` | Per-layer FP32/INT8 reference extraction via ONNX Runtime |
 | `quant_params.json` | Extracted quant params for all 61 CONV ops |
+| `per_layer_ref/` | 61 Conv FP32+INT8 references + layer_mapping.json |
 | `check0_base_optimize.onnx` | Pre-fusion ONNX with QuantizeLinear/DequantizeLinear nodes |
 
 ## Verification Commands
