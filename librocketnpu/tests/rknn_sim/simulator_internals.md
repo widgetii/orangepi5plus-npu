@@ -236,29 +236,37 @@ result = sess.run({input_name: input_nchw})
 
 **Priority**: HIGH — pinpoints where our computation diverges.
 
-### Action 3: Understand fake_tensor Quantization Scheme
+### Action 3: Understand fake_tensor Quantization Scheme — DONE
 
-**Goal**: Determine exact rounding behavior used by RKNN simulator.
+**Status**: COMPLETED. No new scripts — findings documented here.
 
-```python
-import numpy as np
-from rknn.api.simulator import quant_tensor, dequant_tensor, fake_tensor
-
-# Test with known values to determine rounding mode
-test_values = np.array([0.5, 1.5, 2.5, 3.5, -0.5, -1.5], dtype=np.float32)
-# If round-half-to-even: 0→0, 2→2, 2→2, 4→4
-# If round-half-up:      0→1, 2→2, 2→3, 4→4
-
-# Create mock quant params (scale=1.0, zp=0) and test
-quant_params = {'scale': np.array([1.0]), 'zero_point': np.array([0])}
-result = quant_tensor(test_values.reshape(1,1,1,-1), quant_params, 'int8')
-print(result)  # Reveals rounding mode
+**Rounding mode**: Round-half-to-even (banker's rounding), same as `np.rint()`.
+```
+Input:  [ 0.5  1.5  2.5  3.5 -0.5 -1.5 -2.5 -3.5]
+Output: [ 0    2    2    4    0   -2   -2   -4  ]
 ```
 
-Key questions:
-- Round-half-to-even vs round-half-up?
-- Saturation behavior at INT8 boundaries (-128, 127)?
-- Per-channel scale application order (multiply then round, or something else)?
+**Saturation**: Clips to [-128, 127]. -128.5 → -128 (round-to-even then clip).
+
+**Exact formula**:
+```
+int8_val = clip(rint(fp32_val / scale) + zero_point, -128, 127)
+```
+NumPy equivalent: `np.clip(np.rint(fp32 / scale) + zp, -128, 127).astype(np.int8)`
+
+**Manual match**: 100% exact — random 1x32x10x10 tensor matches `quant_tensor()` perfectly.
+
+**Per-channel scales**: Applied along axis=1 (NCHW channel dim), each channel independent.
+
+**`fake_tensor`**: NOT usable standalone — needs `qmethod` key in params dict (internal
+RKNN pipeline state). Use manual `np.rint` or `quant_tensor` + `dequant_tensor` instead.
+
+**`quant_tensor` param dict** (note: `dtype` key is REQUIRED):
+```python
+params = {'scale': np.array([...], np.float32), 'zero_point': np.array([...], np.int32), 'dtype': 'int8'}
+quant_tensor(fp32_tensor_nchw, params, 'int8')  # returns int8 ndarray
+dequant_tensor(int8_tensor, params, 'float32', 'int8')  # returns float32
+```
 
 **Priority**: HIGH — rounding differences cause ~1 LSB error per layer, accumulating.
 
