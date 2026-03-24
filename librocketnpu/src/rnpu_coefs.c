@@ -75,12 +75,12 @@ unsigned rnpu_fill_weights(const struct rnpu_tfl_model *tfl,
                         dst[n++] = 0x0;
                      else if (ic >= input_channels_real) {
                         if (i2 < 16 || (input_channels_real % 32) > 16)
-                           dst[n++] = 0;  /* zero weight for padded channels */
+                           dst[n++] = zero_point - 0x80;
                      } else {
                         unsigned flat = oc * weights_width * weights_height * input_channels_real
                                       + x * weights_height * input_channels_real
                                       + y * input_channels_real + ic;
-                        dst[n++] = (int8_t)w_in[flat] - (int8_t)zero_point;
+                        dst[n++] = w_in[flat] - 0x80;
                      }
                   }
                }
@@ -127,12 +127,12 @@ unsigned rnpu_fill_weights_group(const struct rnpu_tfl_model *tfl,
                         if (oc_local < oc_pad) dst[n++] = 0x0;
                      } else if (icc >= ic_real) {
                         if (i2 < 16 || (ic_real % 32) > 16)
-                           dst[n++] = 0;  /* zero weight for padded channels */
+                           dst[n++] = zp - 0x80;
                      } else {
                         unsigned oc_global = channel_indices[oc_local];
                         unsigned flat = oc_global * ww * wh * ic_real
                                       + x * wh * ic_real + y * ic_real + icc;
-                        dst[n++] = (int8_t)w_in[flat] - (int8_t)zp;
+                        dst[n++] = w_in[flat] - 0x80;
                      }
                   }
                }
@@ -178,8 +178,7 @@ static int32_t calc_bias_correction(const struct rnpu_tfl_model *tfl,
          for (unsigned y = 0; y < wh; y++)
             for (unsigned i = 0; i < ic; i++) {
                unsigned flat = oc * ww * wh * ic + x * wh * ic + y * ic + i;
-               int32_t wd = (int32_t)(int8_t)w[flat] - (int32_t)(int8_t)wzp;
-               corr += wd * (izp - 0x80);
+               corr += (w[flat] - wzp) * (izp - 0x80);
             }
    }
    return corr;
