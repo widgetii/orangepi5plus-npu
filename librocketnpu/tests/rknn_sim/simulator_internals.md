@@ -283,34 +283,38 @@ Requires `target='rk3588'` (actual hardware), not available in Docker simulator.
 
 Use `per_layer_reference.py` (Action 2) for per-layer comparison instead.
 
-### Action 5: Test optimization_level=2
+### Action 5: Test optimization_level=2 — DONE
 
-**Goal**: Check if simulator output changes with different optimization level.
+**Status**: COMPLETED. opt3 (default) is slightly closer to hardware than opt2.
 
-RKNN warned: "QAT model loaded but optimization_level=3, some passes will affect
-accuracy." Re-run simulator with `optimization_level=2` and compare outputs against
-current golden (which used default optimization_level=3).
+**opt2 vs opt3 sim**: ~90% exact, max_diff=5. Level 2 returns INT8 directly.
 
-```python
-rknn.config(target_platform='rk3588', optimization_level=2)
-```
+| Metric | opt3 vs hw | opt2 vs hw |
+|--------|-----------|-----------|
+| H0 exact | 91.0% | 89.8% |
+| H1 exact | 83.8% | 82.2% |
+| H2 exact | 91.9% | 91.0% |
 
-If sim output changes, the diff tells us which optimization passes affect accuracy.
+Both sim levels are very close to hardware (~0.2 mean diff). The librocketnpu gap
+(~18-25 mean diff) is unrelated to simulator optimization level. Keep using opt3.
 
-**Priority**: MEDIUM — may reduce sim-vs-hardware gap.
+### Action 6: Build Per-Layer Comparison Tool — DONE
 
-### Action 6: Build Per-Layer Comparison Tool
+**Status**: COMPLETED. Two components:
 
-**Goal**: Script that identifies exact layer where librocketnpu diverges from RKNN.
+1. **`RNPU_DUMP_OPS`** env var in `rnpu_model.c` — dumps per-op uint8 NHWC tensors:
+   ```bash
+   mkdir -p /tmp/op_dump
+   RNPU_DUMP_OPS=/tmp/op_dump ./test_yolo model.tflite input0.bin
+   # Creates op_00.bin through op_60.bin (61 CONV ops)
+   ```
 
-Pipeline:
-1. Load TFLite → build RKNN IR
-2. Run Session.run for FP32 reference (all intermediates)
-3. Apply quant_tensor per layer to get RKNN's quantized reference
-4. Compare with librocketnpu per-layer dumps (`RNPU_TRACE_OPS=1`)
-5. Report first layer with significant divergence
-
-Requires matching layer names between RKNN's ONNX graph and our TFLite op indices.
+2. **`compare_per_layer.py`** — compares librocketnpu dumps vs RKNN INT8 references:
+   ```bash
+   python3 compare_per_layer.py --ref per_layer_ref --dump op_dump
+   ```
+   Handles format conversion: librocketnpu uint8 NHWC (+0x80 offset) ↔ RKNN int8 NCHW.
+   Reports per-layer exact%, mean_diff, max_diff and identifies first diverging layer.
 
 **Priority**: HIGH — the key debugging tool.
 
@@ -370,6 +374,7 @@ before worrying about quantization accuracy.
 | `compare_outputs.py` | Output comparison tool |
 | `extract_quant_params.py` | RKNN vs TFLite quant param extraction & comparison |
 | `per_layer_reference.py` | Per-layer FP32/INT8 reference extraction via ONNX Runtime |
+| `compare_per_layer.py` | Per-layer comparison: librocketnpu dumps vs RKNN references |
 | `quant_params.json` | Extracted quant params for all 61 CONV ops |
 | `per_layer_ref/` | 61 Conv FP32+INT8 references + layer_mapping.json |
 | `check0_base_optimize.onnx` | Pre-fusion ONNX with QuantizeLinear/DequantizeLinear nodes |

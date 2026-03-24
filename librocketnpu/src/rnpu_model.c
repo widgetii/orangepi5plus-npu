@@ -1292,8 +1292,10 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
    /* Flush input to NPU */
    rnpu_bo_fini(m->fd, &m->activation_bo);
 
-   /* Debug: per-op output tracing */
+   /* Debug: per-op output tracing and tensor dump */
    bool trace_ops = getenv("RNPU_TRACE_OPS") != NULL;
+   const char *dump_dir = getenv("RNPU_DUMP_OPS");
+   if (dump_dir) trace_ops = true;
 
    /* Execute segments — one job per CONV operation */
    unsigned hw_job_idx = 0;
@@ -1371,6 +1373,12 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
                if (dop->requant_group_count > 1)
                   fprintf(stderr, " (%u rqg)", dop->requant_group_count);
                fprintf(stderr, "\n");
+               if (dump_dir) {
+                  char path[256];
+                  snprintf(path, sizeof(path), "%s/op_%02u.bin", dump_dir, j);
+                  FILE *fp = fopen(path, "wb");
+                  if (fp) { fwrite(buf, 1, sz, fp); fclose(fp); }
+               }
                free(buf);
             }
          }
@@ -1399,6 +1407,12 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
             for (unsigned k = 0; k < 256; k++) if (hist[k]) unique++;
             fprintf(stderr, "  op %2u [SW/%d] t%u %ux%ux%u: %u unique\n",
                     seg->first_op, dop->type, ti, tw, th, tc, unique);
+            if (dump_dir) {
+               char path[256];
+               snprintf(path, sizeof(path), "%s/op_%02u.bin", dump_dir, seg->first_op);
+               FILE *fp = fopen(path, "wb");
+               if (fp) { fwrite(buf, 1, sz, fp); fclose(fp); }
+            }
             free(buf);
          }
          if (s + 1 < m->segment_count && m->segments[s+1].is_hw)
