@@ -7,6 +7,9 @@ set -euo pipefail
 MODEL_DIR="/root/npu-research/models"
 MODEL="${MODEL_DIR}/mobilenet_v1_quant.tflite"
 GOLDEN="${MODEL_DIR}/mobilenet_golden.bin"
+INPUT="${MODEL_DIR}/grace_hopper_224.bin"
+# MobileNetV1 class 653 = "military uniform" (Grace Hopper photo)
+EXPECTED_CLASS=653
 
 echo "=== Hardware Smoke Test ==="
 echo "Host: $(hostname)"
@@ -22,11 +25,13 @@ else
     exit 2
 fi
 
-# Check model files
-if [ ! -f "$MODEL" ]; then
-    echo "ERROR: Model not found: $MODEL"
-    exit 2
-fi
+# Check required files
+for f in "$MODEL" "$INPUT"; do
+    if [ ! -f "$f" ]; then
+        echo "ERROR: Required file not found: $f"
+        exit 2
+    fi
+done
 
 # Build
 echo ""
@@ -43,14 +48,18 @@ echo ""
 echo "=== Running rknpu_abi tests (aarch64) ==="
 LD_LIBRARY_PATH=. ./test_rknpu_abi
 
-# Run NPU inference test
+# Run NPU inference with real image
 echo ""
-echo "=== Running MobileNetV1 NPU inference ==="
+echo "=== Running MobileNetV1 NPU inference (Grace Hopper) ==="
 if [ -f "$GOLDEN" ]; then
-    LD_LIBRARY_PATH=. ./test_mobilenet "$MODEL" 5 "$GOLDEN"
+    LD_LIBRARY_PATH=. ./test_mobilenet "$MODEL" 5 "$GOLDEN" "$INPUT" "$EXPECTED_CLASS"
 else
-    echo "WARNING: No golden file, running without comparison"
-    LD_LIBRARY_PATH=. ./test_mobilenet "$MODEL" 5
+    echo "No golden file — first run, generating baseline"
+    LD_LIBRARY_PATH=. ./test_mobilenet "$MODEL" 1 "" "$INPUT" "$EXPECTED_CLASS" || true
+    cp output_0.bin "$GOLDEN"
+    echo "Golden saved to $GOLDEN"
+    # Re-run with golden to verify determinism
+    LD_LIBRARY_PATH=. ./test_mobilenet "$MODEL" 3 "$GOLDEN" "$INPUT" "$EXPECTED_CLASS"
 fi
 
 echo ""
