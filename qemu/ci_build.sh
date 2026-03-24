@@ -101,27 +101,21 @@ rm -rf "$KERN_DIR"
 echo ""
 echo "=== Step 3: Download busybox ==="
 if [ ! -f "$BOOT/busybox" ]; then
-    # Download arm64 busybox-static from Ubuntu repos (cross-architecture)
-    echo "Downloading aarch64 busybox-static..."
-    sudo dpkg --add-architecture arm64 2>/dev/null || true
-    sudo apt-get update -qq 2>/dev/null || true
-    apt-get download busybox-static:arm64 2>/dev/null || {
-        # Fallback: direct wget from Ubuntu pool
-        wget -q "http://ports.ubuntu.com/pool/universe/b/busybox/busybox-static_1.36.1-6ubuntu3.1_arm64.deb" \
-             -O busybox-static_arm64.deb 2>/dev/null || \
-        wget -q "http://ports.ubuntu.com/pool/universe/b/busybox/busybox-static_1.36.1-6ubuntu3_arm64.deb" \
-             -O busybox-static_arm64.deb 2>/dev/null
-    }
-    DEB=$(ls busybox-static*arm64*.deb 2>/dev/null | head -1)
-    if [ -n "$DEB" ]; then
-        dpkg-deb -x "$DEB" /tmp/bb
+    echo "Downloading aarch64 busybox..."
+    # Download from Ubuntu ports pool (busybox package, not busybox-static)
+    BBURL="http://ports.ubuntu.com/pool/universe/b/busybox"
+    BBDEB=$(wget -q -O- "$BBURL/" | grep -oP 'href="\Kbusybox_[^"]*arm64[^"]*\.deb' | sort -V | tail -1)
+    if [ -n "$BBDEB" ]; then
+        wget -q "$BBURL/$BBDEB" -O /tmp/busybox.deb
+        dpkg-deb -x /tmp/busybox.deb /tmp/bb
         cp /tmp/bb/bin/busybox "$BOOT/busybox"
-        rm -rf /tmp/bb "$DEB"
+        rm -rf /tmp/bb /tmp/busybox.deb
     else
-        echo "ERROR: Could not get aarch64 busybox"
+        echo "ERROR: Could not find aarch64 busybox in Ubuntu pool"
         exit 1
     fi
     chmod +x "$BOOT/busybox"
+    echo "busybox: $(file "$BOOT/busybox" | grep -o 'ARM.*')"
 fi
 
 echo ""
