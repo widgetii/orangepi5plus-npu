@@ -101,22 +101,14 @@ rm -rf "$KERN_DIR"
 echo ""
 echo "=== Step 3: Download busybox ==="
 if [ ! -f "$BOOT/busybox" ]; then
-    echo "Building aarch64 busybox (static)..."
-    BBVER="1.36.1"
-    wget -q "https://busybox.net/downloads/busybox-${BBVER}.tar.bz2" -O /tmp/busybox.tar.bz2
-    tar xjf /tmp/busybox.tar.bz2 -C /tmp
-    cd "/tmp/busybox-${BBVER}"
-    make CROSS_COMPILE=${CROSS} defconfig >/dev/null
-    sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
-    # Disable features that need extra libs
-    sed -i 's/CONFIG_PAM=y/# CONFIG_PAM is not set/' .config
-    sed -i 's/CONFIG_FEATURE_HAVE_RPC=y/# CONFIG_FEATURE_HAVE_RPC is not set/' .config
-    sed -i 's/CONFIG_FEATURE_INETD_RPC=y/# CONFIG_FEATURE_INETD_RPC is not set/' .config
-    make CROSS_COMPILE=${CROSS} -j$(nproc) busybox 2>&1 | tail -5
-    cp busybox "$BOOT/busybox"
-    cd "$REPO_ROOT"
-    rm -rf "/tmp/busybox-${BBVER}" /tmp/busybox.tar.bz2
-    echo "busybox: $(file "$BOOT/busybox" | grep -o 'ARM.*linked')"
+    echo "Extracting aarch64 busybox from Docker image..."
+    # Use the official busybox Docker image (static, multi-arch)
+    docker pull --platform linux/arm64 busybox:stable-musl >/dev/null 2>&1
+    CID=$(docker create --platform linux/arm64 busybox:stable-musl)
+    docker cp "$CID:/bin/busybox" "$BOOT/busybox"
+    docker rm "$CID" >/dev/null
+    chmod +x "$BOOT/busybox"
+    echo "busybox: $(file "$BOOT/busybox" | grep -o 'ARM.*')"
 fi
 
 echo ""
