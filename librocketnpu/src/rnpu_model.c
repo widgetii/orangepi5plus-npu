@@ -1273,6 +1273,81 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
    return m;
 }
 
+/* CRC16-CCITT for tensor fingerprinting */
+static uint16_t crc16(const uint8_t *data, size_t len)
+{
+   uint16_t crc = 0xFFFF;
+   for (size_t i = 0; i < len; i++) {
+      crc ^= (uint16_t)data[i] << 8;
+      for (int j = 0; j < 8; j++)
+         crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+   }
+   return crc;
+}
+
+static const char *op_type_name(enum rnpu_op_type t, bool dw)
+{
+   switch (t) {
+   case RNPU_OP_CONV: return dw ? "DW_CONV" : "CONV";
+   case RNPU_OP_CONCAT: return "CONCAT";
+   case RNPU_OP_MAX_POOL: return "MAXPOOL";
+   case RNPU_OP_PAD: return "PAD";
+   case RNPU_OP_RESIZE_NEAREST: return "RESIZE";
+   case RNPU_OP_LOGISTIC: return "SIGMOID";
+   case RNPU_OP_AVG_POOL: return "AVGPOOL";
+   case RNPU_OP_RESHAPE: return "RESHAPE";
+   case RNPU_OP_SOFTMAX: return "SOFTMAX";
+   default: return "?";
+   }
+}
+
+/* Print per-op debug line. raw = pointer to NPU-format tensor in activation BO.
+ * raw_size = tensor size in bytes (groups * w * h * 16). */
+static void debug_op(int level, unsigned idx, const struct rnpu_operation *op,
+                     const uint8_t *in_raw, unsigned in_raw_size,
+                     const uint8_t *out_raw, unsigned out_raw_size)
+{
+   uint16_t in_crc = crc16(in_raw, in_raw_size);
+   uint16_t out_crc = crc16(out_raw, out_raw_size);
+
+   /* Output stats */
+   uint8_t vmin = 255, vmax = 0;
+   unsigned unique_map[256] = {0};
+   for (unsigned i = 0; i < out_raw_size; i++) {
+      if (out_raw[i] < vmin) vmin = out_raw[i];
+      if (out_raw[i] > vmax) vmax = out_raw[i];
+      unique_map[out_raw[i]] = 1;
+   }
+   unsigned uniq = 0;
+   for (unsigned i = 0; i < 256; i++) uniq += unique_map[i];
+
+   fprintf(stderr, "rnpu_dbg: op[%02u] %-8s t%u->t%u %ux%ux%u->%ux%ux%u"
+           " in=%04x out=%04x [%u..%u] uniq=%u\n",
+           idx, op_type_name(op->type, op->depthwise),
+           op->input_tensor, op->output_tensor,
+           op->input_width, op->input_height, op->input_channels,
+           op->output_width, op->output_height, op->output_channels,
+           in_crc, out_crc, vmin, vmax, uniq);
+
+   if (level >= 2) {
+      fprintf(stderr, "rnpu_dbg:   in_raw[0:32]:");
+      for (unsigned i = 0; i < 32 && i < in_raw_size; i++)
+         fprintf(stderr, " %02x", in_raw[i]);
+      fprintf(stderr, "\n");
+      fprintf(stderr, "rnpu_dbg:   out_raw[0:32]:");
+      for (unsigned i = 0; i < 32 && i < out_raw_size; i++)
+         fprintf(stderr, " %02x", out_raw[i]);
+      fprintf(stderr, "\n");
+   }
+
+   if (level >= 3 && op->type == RNPU_OP_CONV) {
+      fprintf(stderr, "rnpu_dbg:   wzp=%u ozp=%u ws=%.6f os=%.6f trunc=%u owop=%d\n",
+              op->weights_zero_point, op->output_zero_point,
+              op->weights_scale, op->output_scale,
+              op->truncate_bits, (int)(int16_t)(op->tasks[0].weights_zero_point));
+   }
+}
+
 int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
 {
    /* Convert input to NPU format */
@@ -1296,6 +1371,17 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
    bool trace_ops = getenv("RNPU_TRACE_OPS") != NULL;
    const char *dump_dir = getenv("RNPU_DUMP_OPS");
    if (dump_dir) trace_ops = true;
+
+   /* RNPU_DEBUG: structured per-op diagnostics for board vs QEMU comparison.
+    * Level 1: per-op fingerprint (CRC + first bytes)
+    * Level 2: + raw NPU-format bytes
+    * Level 3: + regcmd register values, weight/bias checksums */
+   int debug_level = 0;
+   {
+      const char *dbg = getenv("RNPU_DEBUG");
+      if (dbg) debug_level = atoi(dbg);
+      if (debug_level < 0) debug_level = 0;
+   }
 
    /* Execute segments — one job per CONV operation */
    unsigned hw_job_idx = 0;
@@ -1346,7 +1432,24 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
             rnpu_compact_unsort_output(m, first_g, j - first_g + 1);
          }
 
-         /* Debug: trace per-op output stats */
+         /* RNPU_DEBUG: per-op fingerprint */
+         if (debug_level >= 1) {
+            for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
+               struct rnpu_operation *dop = &m->ops[j];
+               unsigned in_ti = dop->input_tensor, out_ti = dop->output_tensor;
+               uint8_t *in_ptr = act + m->tensors[in_ti].offset;
+               uint8_t *out_ptr = act + m->tensors[out_ti].offset;
+               unsigned in_sz = m->tensors[in_ti].size ? m->tensors[in_ti].size
+                  : DIV_ROUND_UP(dop->input_channels, FEATURE_ATOMIC_SIZE)
+                    * dop->input_width * dop->input_height * FEATURE_ATOMIC_SIZE;
+               unsigned out_sz = m->tensors[out_ti].size ? m->tensors[out_ti].size
+                  : DIV_ROUND_UP(dop->output_channels, FEATURE_ATOMIC_SIZE)
+                    * dop->output_width * dop->output_height * FEATURE_ATOMIC_SIZE;
+               debug_op(debug_level, j, dop, in_ptr, in_sz, out_ptr, out_sz);
+            }
+         }
+
+         /* Debug: trace per-op output stats (legacy) */
          if (trace_ops) {
             for (unsigned j = seg->first_op; j < seg->first_op + seg->op_count; j++) {
                struct rnpu_operation *dop = &m->ops[j];
@@ -1390,6 +1493,22 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
          hw_job_idx += seg->job_count;
       } else {
          rnpu_execute_sw_op(m, seg->first_op);
+
+         if (debug_level >= 1) {
+            unsigned j = seg->first_op;
+            struct rnpu_operation *dop = &m->ops[j];
+            unsigned in_ti = dop->input_tensor, out_ti = dop->output_tensor;
+            uint8_t *in_ptr = act + m->tensors[in_ti].offset;
+            uint8_t *out_ptr = act + m->tensors[out_ti].offset;
+            unsigned in_sz = m->tensors[in_ti].size ? m->tensors[in_ti].size
+               : DIV_ROUND_UP(dop->input_channels, FEATURE_ATOMIC_SIZE)
+                 * dop->input_width * dop->input_height * FEATURE_ATOMIC_SIZE;
+            unsigned out_sz = m->tensors[out_ti].size ? m->tensors[out_ti].size
+               : DIV_ROUND_UP(dop->output_channels, FEATURE_ATOMIC_SIZE)
+                 * dop->output_width * dop->output_height * FEATURE_ATOMIC_SIZE;
+            debug_op(debug_level, j, dop, in_ptr, in_sz, out_ptr, out_sz);
+         }
+
          if (trace_ops) {
             struct rnpu_operation *dop = &m->ops[seg->first_op];
             unsigned ti = dop->output_tensor;
