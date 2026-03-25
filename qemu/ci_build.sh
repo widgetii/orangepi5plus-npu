@@ -178,9 +178,10 @@ if [ -d "$BOOT/modules" ]; then
     cp "$BOOT/modules/"*.ko "$ROOTFS/lib/modules/" 2>/dev/null || true
 fi
 
-# Model + golden + input image
+# Model + golden + Grace Hopper input
 if [ -f "$MODEL" ]; then cp "$MODEL" "$ROOTFS/model.tflite"; fi
 if [ -f "$GOLDEN" ]; then cp "$GOLDEN" "$ROOTFS/golden.bin"; fi
+if [ -f "$BOOT/grace_hopper_224.bin" ]; then cp "$BOOT/grace_hopper_224.bin" "$ROOTFS/input.bin"; fi
 
 # Init script (from git)
 cp "$BOOT/rootfs/init" "$ROOTFS/init"
