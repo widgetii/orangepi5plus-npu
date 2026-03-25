@@ -685,8 +685,9 @@ static unsigned build_conv_regcmd(uint64_t *buf, const struct conv_config *cfg,
     *p++ = emit(TARGET_CNA, 0x1070, in_addr);
     *p++ = emit(TARGET_CNA, 0x1074, 0);
     *p++ = emit(TARGET_CNA, 0x1078, 0x0f0f0000);
-    uint32_t line_stride = cfg->in_h * NPU_FEATURE_ATOMIC_SIZE;
-    uint32_t surf_stride = cfg->in_w * cfg->in_h * NPU_FEATURE_ATOMIC_SIZE;
+    /* Line/surface stride in register units (bytes / 4), matching librocketnpu */
+    uint32_t line_stride = cfg->in_h * NPU_FEATURE_ATOMIC_SIZE / 4;
+    uint32_t surf_stride = cfg->in_w * cfg->in_h * NPU_FEATURE_ATOMIC_SIZE / 4;
     *p++ = emit(TARGET_CNA, 0x107c, line_stride);
     *p++ = emit(TARGET_CNA, 0x1080, surf_stride);
     *p++ = emit(TARGET_CNA, 0x1084, 0);

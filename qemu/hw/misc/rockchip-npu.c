@@ -358,7 +358,19 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     uint32_t in_h = task->input_height;
 
     uint32_t in_groups = DIV_ROUND_UP(in_c, NPU_FEATURE_ATOMIC_SIZE);
-    uint32_t in_buf_size = in_groups * in_w * in_h * NPU_FEATURE_ATOMIC_SIZE;
+
+    /* DMA input stride: register values are in 4-byte units.
+     * For tiled ops, the stride covers the full tensor (not just the tile). */
+    uint32_t in_line_bytes = task->input_line_stride
+        ? task->input_line_stride * 4
+        : in_h * NPU_FEATURE_ATOMIC_SIZE;
+    uint32_t in_surf_bytes = task->input_surface_stride
+        ? task->input_surface_stride * 4
+        : in_w * in_line_bytes;
+    uint32_t in_buf_size = (in_groups > 1)
+        ? (in_groups - 1) * in_surf_bytes + (in_w - 1) * in_line_bytes
+          + in_h * NPU_FEATURE_ATOMIC_SIZE
+        : (in_w - 1) * in_line_bytes + in_h * NPU_FEATURE_ATOMIC_SIZE;
 
     uint32_t wt_oc = depthwise ? 1 : ALIGN_UP(MAX2(out_c, 2), 2);
     uint32_t wt_ic = MAX2(in_c_real, NPU_FEATURE_ATOMIC_SIZE);
@@ -452,9 +464,11 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                             } else {
                                 uint32_t g = abs_ic / NPU_FEATURE_ATOMIC_SIZE;
                                 uint32_t c = abs_ic % NPU_FEATURE_ATOMIC_SIZE;
-                                uint32_t off = npu_input_offset(g, ix, iy,
-                                                                in_w, in_h);
-                                in_val = (int8_t)in_buf[off + c];
+                                uint32_t off = g * in_surf_bytes
+                                             + ix * in_line_bytes
+                                             + iy * NPU_FEATURE_ATOMIC_SIZE;
+                                in_val = (off + c < in_buf_size)
+                                    ? (int8_t)in_buf[off + c] : pad_val;
                             }
 
                             int8_t w_val;
