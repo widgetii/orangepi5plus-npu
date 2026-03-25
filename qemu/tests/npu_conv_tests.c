@@ -545,9 +545,10 @@ static void npu_output_to_nhwc(const uint8_t *npu, int8_t *nhwc,
             for (uint32_t ch = 0; ch < c; ch++) {
                 uint32_t g = ch / NPU_FEATURE_ATOMIC_SIZE;
                 uint32_t c_within = ch % NPU_FEATURE_ATOMIC_SIZE;
+                /* x-major: matching NPU_OFFSET in librocketnpu */
                 uint32_t off = g * w * h * NPU_FEATURE_ATOMIC_SIZE
-                             + y * w * NPU_FEATURE_ATOMIC_SIZE
-                             + x * NPU_FEATURE_ATOMIC_SIZE
+                             + x * h * NPU_FEATURE_ATOMIC_SIZE
+                             + y * NPU_FEATURE_ATOMIC_SIZE
                              + c_within;
                 nhwc[y * w * c + x * c + ch] = (int8_t)npu[off];
             }
