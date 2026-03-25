@@ -531,7 +531,7 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                         if (ew_buf != NULL) {
                             uint32_t og = oc / NPU_FEATURE_ATOMIC_SIZE;
                             uint32_t oc_within = oc % NPU_FEATURE_ATOMIC_SIZE;
-                            uint32_t ew_off = npu_output_offset(og, oy, ox,
+                            uint32_t ew_off = npu_output_offset(og, ox, oy,
                                                                  out_w, out_h);
                             ew_operand = (int32_t)(int8_t)ew_buf[ew_off +
                                                                   oc_within];
@@ -575,34 +575,14 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
 
                 uint32_t og = oc / NPU_FEATURE_ATOMIC_SIZE;
                 uint32_t oc_within = oc % NPU_FEATURE_ATOMIC_SIZE;
-                uint32_t out_off = npu_output_offset(og, oy, ox,
+                uint32_t out_off = npu_output_offset(og, ox, oy,
                                                       out_w, out_h);
                 out_buf[out_off + oc_within] = (uint8_t)(int8_t)result;
             }
         }
     }
 
-    /* Transpose output from y-major (conv loop order) to x-major (matching
-     * npu_input_offset and NPU_OFFSET in librocketnpu's SW ops).
-     * Real hardware DMA does this transparently; QEMU must do it explicitly. */
-    {
-        uint32_t group_size = out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
-        uint8_t *tmp = g_malloc(group_size);
-        for (uint32_t g = 0; g < out_groups; g++) {
-            uint8_t *grp = out_buf + g * group_size;
-            memcpy(tmp, grp, group_size);
-            for (uint32_t oy = 0; oy < out_h; oy++) {
-                for (uint32_t ox = 0; ox < out_w; ox++) {
-                    uint32_t src_off = oy * out_w * NPU_FEATURE_ATOMIC_SIZE
-                                     + ox * NPU_FEATURE_ATOMIC_SIZE;
-                    uint32_t dst_off = ox * out_h * NPU_FEATURE_ATOMIC_SIZE
-                                     + oy * NPU_FEATURE_ATOMIC_SIZE;
-                    memcpy(grp + dst_off, tmp + src_off, NPU_FEATURE_ATOMIC_SIZE);
-                }
-            }
-        }
-        g_free(tmp);
-    }
+    /* Output is col-major (matching npu_input_offset) — no transpose needed. */
 
     if (task->output_surface_stride > 0 && out_groups > 1) {
         uint32_t group_size = out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
