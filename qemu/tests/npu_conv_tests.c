@@ -378,23 +378,15 @@ static uint64_t emit(uint16_t target, uint16_t reg, uint32_t value)
 static inline int32_t nvdla_truncate(int32_t value, unsigned truncate)
 {
     if (truncate == 0) return value;
-    int32_t sign = (value < 0) ? 1 : 0;
     uint32_t guide = (value >> (truncate - 1)) & 1;
-    uint32_t sticky = (truncate > 1)
-        ? ((value & ((1u << (truncate - 1)) - 1)) != 0) : 0;
-    int32_t round_up = guide & ((!sign) | sticky);
-    return (value >> truncate) + round_up;
+    return (value >> truncate) + guide;
 }
 
 static inline int64_t nvdla_shift_right_round64(int64_t value, unsigned shift)
 {
     if (shift == 0) return value;
-    int64_t sign = (value < 0) ? 1 : 0;
     uint64_t guide = (value >> (shift - 1)) & 1;
-    uint64_t sticky = (shift > 1)
-        ? ((value & ((1ULL << (shift - 1)) - 1)) != 0) : 0;
-    int64_t round_up = guide & ((!sign) | sticky);
-    return (value >> shift) + round_up;
+    return (value >> shift) + guide;
 }
 
 /* ======================================================================

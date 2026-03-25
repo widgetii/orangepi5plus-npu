@@ -410,6 +410,12 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
         qemu_fdt_add_subnode(fdt, node);
         qemu_fdt_setprop_string(fdt, node, "compatible",
                                 "rockchip,rk3588-rknn-core");
+        /* Only enable the last core (fdad0000) — the Rocket driver probes
+         * in reverse order so this becomes core 0. Disabling others avoids
+         * DRM scheduler timeouts from QEMU's synchronous execution model. */
+        if (i < RK3588_NPU_NUM_CORES - 1) {
+            qemu_fdt_setprop_string(fdt, node, "status", "disabled");
+        }
         uint64_t core_reg[6] = {
             cpu_to_be64(npu_bases[i] + 0x0000), cpu_to_be64(0x1000),
             cpu_to_be64(npu_bases[i] + 0x1000), cpu_to_be64(0x1000),

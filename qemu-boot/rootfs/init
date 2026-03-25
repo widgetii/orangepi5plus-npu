@@ -1,38 +1,12 @@
 #!/bin/sh
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev
-
-echo "Loading kernel modules..."
-insmod /lib/modules/drm_shmem_helper.ko
-insmod /lib/modules/gpu-sched.ko
-insmod /lib/modules/rocket.ko
-
-echo "Waiting for device..."
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if [ -e /dev/accel/accel0 ]; then
-        echo "  /dev/accel/accel0 found after ${i}s"
-        break
-    fi
-    sleep 1
-done
-ls -la /dev/accel/ 2>/dev/null
-
-echo "Running NPU test..."
-/bin/npu_test
-echo "Test exit code: $?"
-
-echo "Running conv test suite..."
+mount -t proc proc /proc; mount -t sysfs sysfs /sys; mount -t devtmpfs devtmpfs /dev
+insmod /lib/modules/drm_shmem_helper.ko; insmod /lib/modules/gpu-sched.ko; insmod /lib/modules/rocket.ko
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /dev/accel/accel0 ] && break; sleep 1; done
+echo "=== Running conv tests ==="
 /bin/npu_conv_tests
 echo "Conv tests exit code: $?"
-
-echo "Running MobileNetV1 (Grace Hopper)..."
-if [ -f /input.bin ]; then
-    /bin/test_mobilenet /model.tflite 1 /golden.bin /input.bin 653
-else
-    /bin/test_mobilenet /model.tflite 1 /golden.bin
-fi
+echo "=== Running MobileNet ==="
+/bin/test_mobilenet /model.tflite 1 /golden.bin /input.bin 653
 echo "MobileNetV1 exit code: $?"
-
 echo "--- QEMU NPU TEST COMPLETE ---"
 exec /bin/sh

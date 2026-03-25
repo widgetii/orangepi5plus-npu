@@ -50,6 +50,7 @@ rm -f "$LOG"
 
 timeout 180 "$QEMU" \
     -M orangepi5plus -m 2G -nographic -smp 4 \
+    -icount shift=0,align=off,sleep=on \
     -kernel "$KERNEL" -initrd "$INITRD" \
     -append "$APPEND" \
     -serial file:"$LOG" &
@@ -114,18 +115,19 @@ if grep -q "RESULT:.*bit-exact\|RESULT:.*max_diff" "$LOG"; then
     fi
 fi
 
-# Check MobileNetV1 classification (informational — QEMU may not support input-dependent output)
+# Check MobileNetV1 classification
 if grep -q "Top-1 class:" "$LOG"; then
     CLASS_RESULT=$(grep "Top-1 class:" "$LOG" | tail -1)
     echo "INFO: MobileNetV1 classification — $CLASS_RESULT"
     if grep -q "RESULT: PASS (expected class" "$LOG"; then
         echo "PASS: Classification correct"
-    elif grep -q "RESULT: WRONG_CLASS" "$LOG"; then
-        echo "WARN: Classification wrong (known QEMU limitation for input-dependent output)"
+    elif grep -q "RESULT: FAIL (expected class" "$LOG"; then
+        echo "FAIL: Classification wrong"
+        FAILED=1
     fi
 fi
 
-# Fallback: check if MobileNet ran at all
+# Check MobileNet completed
 if ! grep -q "MobileNetV1 exit code: 0" "$LOG"; then
     if grep -q "MobileNetV1 exit code:" "$LOG"; then
         echo "FAIL: MobileNetV1 exited with error"

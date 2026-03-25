@@ -266,12 +266,8 @@ static inline int32_t nvdla_truncate(int32_t value, unsigned truncate)
     if (truncate == 0) {
         return value;
     }
-    int32_t sign = (value < 0) ? 1 : 0;
     uint32_t guide = (value >> (truncate - 1)) & 1;
-    uint32_t sticky = (truncate > 1)
-        ? ((value & ((1u << (truncate - 1)) - 1)) != 0) : 0;
-    int32_t round_up = guide & ((!sign) | sticky);
-    return (value >> truncate) + round_up;
+    return (value >> truncate) + guide;
 }
 
 static inline int64_t nvdla_shift_right_round64(int64_t value, unsigned shift)
@@ -279,12 +275,8 @@ static inline int64_t nvdla_shift_right_round64(int64_t value, unsigned shift)
     if (shift == 0) {
         return value;
     }
-    int64_t sign = (value < 0) ? 1 : 0;
     uint64_t guide = (value >> (shift - 1)) & 1;
-    uint64_t sticky = (shift > 1)
-        ? ((value & ((1ULL << (shift - 1)) - 1)) != 0) : 0;
-    int64_t round_up = guide & ((!sign) | sticky);
-    return (value >> shift) + round_up;
+    return (value >> shift) + guide;
 }
 
 /* ======================================================================
@@ -484,26 +476,27 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
 
                             acc += (int32_t)in_val * (int32_t)w_val;
                             sum_inputs += (int32_t)in_val;
+
                         }
                     }
                 }
 
-                /* BS_OW_OP: weight zero-point compensation.
-                 * Weights are stored as (w - 0x80), but correct is (w - wzp).
-                 * Per output pixel, this introduces error = (wzp - 0x80) * sum(inputs).
-                 * BS_OW_OP = (0x80 - wzp) cancels it: acc += ow_op * sum_inputs. */
+                acc = nvdla_truncate(acc, task->truncate_bits);
+
+                /* BS_OW_OP: weight zero-point compensation (SDP stage).
+                 * Applied AFTER CACC truncation, matching hardware pipeline order.
+                 * Weights stored as (w - 0x80), BS_OW_OP = (0x80 - wzp) corrects. */
                 if (task->bs_ow_op) {
                     int16_t ow_op = (int16_t)task->bs_ow_op;
                     acc += (int32_t)ow_op * sum_inputs;
                 }
-
-                acc = nvdla_truncate(acc, task->truncate_bits);
 
                 /* SDP Pipeline: BS → BN → EW → OUT_CVT */
                 {
                     bool bs_alu_src = (task->bs_cfg >> 8) & 1;
                     int32_t bs_alu_op = bs_alu_src ? bias_buf[oc]
                                                    : task->bs_alu_cfg;
+
 
                     /* Per-channel MUL: when MUL_SRC=DMA (bit 0 of bs_mul_cfg),
                      * override the scalar mul operand with per-channel value */
