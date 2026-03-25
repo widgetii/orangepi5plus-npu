@@ -6,8 +6,10 @@ set -euo pipefail
 
 MODEL_DIR="/root/npu-research/models"
 MODEL="${MODEL_DIR}/mobilenet_v1_quant.tflite"
-GOLDEN="${MODEL_DIR}/mobilenet_golden.bin"
 INPUT="${MODEL_DIR}/grace_hopper_224.bin"
+# Golden from git (TFLite CPU reference, class 653 "military uniform")
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+GOLDEN="${SCRIPT_DIR}/../../qemu-boot/golden_mobilenet_output.bin"
 # MobileNetV1 class 653 = "military uniform" (Grace Hopper photo)
 EXPECTED_CLASS=653
 
@@ -33,6 +35,12 @@ for f in "$MODEL" "$INPUT"; do
     fi
 done
 
+if [ ! -f "$GOLDEN" ]; then
+    echo "ERROR: Golden file not found: $GOLDEN"
+    echo "  (golden must be committed in git at qemu-boot/golden_mobilenet_output.bin)"
+    exit 2
+fi
+
 # Build
 echo ""
 echo "=== Building librocketnpu ==="
@@ -48,19 +56,10 @@ echo ""
 echo "=== Running rknpu_abi tests (aarch64) ==="
 LD_LIBRARY_PATH=. ./test_rknpu_abi
 
-# Run NPU inference with real image
+# Run NPU inference with real image and classification check
 echo ""
 echo "=== Running MobileNetV1 NPU inference (Grace Hopper) ==="
-if [ -f "$GOLDEN" ]; then
-    LD_LIBRARY_PATH=. ./test_mobilenet "$MODEL" 5 "$GOLDEN" "$INPUT" "$EXPECTED_CLASS"
-else
-    echo "No golden file — first run, generating baseline"
-    LD_LIBRARY_PATH=. ./test_mobilenet "$MODEL" 1 "" "$INPUT" "$EXPECTED_CLASS" || true
-    cp output_0.bin "$GOLDEN"
-    echo "Golden saved to $GOLDEN"
-    # Re-run with golden to verify determinism
-    LD_LIBRARY_PATH=. ./test_mobilenet "$MODEL" 3 "$GOLDEN" "$INPUT" "$EXPECTED_CLASS"
-fi
+LD_LIBRARY_PATH=. ./test_mobilenet "$MODEL" 5 "$GOLDEN" "$INPUT" "$EXPECTED_CLASS"
 
 echo ""
 echo "=== All hardware smoke tests passed ==="

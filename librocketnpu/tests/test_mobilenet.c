@@ -218,9 +218,8 @@ int main(int argc, char **argv)
       if (top1 == expected_class) {
          printf("RESULT: PASS (expected class %d)\n", expected_class);
       } else {
-         printf("RESULT: WRONG_CLASS (expected %d, got %d)\n", expected_class, top1);
-         /* Don't fail — known input conversion issue on RKNPU.
-          * Golden comparison (above) is the real correctness gate. */
+         printf("RESULT: FAIL (expected class %d, got %d)\n", expected_class, top1);
+         result = 1;
       }
 
       free(output);
