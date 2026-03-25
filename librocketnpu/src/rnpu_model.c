@@ -1383,20 +1383,63 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
       if (debug_level < 0) debug_level = 0;
    }
 
+   /* RNPU_DEBUG_PER_OP: submit one job at a time and read output CRC
+    * immediately, avoiding activation BO reuse corrupting earlier tensors. */
+   bool debug_per_op = getenv("RNPU_DEBUG_PER_OP") != NULL;
+
    /* Execute segments — one job per CONV operation */
    unsigned hw_job_idx = 0;
    for (unsigned s = 0; s < m->segment_count; s++) {
       struct rnpu_exec_segment *seg = &m->segments[s];
       if (seg->is_hw) {
-         /* Submit all jobs in this segment */
-         int ret = rnpu_submit(m->fd, &m->jobs[hw_job_idx], seg->job_count);
-         if (ret) {
-            fprintf(stderr, "rnpu: segment submit failed (%u jobs)\n", seg->job_count);
-            return ret;
-         }
 
-         /* Wait for completion */
-         rnpu_bo_prep(m->fd, &m->activation_bo);
+         if (debug_per_op) {
+            /* Per-op mode: submit one job at a time, CRC output after each */
+            unsigned j_idx = hw_job_idx;
+            for (unsigned j = 0; j < seg->job_count; j++) {
+               int ret = rnpu_submit(m->fd, &m->jobs[j_idx + j], 1);
+               if (ret) {
+                  fprintf(stderr, "rnpu: per-op submit %u failed\n", j);
+                  return ret;
+               }
+               rnpu_bo_prep(m->fd, &m->activation_bo);
+
+               /* Find which op this job belongs to and CRC its output */
+               unsigned op_idx = seg->first_op + j;
+               if (op_idx < seg->first_op + seg->op_count) {
+                  struct rnpu_operation *dop = &m->ops[op_idx];
+                  unsigned out_ti = dop->output_tensor;
+                  uint8_t *out_ptr = act + m->tensors[out_ti].offset;
+                  /* Use actual written size (groups * w * h * 16), NOT tensor
+                   * allocation which may include 2x padding for HW convention */
+                  unsigned out_sz = DIV_ROUND_UP(dop->output_channels, FEATURE_ATOMIC_SIZE)
+                       * dop->output_width * dop->output_height * FEATURE_ATOMIC_SIZE;
+                  uint16_t out_crc = crc16(out_ptr, out_sz);
+                  fprintf(stderr, "perop: op[%02u] %-8s t%u->t%u %ux%ux%u out_crc=%04x sz=%u\n",
+                          op_idx, op_type_name(dop->type, dop->depthwise),
+                          dop->input_tensor, dop->output_tensor,
+                          dop->output_width, dop->output_height, dop->output_channels,
+                          out_crc, out_sz);
+                  /* Dump raw NPU tensor to /tmp/perop_NN.bin */
+                  {
+                     char path[64];
+                     snprintf(path, sizeof(path), "/tmp/perop_%02u.bin", op_idx);
+                     FILE *fp = fopen(path, "wb");
+                     if (fp) { fwrite(out_ptr, 1, out_sz, fp); fclose(fp); }
+                  }
+               }
+               rnpu_bo_fini(m->fd, &m->activation_bo);
+            }
+            rnpu_bo_prep(m->fd, &m->activation_bo);
+         } else {
+            /* Normal mode: submit all jobs in segment at once */
+            int ret = rnpu_submit(m->fd, &m->jobs[hw_job_idx], seg->job_count);
+            if (ret) {
+               fprintf(stderr, "rnpu: segment submit failed (%u jobs)\n", seg->job_count);
+               return ret;
+            }
+            rnpu_bo_prep(m->fd, &m->activation_bo);
+         }
 
          /* Apply per-axis corrections (skip for BRDMA per-channel ops —
           * hardware already handles per-channel requantization) */

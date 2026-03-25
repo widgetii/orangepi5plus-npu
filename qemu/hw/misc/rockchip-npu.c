@@ -113,7 +113,7 @@ static void parse_regcmd_entry(RocketConvTask *task, uint64_t entry)
         break;
     case 0x301c: task->truncate_bits = val & 0x1f; break;
     case 0x4020: task->dst_addr = val; break;
-    case 0x4024: task->output_surface_stride = (val >> 4) & 0x0fffffff; break;
+    case 0x4024: task->output_surface_stride = val & 0xfffffff0; break;
     case 0x4030: break;
     case 0x4034: break;
     case 0x403c:
@@ -563,6 +563,7 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                 if (scaled < -65536) scaled = -65536;
 
                 int32_t result = (int32_t)scaled + out_cvt_offset;
+
                 if (result < -128) result = -128;
                 if (result > 127) result = 127;
 
@@ -585,6 +586,25 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
         }
     } else {
         npu_dma_write(s, task->dst_addr, out_buf, out_buf_size);
+    }
+
+    /* Per-task output CRC + first bytes for debugging */
+    {
+        uint16_t crc = 0xFFFF;
+        for (uint32_t i = 0; i < out_buf_size; i++) {
+            crc ^= (uint16_t)out_buf[i] << 8;
+            for (int j = 0; j < 8; j++)
+                crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+        }
+        /* Log first 16 bytes of output for comparison with board */
+        char hex[64];
+        int hlen = 0;
+        for (int i = 0; i < 16 && i < (int)out_buf_size; i++)
+            hlen += snprintf(hex + hlen, sizeof(hex) - hlen, "%02x ", out_buf[i]);
+        qemu_log_mask(LOG_UNIMP,
+                      "rockchip-npu: task %s %ux%ux%u dst=0x%x crc=%04x [%s]\n",
+                      depthwise ? "DW" : "CV",
+                      out_w, out_h, out_c, task->dst_addr, crc, hex);
     }
 
     g_free(in_buf);

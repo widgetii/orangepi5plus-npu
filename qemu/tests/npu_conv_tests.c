@@ -702,7 +702,7 @@ static unsigned build_conv_regcmd(uint64_t *buf, const struct conv_config *cfg,
     *p++ = emit(TARGET_DPU, 0x4014, 0);
     *p++ = emit(TARGET_DPU, 0x4020, out_addr);
     uint32_t dst_surf_stride = out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
-    *p++ = emit(TARGET_DPU, 0x4024, dst_surf_stride << 4);
+    *p++ = emit(TARGET_DPU, 0x4024, dst_surf_stride);
     *p++ = emit(TARGET_DPU, 0x4030, out_w - 1);
     *p++ = emit(TARGET_DPU, 0x4034, out_h - 1);
     *p++ = emit(TARGET_DPU, 0x4038, 0);

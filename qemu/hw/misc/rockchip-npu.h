@@ -264,8 +264,6 @@ static inline uint32_t npu_input_offset(uint32_t g, uint32_t x, uint32_t y,
 static inline uint32_t npu_output_offset(uint32_t g, uint32_t x, uint32_t y,
                                           uint32_t w, uint32_t h)
 {
-    /* Col-major (x outer, y inner) — matches npu_input_offset so intermediate
-     * tensors chain correctly without per-tile transpose. */
     return g * w * h * NPU_FEATURE_ATOMIC_SIZE +
            x * h * NPU_FEATURE_ATOMIC_SIZE +
            y * NPU_FEATURE_ATOMIC_SIZE;
