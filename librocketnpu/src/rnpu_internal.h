@@ -117,6 +117,10 @@ enum rnpu_tfl_opcode {
    TFLITE_OP_RESHAPE = 22,
    TFLITE_OP_SOFTMAX = 25,
    TFLITE_OP_PAD = 34,
+   TFLITE_OP_FULLY_CONNECTED = 9,
+   TFLITE_OP_STRIDED_SLICE = 45,
+   TFLITE_OP_SHAPE = 77,
+   TFLITE_OP_PACK = 83,
    TFLITE_OP_RESIZE_NEAREST_NEIGHBOR = 97,
 };
 
@@ -167,6 +171,7 @@ enum rnpu_op_type {
    RNPU_OP_AVG_POOL,
    RNPU_OP_RESHAPE,
    RNPU_OP_SOFTMAX,
+   RNPU_OP_FULLY_CONNECTED,
 };
 
 struct rnpu_split_task {
@@ -293,6 +298,16 @@ struct rnpu_operation {
          float out_scale;
          int out_zp;
       } softmax;
+      struct {
+         const int8_t *weights;   /* [output_size, input_size] */
+         const int32_t *bias;     /* [output_size] */
+         unsigned input_size;
+         unsigned output_size;
+         float in_scale, out_scale;
+         int in_zp, w_zp, out_zp;
+         float *w_scales;         /* per-channel: [output_size], NULL if per-tensor */
+         unsigned num_w_scales;
+      } fc;
    } sw;
 };
 

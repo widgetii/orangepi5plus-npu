@@ -226,6 +226,48 @@ static void lower_softmax(struct rnpu_model *m, const struct rnpu_tfl_op *top,
    op->sw.softmax.out_zp = ot->quant.zero_point;
 }
 
+static void lower_fully_connected(struct rnpu_model *m, const struct rnpu_tfl_op *top,
+                                    struct rnpu_operation *op)
+{
+   lower_sw_op_auto(m, top, op, RNPU_OP_FULLY_CONNECTED);
+
+   const struct rnpu_tfl_tensor *it = &m->tfl.tensors[top->inputs[0]];
+   const struct rnpu_tfl_tensor *wt = &m->tfl.tensors[top->inputs[1]];
+   const struct rnpu_tfl_tensor *ot = &m->tfl.tensors[top->outputs[0]];
+
+   const struct rnpu_tfl_buffer *wb = &m->tfl.buffers[wt->buffer_index];
+   op->sw.fc.weights = (const int8_t *)wb->data;
+
+   if (top->input_count > 2 && top->inputs[2] >= 0) {
+      const struct rnpu_tfl_tensor *bt = &m->tfl.tensors[top->inputs[2]];
+      const struct rnpu_tfl_buffer *bb = &m->tfl.buffers[bt->buffer_index];
+      op->sw.fc.bias = (const int32_t *)bb->data;
+   }
+
+   unsigned input_size = 1;
+   for (int d = 1; d < it->shape_len; d++)
+      input_size *= it->shape[d];
+   op->sw.fc.input_size = input_size;
+   op->sw.fc.output_size = ot->shape[ot->shape_len - 1];
+
+   op->sw.fc.in_scale = it->quant.scale;
+   op->sw.fc.in_zp = it->quant.zero_point;
+   op->sw.fc.w_zp = wt->quant.zero_point;
+   op->sw.fc.out_scale = ot->quant.scale;
+   op->sw.fc.out_zp = ot->quant.zero_point;
+
+   if (wt->quant.scales && wt->quant.num_scales > 1) {
+      op->sw.fc.num_w_scales = wt->quant.num_scales;
+      op->sw.fc.w_scales = malloc(wt->quant.num_scales * sizeof(float));
+      memcpy(op->sw.fc.w_scales, wt->quant.scales,
+             wt->quant.num_scales * sizeof(float));
+   } else {
+      op->sw.fc.num_w_scales = 1;
+      op->sw.fc.w_scales = malloc(sizeof(float));
+      op->sw.fc.w_scales[0] = wt->quant.scale;
+   }
+}
+
 static void lower_logistic(struct rnpu_model *m, const struct rnpu_tfl_op *top,
                             struct rnpu_operation *op)
 {
@@ -1151,6 +1193,15 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
          lower_softmax(m, top, op);
          m->op_count++;
          break;
+      case TFLITE_OP_FULLY_CONNECTED:
+         lower_fully_connected(m, top, op);
+         m->op_count++;
+         break;
+      case TFLITE_OP_SHAPE:
+      case TFLITE_OP_STRIDED_SLICE:
+      case TFLITE_OP_PACK:
+         /* Shape computation ops for dynamic RESHAPE — silently skip */
+         break;
       default:
          fprintf(stderr, "rnpu: unsupported op %d\n", top->builtin_code);
          break;
@@ -1297,6 +1348,7 @@ static const char *op_type_name(enum rnpu_op_type t, bool dw)
    case RNPU_OP_AVG_POOL: return "AVGPOOL";
    case RNPU_OP_RESHAPE: return "RESHAPE";
    case RNPU_OP_SOFTMAX: return "SOFTMAX";
+   case RNPU_OP_FULLY_CONNECTED: return "FC";
    default: return "?";
    }
 }
@@ -1356,7 +1408,10 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
 
    if (m->sw_only) {
       unsigned total = first->input_width * first->input_height * first->input_channels;
-      memcpy(act + m->tensors[m->graph_input_tensor].offset, input, total);
+      const uint8_t *src = (const uint8_t *)input;
+      uint8_t *dst = act + m->tensors[m->graph_input_tensor].offset;
+      for (unsigned i = 0; i < total; i++)
+         dst[i] = src[i] - 0x80;
    } else {
       rnpu_convert_input(act + m->tensors[m->graph_input_tensor].offset,
                          input,

@@ -18,9 +18,17 @@ librocketnpu/capture_rknn_golden
 *.tar
 *.tar.gz
 
+# Small test artifacts that MUST be tracked
+!librocketnpu/tests/models/fc_model_int8.tflite
+!librocketnpu/tests/models/fc_test_input.bin
+!librocketnpu/tests/models/fc_cpu_golden.bin
+
 # QEMU boot/src directories (large binaries, kernel images)
 qemu-boot/
 qemu-src/
+# Init scripts inside qemu-boot are tracked
+!qemu-boot/rootfs/
+!qemu-boot/rootfs-vendor/
 qemu/hw/misc/*.bak
 
 # Static test binaries

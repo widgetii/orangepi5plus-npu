@@ -8,5 +8,10 @@ echo "Conv tests exit code: $?"
 echo "=== Running MobileNet ==="
 /bin/test_mobilenet /model.tflite 1 /golden.bin /input.bin 653
 echo "MobileNetV1 exit code: $?"
+if [ -f /bin/test_fc ] && [ -f /fc_model.tflite ]; then
+echo "=== Running FC test ==="
+/bin/test_fc /fc_model.tflite /fc_golden.bin /fc_input.bin
+echo "FC test exit code: $?"
+fi
 echo "--- QEMU NPU TEST COMPLETE ---"
 exec /bin/sh

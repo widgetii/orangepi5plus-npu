@@ -27,7 +27,7 @@ ONNX_LDFLAGS = -lprotobuf-c
 
 .PHONY: all clean test
 
-all: librocketnpu.so test_mobilenet test_yolo test_debug test_sw_ops test_rknpu_abi test_hybrid_regcmd test_onnx_parse
+all: librocketnpu.so test_mobilenet test_yolo test_debug test_sw_ops test_rknpu_abi test_hybrid_regcmd test_onnx_parse test_fc
 
 librocketnpu.so: $(OBJS)
 	$(CC) -shared -o $@ $^ $(LDFLAGS)
@@ -51,6 +51,9 @@ test_rknpu_abi: tests/test_rknpu_abi.c librocketnpu.so
 	$(CC) $(CFLAGS) -o $@ $< -L. -lrocketnpu -Wl,-rpath,'$$ORIGIN' $(LDFLAGS)
 
 test_hybrid_regcmd: tests/test_hybrid_regcmd.c librocketnpu.so
+	$(CC) $(CFLAGS) -o $@ $< -L. -lrocketnpu -Wl,-rpath,'$$ORIGIN' $(LDFLAGS)
+
+test_fc: tests/test_fc.c librocketnpu.so
 	$(CC) $(CFLAGS) -o $@ $< -L. -lrocketnpu -Wl,-rpath,'$$ORIGIN' $(LDFLAGS)
 
 test_onnx_parse: tests/test_onnx_parse.c $(ONNX_OBJS)

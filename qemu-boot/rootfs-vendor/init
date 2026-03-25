@@ -57,6 +57,13 @@ if [ -f /bin/test_mobilenet ] && [ -f /model.tflite ]; then
     echo "MobileNetV1 exit code: $?"
 fi
 
+if [ -f /bin/test_fc ] && [ -f /fc_model.tflite ]; then
+    echo ""
+    echo "=== Running FC test ==="
+    /bin/test_fc /fc_model.tflite /fc_golden.bin /fc_input.bin
+    echo "FC test exit code: $?"
+fi
+
 echo ""
 echo "--- QEMU RKNPU TEST COMPLETE ---"
 exec /bin/sh < /dev/ttyS0

@@ -30,7 +30,7 @@ jobs:
         run: make librocketnpu.so
 
       - name: Build tests
-        run: make test_sw_ops test_rknpu_abi test_onnx_parse
+        run: make test_sw_ops test_rknpu_abi test_onnx_parse test_fc
 
       - name: Run sw_ops tests
         run: LD_LIBRARY_PATH=. ./test_sw_ops

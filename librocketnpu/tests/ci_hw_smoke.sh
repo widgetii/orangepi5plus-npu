@@ -45,7 +45,7 @@ fi
 echo ""
 echo "=== Building librocketnpu ==="
 make clean 2>/dev/null || true
-make librocketnpu.so test_mobilenet test_sw_ops test_rknpu_abi
+make librocketnpu.so test_mobilenet test_fc test_sw_ops test_rknpu_abi
 
 # Run CPU-only tests on aarch64
 echo ""
@@ -60,6 +60,14 @@ LD_LIBRARY_PATH=. ./test_rknpu_abi
 echo ""
 echo "=== Running MobileNetV1 NPU inference (Grace Hopper) ==="
 LD_LIBRARY_PATH=. ./test_mobilenet "$MODEL" 5 "$GOLDEN" "$INPUT" "$EXPECTED_CLASS"
+
+# Run FC model test (sw_only, no NPU hardware needed)
+FC_DIR="${SCRIPT_DIR}/models"
+if [ -f "$FC_DIR/fc_model_int8.tflite" ]; then
+    echo ""
+    echo "=== Running FC model test ==="
+    LD_LIBRARY_PATH=. ./test_fc "$FC_DIR/fc_model_int8.tflite" "$FC_DIR/fc_cpu_golden.bin" "$FC_DIR/fc_test_input.bin"
+fi
 
 echo ""
 echo "=== All hardware smoke tests passed ==="

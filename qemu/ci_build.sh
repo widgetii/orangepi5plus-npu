@@ -139,6 +139,12 @@ ${CROSS}gcc -static -O2 -Ilibrocketnpu/include -Ilibrocketnpu/src \
     -o "$BOOT/test_mobilenet" librocketnpu/tests/test_mobilenet.c \
     "$OBJDIR/librocketnpu.a" -lm
 echo "test_mobilenet: $(file "$BOOT/test_mobilenet" | grep -o 'ARM aarch64.*linked')"
+
+# test_fc
+${CROSS}gcc -static -O2 -Ilibrocketnpu/include -Ilibrocketnpu/src \
+    -o "$BOOT/test_fc" librocketnpu/tests/test_fc.c \
+    "$OBJDIR/librocketnpu.a" -lm
+echo "test_fc: $(file "$BOOT/test_fc" | grep -o 'ARM aarch64.*linked')"
 rm -rf "$OBJDIR"
 
 echo ""
@@ -172,6 +178,7 @@ done
 cp "$BOOT/npu_test" "$ROOTFS/bin/"
 cp "$BOOT/npu_conv_tests" "$ROOTFS/bin/"
 cp "$BOOT/test_mobilenet" "$ROOTFS/bin/"
+cp "$BOOT/test_fc" "$ROOTFS/bin/"
 
 # Kernel modules
 if [ -d "$BOOT/modules" ]; then
@@ -182,6 +189,14 @@ fi
 if [ -f "$MODEL" ]; then cp "$MODEL" "$ROOTFS/model.tflite"; fi
 if [ -f "$GOLDEN" ]; then cp "$GOLDEN" "$ROOTFS/golden.bin"; fi
 if [ -f "$BOOT/grace_hopper_224.bin" ]; then cp "$BOOT/grace_hopper_224.bin" "$ROOTFS/input.bin"; fi
+
+# FC model + test data
+FC_DIR="$REPO_ROOT/librocketnpu/tests/models"
+if [ -f "$FC_DIR/fc_model_int8.tflite" ]; then
+    cp "$FC_DIR/fc_model_int8.tflite" "$ROOTFS/fc_model.tflite"
+    cp "$FC_DIR/fc_test_input.bin" "$ROOTFS/fc_input.bin"
+    cp "$FC_DIR/fc_cpu_golden.bin" "$ROOTFS/fc_golden.bin"
+fi
 
 # Init script (from git)
 cp "$BOOT/rootfs/init" "$ROOTFS/init"
@@ -202,8 +217,14 @@ done
 
 cp "$BOOT/npu_conv_tests" "$ROOTFS_V/bin/" 2>/dev/null || true
 cp "$BOOT/test_mobilenet" "$ROOTFS_V/bin/" 2>/dev/null || true
+cp "$BOOT/test_fc" "$ROOTFS_V/bin/" 2>/dev/null || true
 if [ -f "$MODEL" ]; then cp "$MODEL" "$ROOTFS_V/model.tflite"; fi
 if [ -f "$GOLDEN" ]; then cp "$GOLDEN" "$ROOTFS_V/golden.bin"; fi
+if [ -f "$FC_DIR/fc_model_int8.tflite" ]; then
+    cp "$FC_DIR/fc_model_int8.tflite" "$ROOTFS_V/fc_model.tflite"
+    cp "$FC_DIR/fc_test_input.bin" "$ROOTFS_V/fc_input.bin"
+    cp "$FC_DIR/fc_cpu_golden.bin" "$ROOTFS_V/fc_golden.bin"
+fi
 cp "$BOOT/rootfs-vendor/init" "$ROOTFS_V/init"
 chmod +x "$ROOTFS_V/init"
 

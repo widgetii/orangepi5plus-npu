@@ -23,45 +23,42 @@
 typedef uint64_t rknn_context;
 
 typedef struct {
-   uint32_t id;
-   uint32_t size;
+   uint32_t index;
    uint32_t n_dims;
    uint32_t dims[16];
    char name[256];
    uint32_t n_elems;
+   uint32_t size;
+   uint32_t fmt;
    uint32_t type;
    uint32_t qnt_type;
    int8_t fl;
-   uint32_t zp;
+   int32_t zp;
    float scale;
    uint32_t w_stride;
    uint32_t size_with_stride;
    uint8_t pass_through;
-   uint8_t h_stride;
+   uint32_t h_stride;
 } rknn_tensor_attr;
 
 typedef struct {
-   uint8_t *buf;
+   uint8_t want_float;
+   uint8_t is_prealloc;
+   uint32_t index;
+   void *buf;
    uint32_t size;
-   int32_t  index;
-   uint32_t type;
-   uint32_t fmt;
-   uint8_t  pass_through;
 } rknn_output;
 
 typedef struct {
+   uint32_t index;
    void *buf;
    uint32_t size;
-   uint8_t  pass_through;
+   uint8_t pass_through;
    uint32_t type;
    uint32_t fmt;
-   uint32_t index;
 } rknn_input;
 
 typedef struct {
-   uint32_t model_channel;
-   uint32_t model_width;
-   uint32_t model_height;
    uint32_t n_input;
    uint32_t n_output;
 } rknn_input_output_num;
@@ -86,11 +83,12 @@ typedef int (*rknn_destroy_fn)(rknn_context);
 int main(int argc, char **argv)
 {
    if (argc < 2) {
-      fprintf(stderr, "Usage: %s <model.rknn> [output_prefix]\n", argv[0]);
+      fprintf(stderr, "Usage: %s <model.rknn> [output_prefix] [input.bin]\n", argv[0]);
       return 1;
    }
    const char *model_path = argv[1];
    const char *prefix = argc > 2 ? argv[2] : "rknn_golden";
+   const char *input_path = argc > 3 ? argv[3] : NULL;
 
    /* Load RKNN runtime dynamically */
    void *lib = dlopen("librknnrt.so", RTLD_NOW);
@@ -141,7 +139,7 @@ int main(int argc, char **argv)
 
    /* Query input attrs */
    for (uint32_t i = 0; i < io_num.n_input; i++) {
-      rknn_tensor_attr attr = { .id = i };
+      rknn_tensor_attr attr = { .index = i };
       p_query(ctx, RKNN_QUERY_INPUT_ATTR, &attr, sizeof(attr));
       printf("Input %u: %s, dims=[", i, attr.name);
       for (uint32_t d = 0; d < attr.n_dims; d++)
@@ -152,7 +150,7 @@ int main(int argc, char **argv)
    /* Query output attrs */
    rknn_tensor_attr *out_attrs = calloc(io_num.n_output, sizeof(rknn_tensor_attr));
    for (uint32_t i = 0; i < io_num.n_output; i++) {
-      out_attrs[i].id = i;
+      out_attrs[i].index = i;
       p_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &out_attrs[i], sizeof(rknn_tensor_attr));
       printf("Output %u: %s, dims=[", i, out_attrs[i].name);
       for (uint32_t d = 0; d < out_attrs[i].n_dims; d++)
@@ -168,7 +166,20 @@ int main(int argc, char **argv)
 
    uint32_t in_size = in_attr.n_elems;
    uint8_t *input = malloc(in_size);
-   memset(input, 128, in_size);
+   if (input_path) {
+      FILE *inf = fopen(input_path, "rb");
+      if (!inf) {
+         fprintf(stderr, "Cannot open input: %s\n", input_path);
+         p_destroy(ctx); dlclose(lib);
+         return 1;
+      }
+      fread(input, 1, in_size, inf);
+      fclose(inf);
+      printf("Loaded input: %s (%u bytes)\n", input_path, in_size);
+   } else {
+      memset(input, 128, in_size);
+      printf("Using default input (all 128)\n");
+   }
 
    rknn_input inputs[1] = {{
       .buf = input,

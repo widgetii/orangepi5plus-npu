@@ -368,6 +368,40 @@ static void exec_logistic(struct rnpu_model *m, struct rnpu_operation *op)
       out[i] = lut[in[i]];
 }
 
+static void exec_fully_connected(struct rnpu_model *m, struct rnpu_operation *op)
+{
+   unsigned in_size = op->sw.fc.input_size;
+   unsigned out_size = op->sw.fc.output_size;
+   const int8_t *weights = op->sw.fc.weights;
+   const int32_t *bias = op->sw.fc.bias;
+   int in_zp = op->sw.fc.in_zp;
+   int w_zp = op->sw.fc.w_zp;
+   float in_scale = op->sw.fc.in_scale;
+   float out_scale = op->sw.fc.out_scale;
+   int out_zp = op->sw.fc.out_zp;
+   bool per_channel = op->sw.fc.num_w_scales > 1;
+
+   uint8_t *in = tensor_ptr(m, op->input_tensor);
+   uint8_t *out = tensor_ptr(m, op->output_tensor);
+
+   for (unsigned i = 0; i < out_size; i++) {
+      int32_t acc = 0;
+      for (unsigned j = 0; j < in_size; j++) {
+         int32_t iv = (int32_t)(int8_t)in[j] - in_zp;
+         int32_t wv = (int32_t)weights[i * in_size + j] - w_zp;
+         acc += iv * wv;
+      }
+      if (bias) acc += bias[i];
+
+      float w_scale = per_channel ? op->sw.fc.w_scales[i] : op->sw.fc.w_scales[0];
+      float m_scale = in_scale * w_scale / out_scale;
+      int q = (int)roundf((float)acc * m_scale) + out_zp;
+      if (q < -128) q = -128;
+      if (q > 127) q = 127;
+      out[i] = (uint8_t)(int8_t)q;
+   }
+}
+
 void rnpu_execute_sw_op(struct rnpu_model *m, unsigned op_index)
 {
    struct rnpu_operation *op = &m->ops[op_index];
@@ -380,6 +414,7 @@ void rnpu_execute_sw_op(struct rnpu_model *m, unsigned op_index)
    case RNPU_OP_AVG_POOL:       exec_avg_pool(m, op); break;
    case RNPU_OP_RESHAPE:        exec_reshape(m, op); break;
    case RNPU_OP_SOFTMAX:        exec_softmax(m, op); break;
+   case RNPU_OP_FULLY_CONNECTED: exec_fully_connected(m, op); break;
    default: break;
    }
 }
