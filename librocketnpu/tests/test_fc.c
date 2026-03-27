@@ -127,7 +127,7 @@ int main(int argc, char **argv)
          if (max_diff == 0)
             printf("RESULT: PASS (bit-exact)\n");
          else if (max_diff <= 1)
-            printf("RESULT: CLOSE (max_diff=1)\n");
+            printf("RESULT: PASS (max_diff=%d, within HW tolerance)\n", max_diff);
          else {
             printf("RESULT: FAIL (max_diff=%d)\n", max_diff);
             result = 1;

@@ -8,14 +8,46 @@
 #include <math.h>
 #include "rnpu_coefs.h"
 
+/* Shape helpers — handle both 4D conv tensors and 2D FC tensors */
+static unsigned op_channels(const struct rnpu_tfl_tensor *t)
+{
+   return (t->shape_len >= 4) ? t->shape[3] : t->shape[t->shape_len - 1];
+}
+
+static unsigned op_input_channels(const struct rnpu_tfl_model *tfl,
+                                  const struct rnpu_tfl_op *op)
+{
+   return op_channels(&tfl->tensors[op->inputs[0]]);
+}
+
+static unsigned op_output_channels(const struct rnpu_tfl_model *tfl,
+                                   const struct rnpu_tfl_op *op)
+{
+   return op_channels(&tfl->tensors[op->outputs[0]]);
+}
+
+static void op_weight_dims(const struct rnpu_tfl_model *tfl,
+                           const struct rnpu_tfl_op *op,
+                           unsigned *ww, unsigned *wh)
+{
+   const struct rnpu_tfl_tensor *wt = &tfl->tensors[op->inputs[1]];
+   if (wt->shape_len >= 4) {
+      *ww = wt->shape[1];
+      *wh = wt->shape[2];
+   } else {
+      *ww = 1;
+      *wh = 1;
+   }
+}
+
 /* Check if CONV is depthwise based on TFLite op */
 static bool is_depthwise(const struct rnpu_tfl_model *tfl,
                          const struct rnpu_tfl_op *op)
 {
    if (op->builtin_code != TFLITE_OP_DEPTHWISE_CONV_2D)
       return false;
-   unsigned ic = tfl->tensors[op->inputs[0]].shape[3];
-   unsigned oc = tfl->tensors[op->outputs[0]].shape[3];
+   unsigned ic = op_input_channels(tfl, op);
+   unsigned oc = op_output_channels(tfl, op);
    return ic > 1 && oc > 1;
 }
 
@@ -40,10 +72,10 @@ unsigned rnpu_fill_weights(const struct rnpu_tfl_model *tfl,
    const struct rnpu_tfl_buffer *buf = &tfl->buffers[wt->buffer_index];
    bool dw = is_depthwise(tfl, op);
 
-   unsigned weights_width = wt->shape[1];
-   unsigned weights_height = wt->shape[2];
-   unsigned input_channels_real = tfl->tensors[op->inputs[0]].shape[3];
-   unsigned output_channels_real = tfl->tensors[op->outputs[0]].shape[3];
+   unsigned weights_width, weights_height;
+   op_weight_dims(tfl, op, &weights_width, &weights_height);
+   unsigned input_channels_real = op_input_channels(tfl, op);
+   unsigned output_channels_real = op_output_channels(tfl, op);
    unsigned input_channels = MAX2(input_channels_real, FEATURE_ATOMIC_SIZE);
    unsigned output_channels = ALIGN_UP(output_channels_real, 2);
    if (dw) output_channels = 1;
@@ -101,9 +133,9 @@ unsigned rnpu_fill_weights_group(const struct rnpu_tfl_model *tfl,
    const struct rnpu_tfl_tensor *wt = &tfl->tensors[wt_idx];
    const struct rnpu_tfl_buffer *buf = &tfl->buffers[wt->buffer_index];
 
-   unsigned ww = wt->shape[1];
-   unsigned wh = wt->shape[2];
-   unsigned ic_real = tfl->tensors[op->inputs[0]].shape[3];
+   unsigned ww, wh;
+   op_weight_dims(tfl, op, &ww, &wh);
+   unsigned ic_real = op_input_channels(tfl, op);
    unsigned ic = MAX2(ic_real, FEATURE_ATOMIC_SIZE);
    uint8_t zp = (uint8_t)wt->quant.zero_point;
 
@@ -150,13 +182,13 @@ static int32_t calc_bias_correction(const struct rnpu_tfl_model *tfl,
    int wt_idx = op->inputs[1];
    const struct rnpu_tfl_tensor *wt = &tfl->tensors[wt_idx];
    const struct rnpu_tfl_buffer *buf = &tfl->buffers[wt->buffer_index];
-   unsigned ic = tfl->tensors[op->inputs[0]].shape[3];
+   unsigned ic = op_input_channels(tfl, op);
    const struct rnpu_tfl_tensor *it = &tfl->tensors[op->inputs[0]];
    /* Input/output zero points: int8 tensors need +128 for uint8 NPU domain */
    int izp = (it->type == 9) ? (uint8_t)(it->quant.zero_point + 128)
                               : (uint8_t)it->quant.zero_point;
-   unsigned ww = wt->shape[1];
-   unsigned wh = wt->shape[2];
+   unsigned ww, wh;
+   op_weight_dims(tfl, op, &ww, &wh);
    /* Weight zero point stays in raw domain (used for weight arithmetic) */
    int wzp = (uint8_t)wt->quant.zero_point;
    bool dw = is_depthwise(tfl, op);
@@ -193,7 +225,7 @@ unsigned rnpu_fill_biases(const struct rnpu_tfl_model *tfl,
    const struct rnpu_tfl_tensor *bt = &tfl->tensors[bias_idx];
    const struct rnpu_tfl_buffer *buf = &tfl->buffers[bt->buffer_index];
    const int32_t *biases_in = (const int32_t *)buf->data;
-   unsigned oc = tfl->tensors[op->outputs[0]].shape[3];
+   unsigned oc = op_output_channels(tfl, op);
 
    int wt_idx = op->inputs[1];
    const struct rnpu_tfl_tensor *wt = &tfl->tensors[wt_idx];
@@ -277,7 +309,7 @@ float rnpu_fill_brdma_data(const struct rnpu_tfl_model *tfl,
                             uint8_t *dst, unsigned dst_size,
                             unsigned *out_mul_shift)
 {
-   unsigned oc = tfl->tensors[op->outputs[0]].shape[3];
+   unsigned oc = op_output_channels(tfl, op);
    unsigned oc_pad = ALIGN_UP(MAX2(oc, 32), 16);
    int wt_idx = op->inputs[1];
    const struct rnpu_tfl_tensor *wt = &tfl->tensors[wt_idx];
@@ -358,7 +390,7 @@ float rnpu_fill_brdma_data_group(const struct rnpu_tfl_model *tfl,
                                    uint8_t *dst, unsigned dst_size,
                                    unsigned *out_mul_shift)
 {
-   unsigned oc = tfl->tensors[op->outputs[0]].shape[3];
+   unsigned oc = op_output_channels(tfl, op);
    unsigned oc_pad = ALIGN_UP(MAX2(oc, 32), 16);
    int wt_idx = op->inputs[1];
    const struct rnpu_tfl_tensor *wt = &tfl->tensors[wt_idx];

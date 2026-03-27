@@ -268,6 +268,62 @@ static void lower_fully_connected(struct rnpu_model *m, const struct rnpu_tfl_op
    }
 }
 
+static void lower_fc_as_conv(struct rnpu_model *m, const struct rnpu_tfl_op *top,
+                              struct rnpu_operation *op)
+{
+   const struct rnpu_tfl_model *tfl = &m->tfl;
+   const struct rnpu_tfl_tensor *it = &tfl->tensors[top->inputs[0]];
+   const struct rnpu_tfl_tensor *ot = &tfl->tensors[top->outputs[0]];
+   const struct rnpu_tfl_tensor *wt = &tfl->tensors[top->inputs[1]];
+
+   op->type = RNPU_OP_CONV;
+   op->depthwise = false;
+   op->stride = 1;
+   op->padding_same = false;
+   op->add_tensor = -1;
+
+   op->input_tensor = top->inputs[0];
+   if (it->shape_len >= 4) {
+      op->input_width = it->shape[1];
+      op->input_height = it->shape[2];
+      op->input_channels = it->shape[3];
+   } else {
+      unsigned n = 1;
+      for (int d = 1; d < it->shape_len; d++) n *= it->shape[d];
+      op->input_width = 1;
+      op->input_height = 1;
+      op->input_channels = n;
+   }
+   op->input_zero_point = tfl_zp_u8(it);
+   op->input_scale = it->quant.scale;
+
+   op->output_tensor = top->outputs[0];
+   if (ot->shape_len >= 4) {
+      op->output_width = ot->shape[1];
+      op->output_height = ot->shape[2];
+      op->output_channels = ot->shape[3];
+   } else {
+      op->output_width = 1;
+      op->output_height = 1;
+      op->output_channels = ot->shape[ot->shape_len - 1];
+   }
+   op->output_zero_point = tfl_zp_u8(ot);
+   op->output_scale = ot->quant.scale;
+
+   op->weights_width = 1;
+   op->weights_height = 1;
+   op->weights_zero_point = (uint8_t)wt->quant.zero_point;
+
+   if (wt->quant.scales && wt->quant.num_scales > 1) {
+      float max_s = wt->quant.scales[0];
+      for (unsigned i = 1; i < wt->quant.num_scales; i++)
+         if (wt->quant.scales[i] > max_s) max_s = wt->quant.scales[i];
+      op->weights_scale = max_s;
+   } else {
+      op->weights_scale = wt->quant.scale;
+   }
+}
+
 static void lower_logistic(struct rnpu_model *m, const struct rnpu_tfl_op *top,
                             struct rnpu_operation *op)
 {
@@ -297,6 +353,9 @@ static void lower_logistic(struct rnpu_model *m, const struct rnpu_tfl_op *top,
 
 /* ---- Per-axis group decomposition ---- */
 
+typedef void (*lower_fn)(struct rnpu_model *, const struct rnpu_tfl_op *,
+                         struct rnpu_operation *);
+
 static int cmp_scale_idx(const void *a, const void *b, void *ctx)
 {
    const float *s = ctx;
@@ -304,14 +363,16 @@ static int cmp_scale_idx(const void *a, const void *b, void *ctx)
    return (s[ia] > s[ib]) - (s[ia] < s[ib]);
 }
 
-static unsigned lower_conv_per_group(struct rnpu_model *m,
-                                     const struct rnpu_tfl_op *top,
-                                     struct rnpu_operation **ops_out,
-                                     unsigned *op_count)
+static unsigned lower_per_group(struct rnpu_model *m,
+                                const struct rnpu_tfl_op *top,
+                                struct rnpu_operation **ops_out,
+                                unsigned *op_count,
+                                lower_fn lower)
 {
    const struct rnpu_tfl_tensor *wt = &m->tfl.tensors[top->inputs[1]];
    const struct rnpu_tfl_tensor *ot = &m->tfl.tensors[top->outputs[0]];
-   unsigned full_oc = ot->shape[3];
+   unsigned full_oc = (ot->shape_len >= 4) ? ot->shape[3]
+                                           : ot->shape[ot->shape_len - 1];
    unsigned gs = PER_AXIS_GROUP_SIZE;
    unsigned ng = DIV_ROUND_UP(full_oc, gs);
 
@@ -327,7 +388,7 @@ static unsigned lower_conv_per_group(struct rnpu_model *m,
    for (unsigned g = 0; g < ng; g++) {
       struct rnpu_operation *op = &(*ops_out)[base + g];
       memset(op, 0, sizeof(*op));
-      lower_conv(m, top, op);
+      lower(m, top, op);
 
       unsigned gs_start = g * gs;
       unsigned gc = MIN2(gs, full_oc - gs_start);
@@ -361,6 +422,79 @@ static unsigned lower_conv_per_group(struct rnpu_model *m,
    free(sorted);
    *op_count = base + ng;
    return ng;
+}
+
+/* Setup BRDMA requant groups on an already-lowered per-channel op */
+static void setup_brdma_requant_groups(struct rnpu_model *m,
+                                       const struct rnpu_tfl_op *top,
+                                       struct rnpu_operation *op)
+{
+   const struct rnpu_tfl_tensor *wt = &m->tfl.tensors[top->inputs[1]];
+   unsigned oc = wt->quant.num_scales;
+
+   op->use_brdma_per_channel = true;
+   op->per_channel_scale_count = oc;
+   op->per_channel_scales = malloc(oc * sizeof(float));
+   memcpy(op->per_channel_scales, wt->quant.scales, oc * sizeof(float));
+
+   /* Sort channels by weight scale ascending */
+   unsigned *sorted = malloc(oc * sizeof(unsigned));
+   for (unsigned j = 0; j < oc; j++) sorted[j] = j;
+   for (unsigned a = 0; a < oc; a++)
+      for (unsigned b = a + 1; b < oc; b++)
+         if (wt->quant.scales[sorted[a]] > wt->quant.scales[sorted[b]]) {
+            unsigned tmp = sorted[a]; sorted[a] = sorted[b]; sorted[b] = tmp;
+         }
+
+   /* Greedy grouping where max/min ratio <= requant_ratio */
+   unsigned *group_starts = malloc(oc * sizeof(unsigned));
+   unsigned *group_sizes_tmp = malloc(oc * sizeof(unsigned));
+   float *group_max_ws_tmp = malloc(oc * sizeof(float));
+   unsigned ng = 0, gi = 0;
+   while (gi < oc) {
+      float min_s = wt->quant.scales[sorted[gi]];
+      float max_s = min_s;
+      unsigned ge = gi + 1;
+      while (ge < oc) {
+         float s = wt->quant.scales[sorted[ge]];
+         float new_max = s > max_s ? s : max_s;
+         float requant_ratio = getenv("RNPU_REQUANT_RATIO") ?
+            atof(getenv("RNPU_REQUANT_RATIO")) : 2.0f;
+         if (min_s > 0 && new_max / min_s > requant_ratio) break;
+         max_s = new_max;
+         ge++;
+      }
+      group_starts[ng] = gi;
+      group_sizes_tmp[ng] = ge - gi;
+      group_max_ws_tmp[ng] = max_s;
+      ng++;
+      gi = ge;
+   }
+
+   if (ng > 1) {
+      op->requant_group_count = ng;
+      op->requant_group_sizes = malloc(ng * sizeof(unsigned));
+      op->requant_group_ch_offset = malloc(ng * sizeof(unsigned));
+      op->requant_group_max_ws = malloc(ng * sizeof(float));
+      memcpy(op->requant_group_sizes, group_sizes_tmp, ng * sizeof(unsigned));
+      memcpy(op->requant_group_max_ws, group_max_ws_tmp, ng * sizeof(float));
+      unsigned ch_off = 0;
+      for (unsigned g = 0; g < ng; g++) {
+         op->requant_group_ch_offset[g] = ch_off;
+         ch_off += group_sizes_tmp[g];
+      }
+      op->group_channel_indices = malloc(oc * sizeof(unsigned));
+      memcpy(op->group_channel_indices, sorted, oc * sizeof(unsigned));
+      op->weights_scale = group_max_ws_tmp[ng - 1];
+
+      fprintf(stderr, "rnpu: op %u: %u requant groups for %u OC "
+              "(ratio %.1f)\n", m->op_count, ng, oc,
+              group_max_ws_tmp[ng-1] / group_max_ws_tmp[0]);
+   }
+   free(group_starts);
+   free(group_sizes_tmp);
+   free(group_max_ws_tmp);
+   free(sorted);
 }
 
 /* ---- Model compilation ---- */
@@ -491,14 +625,21 @@ static void compile_weights_and_biases(struct rnpu_model *m)
       const struct rnpu_tfl_op *top = NULL;
       for (unsigned j = 0; j < m->tfl.op_count; j++) {
          if (m->tfl.ops[j].builtin_code == TFLITE_OP_CONV_2D ||
-             m->tfl.ops[j].builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D) {
+             m->tfl.ops[j].builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D ||
+             m->tfl.ops[j].builtin_code == TFLITE_OP_FULLY_CONNECTED) {
             if (m->tfl.ops[j].outputs[0] == (int)op->output_tensor ||
-                m->tfl.ops[j].inputs[0] == (int)op->input_tensor ||
-                (op->output_tensor_channels > 0 &&
-                 m->tfl.tensors[m->tfl.ops[j].outputs[0]].shape[3] ==
-                 (int)op->output_tensor_channels)) {
+                m->tfl.ops[j].inputs[0] == (int)op->input_tensor) {
                top = &m->tfl.ops[j];
                break;
+            }
+            if (op->output_tensor_channels > 0) {
+               const struct rnpu_tfl_tensor *mt = &m->tfl.tensors[m->tfl.ops[j].outputs[0]];
+               unsigned mt_oc = (mt->shape_len >= 4) ? mt->shape[3]
+                                                     : mt->shape[mt->shape_len - 1];
+               if (mt_oc == op->output_tensor_channels) {
+                  top = &m->tfl.ops[j];
+                  break;
+               }
             }
          }
       }
@@ -567,7 +708,8 @@ static void compile_brdma_data(struct rnpu_model *m,
       const struct rnpu_tfl_op *top = NULL;
       for (unsigned j = 0; j < m->tfl.op_count; j++) {
          if (m->tfl.ops[j].builtin_code == TFLITE_OP_CONV_2D ||
-             m->tfl.ops[j].builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D) {
+             m->tfl.ops[j].builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D ||
+             m->tfl.ops[j].builtin_code == TFLITE_OP_FULLY_CONNECTED) {
             if (m->tfl.ops[j].outputs[0] == (int)op->output_tensor ||
                 m->tfl.ops[j].inputs[0] == (int)op->input_tensor) {
                top = &m->tfl.ops[j];
@@ -1006,17 +1148,20 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
    unsigned total_ops = 0;
    for (unsigned i = 0; i < m->tfl.op_count; i++) {
       const struct rnpu_tfl_op *top = &m->tfl.ops[i];
-      if (top->builtin_code == TFLITE_OP_CONV_2D ||
-          top->builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D) {
+      bool is_conv = (top->builtin_code == TFLITE_OP_CONV_2D ||
+                      top->builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D);
+      bool is_fc_hw = (top->builtin_code == TFLITE_OP_FULLY_CONNECTED &&
+                       !getenv("RNPU_FC_SW"));
+      if (is_conv || is_fc_hw) {
          const struct rnpu_tfl_tensor *wt = &m->tfl.tensors[top->inputs[1]];
          if (wt->quant.scales && wt->quant.num_scales > 1) {
             if (rnpu_active_driver == RNPU_DRIVER_RKNPU && !getenv("RNPU_NO_BRDMA")) {
-               /* RKNPU: full-conv per-channel via requant groups, one op */
                total_ops++;
             } else {
-               /* Rocket: GS=1 decomposition */
                const struct rnpu_tfl_tensor *ot = &m->tfl.tensors[top->outputs[0]];
-               total_ops += DIV_ROUND_UP(ot->shape[3], PER_AXIS_GROUP_SIZE);
+               unsigned oc = (ot->shape_len >= 4) ? ot->shape[3]
+                                                  : ot->shape[ot->shape_len - 1];
+               total_ops += DIV_ROUND_UP(oc, PER_AXIS_GROUP_SIZE);
             }
             continue;
          }
@@ -1047,91 +1192,16 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
                   if (wt->quant.scales[j] > max_s) max_s = wt->quant.scales[j];
                }
                if (min_s > 0 && max_s / min_s <= 1.001f) {
-                  /* Effectively per-tensor — use standard path */
                   lower_conv(m, top, op);
                   m->op_count++;
                   break;
                }
 
-               /* RKNPU: full-conv, per-channel via BRDMA BS MUL + requant groups */
                lower_conv(m, top, op);
-               op->use_brdma_per_channel = true;
-               op->per_channel_scale_count = wt->quant.num_scales;
-               op->per_channel_scales = malloc(wt->quant.num_scales * sizeof(float));
-               memcpy(op->per_channel_scales, wt->quant.scales,
-                      wt->quant.num_scales * sizeof(float));
-
-               /* Compute requant groups: sort channels by conv_scale,
-                * greedily group where max/min ratio <= 2.0 */
-               unsigned oc = wt->quant.num_scales;
-               unsigned *sorted = malloc(oc * sizeof(unsigned));
-               for (unsigned j = 0; j < oc; j++) sorted[j] = j;
-               /* Sort by weight scale ascending */
-               for (unsigned a = 0; a < oc; a++)
-                  for (unsigned b = a + 1; b < oc; b++)
-                     if (wt->quant.scales[sorted[a]] > wt->quant.scales[sorted[b]]) {
-                        unsigned tmp = sorted[a]; sorted[a] = sorted[b]; sorted[b] = tmp;
-                     }
-
-               /* Greedy grouping */
-               unsigned max_groups = oc; /* worst case: every channel is its own group */
-               unsigned *group_starts = malloc(max_groups * sizeof(unsigned));
-               unsigned *group_sizes_tmp = malloc(max_groups * sizeof(unsigned));
-               float *group_max_ws_tmp = malloc(max_groups * sizeof(float));
-               unsigned ng = 0;
-               unsigned gi = 0;
-               while (gi < oc) {
-                  unsigned gs = gi;
-                  float min_s = wt->quant.scales[sorted[gi]];
-                  float max_s = min_s;
-                  unsigned ge = gi + 1;
-                  while (ge < oc) {
-                     float s = wt->quant.scales[sorted[ge]];
-                     float new_max = s > max_s ? s : max_s;
-                     float requant_ratio = getenv("RNPU_REQUANT_RATIO") ?
-                        atof(getenv("RNPU_REQUANT_RATIO")) : 2.0f;
-                     if (min_s > 0 && new_max / min_s > requant_ratio) break;
-                     max_s = new_max;
-                     ge++;
-                  }
-                  group_starts[ng] = gs;
-                  group_sizes_tmp[ng] = ge - gs;
-                  group_max_ws_tmp[ng] = max_s;
-                  ng++;
-                  gi = ge;
-               }
-
-               if (ng > 1) {
-                  op->requant_group_count = ng;
-                  op->requant_group_sizes = malloc(ng * sizeof(unsigned));
-                  op->requant_group_ch_offset = malloc(ng * sizeof(unsigned));
-                  op->requant_group_max_ws = malloc(ng * sizeof(float));
-                  memcpy(op->requant_group_sizes, group_sizes_tmp, ng * sizeof(unsigned));
-                  memcpy(op->requant_group_max_ws, group_max_ws_tmp, ng * sizeof(float));
-                  unsigned ch_off = 0;
-                  for (unsigned g = 0; g < ng; g++) {
-                     op->requant_group_ch_offset[g] = ch_off;
-                     ch_off += group_sizes_tmp[g];
-                  }
-                  /* Store sorted channel indices in group_channel_indices */
-                  op->group_channel_indices = malloc(oc * sizeof(unsigned));
-                  memcpy(op->group_channel_indices, sorted, oc * sizeof(unsigned));
-                  /* weights_scale = global max (used for weight/bias filling) */
-                  op->weights_scale = group_max_ws_tmp[ng - 1];
-
-                  fprintf(stderr, "rnpu: op %u: %u requant groups for %u OC "
-                          "(ratio %.1f)\n", m->op_count, ng, oc,
-                          group_max_ws_tmp[ng-1] / group_max_ws_tmp[0]);
-               }
-               free(group_starts);
-               free(group_sizes_tmp);
-               free(group_max_ws_tmp);
-               free(sorted);
-
+               setup_brdma_requant_groups(m, top, op);
                m->op_count++;
             } else {
-               /* Rocket: GS=1 per-channel group decomposition */
-               lower_conv_per_group(m, top, &m->ops, &m->op_count);
+               lower_per_group(m, top, &m->ops, &m->op_count, lower_conv);
             }
          } else {
             lower_conv(m, top, op);
@@ -1193,10 +1263,37 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
          lower_softmax(m, top, op);
          m->op_count++;
          break;
-      case TFLITE_OP_FULLY_CONNECTED:
-         lower_fully_connected(m, top, op);
-         m->op_count++;
+      case TFLITE_OP_FULLY_CONNECTED: {
+         if (getenv("RNPU_FC_SW")) {
+            lower_fully_connected(m, top, op);
+            m->op_count++;
+            break;
+         }
+         const struct rnpu_tfl_tensor *fc_wt = &m->tfl.tensors[top->inputs[1]];
+         if (fc_wt->quant.scales && fc_wt->quant.num_scales > 1) {
+            if (rnpu_active_driver == RNPU_DRIVER_RKNPU && !getenv("RNPU_NO_BRDMA")) {
+               float min_s = fc_wt->quant.scales[0], max_s = fc_wt->quant.scales[0];
+               for (unsigned j = 1; j < fc_wt->quant.num_scales; j++) {
+                  if (fc_wt->quant.scales[j] < min_s) min_s = fc_wt->quant.scales[j];
+                  if (fc_wt->quant.scales[j] > max_s) max_s = fc_wt->quant.scales[j];
+               }
+               if (min_s > 0 && max_s / min_s <= 1.001f) {
+                  lower_fc_as_conv(m, top, op);
+                  m->op_count++;
+                  break;
+               }
+               lower_fc_as_conv(m, top, op);
+               setup_brdma_requant_groups(m, top, op);
+               m->op_count++;
+            } else {
+               lower_per_group(m, top, &m->ops, &m->op_count, lower_fc_as_conv);
+            }
+         } else {
+            lower_fc_as_conv(m, top, op);
+            m->op_count++;
+         }
          break;
+      }
       case TFLITE_OP_SHAPE:
       case TFLITE_OP_STRIDED_SLICE:
       case TFLITE_OP_PACK:
