@@ -7,9 +7,6 @@ on:
       - 'librocketnpu/**'
       - '.github/workflows/ci.yml'
   pull_request:
-    paths:
-      - 'librocketnpu/**'
-      - '.github/workflows/ci.yml'
 
 defaults:
   run:

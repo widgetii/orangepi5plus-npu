@@ -9,11 +9,6 @@ on:
       - 'librocketnpu/**'
       - '.github/workflows/qemu.yml'
   pull_request:
-    paths:
-      - 'qemu/**'
-      - 'qemu-boot/**'
-      - 'librocketnpu/**'
-      - '.github/workflows/qemu.yml'
 
 jobs:
   qemu-npu-test:
