@@ -60,6 +60,7 @@ static void lower_conv(struct rnpu_model *m, const struct rnpu_tfl_op *top,
                 top->opt.dw_conv.stride_w : top->opt.conv.stride_w;
    op->padding_same = (top->builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D) ?
                       (top->opt.dw_conv.padding == 0) : (top->opt.conv.padding == 0);
+   op->has_relu = (top->opt.conv.fused_activation >= 1);
    op->add_tensor = -1;
 
    op->input_tensor = top->inputs[0];
@@ -284,6 +285,7 @@ static void lower_fc_as_conv(struct rnpu_model *m, const struct rnpu_tfl_op *top
    op->depthwise = false;
    op->stride = 1;
    op->padding_same = false;
+   op->has_relu = false; /* FC has no fused activation */
    op->add_tensor = -1;
 
    op->input_tensor = top->inputs[0];
@@ -1148,6 +1150,7 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
       }
       m->tensors[i].scale = t->quant.scale;
       m->tensors[i].zero_point = t->quant.zero_point;
+      m->tensors[i].int8 = (t->type == 9);
    }
 
    /* Pre-scan to compute total internal ops needed */
@@ -1759,7 +1762,9 @@ int rnpu_get_output(rnpu_model_t *m, int idx, void *out, size_t max_size)
    if (m->sw_only) {
       memcpy(out, npu, nhwc_size);
    } else {
-      rnpu_convert_output(out, npu, t->width, t->height, t->channels);
+      /* INT8 output: NPU stores TFLite int8 values directly (no offset-binary),
+       * so skip the +0x80 that's only needed for uint8 outputs */
+      rnpu_convert_output_ex(out, npu, t->width, t->height, t->channels, !t->int8);
    }
    return nhwc_size;
 }
