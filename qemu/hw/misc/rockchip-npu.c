@@ -292,16 +292,8 @@ static inline int32_t apply_sdp_x_stage(int32_t value, uint32_t cfg,
         return value;
     }
 
-    if (!(cfg & 0x02)) {
-        uint32_t algo = (cfg >> 16) & 0xf;
-        switch (algo) {
-        case 0: if (value < alu_operand) value = alu_operand; break;
-        case 1: if (value > alu_operand) value = alu_operand; break;
-        case 2: value += alu_operand; break;
-        default: break;
-        }
-    }
-
+    /* Hardware order: MUL first, then ALU. MUL scales only the conv
+     * accumulator; the bias (ALU ADD) is added after scaling. */
     if (!(cfg & 0x10)) {
         int16_t mul_operand = (int16_t)((mul_cfg >> 16) & 0xffff);
         unsigned mul_shift = (mul_cfg >> 8) & 0x3f;
@@ -310,6 +302,16 @@ static inline int32_t apply_sdp_x_stage(int32_t value, uint32_t cfg,
         if (!mul_prelu || value < 0) {
             int64_t product = (int64_t)value * (int64_t)mul_operand;
             value = (int32_t)nvdla_shift_right_round64(product, mul_shift);
+        }
+    }
+
+    if (!(cfg & 0x02)) {
+        uint32_t algo = (cfg >> 16) & 0xf;
+        switch (algo) {
+        case 0: if (value < alu_operand) value = alu_operand; break;
+        case 1: if (value > alu_operand) value = alu_operand; break;
+        case 2: value += alu_operand; break;
+        default: break;
         }
     }
 
