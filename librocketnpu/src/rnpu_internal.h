@@ -208,6 +208,7 @@ struct rnpu_split_task {
 struct rnpu_operation {
    enum rnpu_op_type type;
    bool depthwise;
+   bool fc_1x1;    /* 1×1 spatial FC-as-Conv: special DMA register values */
    bool has_relu;
    bool reuse_weights_cbuf;
    unsigned truncate_bits;
