@@ -336,7 +336,10 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     uint32_t out_w = task->output_width;
     uint32_t out_h = task->output_height;
     uint32_t out_c = task->output_channels;
-    uint32_t in_c_real = task->input_channels_real;
+    /* FC 1×1 mode: DATAIN_CHANNEL_REAL encodes slice size (64), not actual IC.
+     * Use full input_channels for computation when CHANNEL_REAL < CHANNEL. */
+    bool fc_1x1 = (task->input_channels_real < task->input_channels);
+    uint32_t in_c_real = fc_1x1 ? task->input_channels : task->input_channels_real;
     uint32_t in_c = task->input_channels;
     uint32_t filt_w = task->weight_width;
     uint32_t filt_h = task->weight_height;
@@ -356,9 +359,15 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     uint32_t in_line_bytes = task->input_line_stride
         ? task->input_line_stride * 4
         : in_h * NPU_FEATURE_ATOMIC_SIZE;
-    uint32_t in_surf_bytes = task->input_surface_stride
-        ? task->input_surface_stride * 4
-        : in_w * in_line_bytes;
+    uint32_t in_surf_bytes;
+    if (fc_1x1) {
+        /* FC 1×1: surfaces are contiguous (16 bytes each for 1×1 spatial) */
+        in_surf_bytes = in_w * in_line_bytes;
+    } else {
+        in_surf_bytes = task->input_surface_stride
+            ? task->input_surface_stride * 4
+            : in_w * in_line_bytes;
+    }
     uint32_t in_buf_size = (in_groups > 1)
         ? (in_groups - 1) * in_surf_bytes + (in_w - 1) * in_line_bytes
           + in_h * NPU_FEATURE_ATOMIC_SIZE

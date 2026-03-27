@@ -134,18 +134,18 @@ else
     echo "SKIP: MobileNetV1 result not found"
 fi
 
-# Check FC test
-# TODO: FC now runs on NPU HW (1x1 conv), but QEMU conv accuracy diverges from
-# real HW (same root cause as MobileNetV1, see issue #2). Downgrade to WARN
-# until QEMU conv engine is fixed.
+# Check FC test — enforced for Rocket, warned for vendor (BRDMA emulation gap)
 if grep -q "FC test exit code:" "$LOG"; then
     FC_EXIT=$(grep "FC test exit code:" "$LOG" | tail -1 | tr -d '\r' | awk '{print $NF}')
     if [ "$FC_EXIT" = "0" ]; then
         FC_RESULT=$(grep "RESULT:.*bit-exact\|RESULT:.*max_diff\|RESULT:.*FAIL" "$LOG" | tail -1)
         echo "PASS: FC test — $FC_RESULT"
+    elif [ "$VARIANT" = "rocket" ]; then
+        echo "FAIL: FC test exited with code $FC_EXIT"
+        FAILED=1
     else
         FC_RESULT=$(grep "RESULT:" "$LOG" | tail -1)
-        echo "WARN: FC test — $FC_RESULT (not enforced, see issue #2)"
+        echo "WARN: FC test — $FC_RESULT (vendor kernel, not enforced)"
     fi
 else
     echo "SKIP: FC test not found in output"
