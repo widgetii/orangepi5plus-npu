@@ -29,8 +29,12 @@ static void emit_raw(uint64_t **p, uint32_t target, uint32_t reg, uint32_t value
    *(*p)++ = v;
 }
 
+static int _dump_regcmd = -1;
 static void emit(uint64_t **p, uint32_t reg, uint32_t value)
 {
+   if (_dump_regcmd == -1) _dump_regcmd = getenv("RNPU_DUMP_REGCMD") != NULL;
+   if (_dump_regcmd)
+      fprintf(stderr, "  EMIT reg=0x%04x val=0x%08x\n", reg, value);
    emit_raw(p, rkt_get_target(reg) + 0x1, reg, value);
 }
 
@@ -79,7 +83,7 @@ static unsigned fill_standard_regcmd(const struct rnpu_model *model,
    if (op->fc_1x1) {
       /* FC 1×1 spatial: RKNN-discovered DMA config. CHANNEL_REAL=63 splits
        * 3072 channels into 48 slices of 64, enabling sequential channel reads. */
-      EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(32));
+      EMIT(REG_CNA_CONV_CON2, 0x20);  /* RKNN FC value */
       EMIT(REG_CNA_CONV_CON3, 0x09);
       EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(1) |
                                 CNA_DATA_SIZE0_DATAIN_HEIGHT(1));
@@ -96,13 +100,16 @@ static unsigned fill_standard_regcmd(const struct rnpu_model *model,
    }
    EMIT(REG_CNA_DATA_SIZE2, CNA_DATA_SIZE2_DATAOUT_WIDTH(task->output_width));
    EMIT(REG_CNA_DATA_SIZE3, CNA_DATA_SIZE3_DATAOUT_ATOMICS(task->atomic_count));
-   EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
-                               task->input_channels * task->weights_kernels);
-   EMIT(REG_CNA_WEIGHT_SIZE1, task->weights_width * task->weights_height *
-                               task->input_channels);
-   EMIT(REG_CNA_WEIGHT_SIZE2, CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(task->weights_width) |
-                               CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(task->weights_height) |
-                               CNA_WEIGHT_SIZE2_WEIGHT_KERNELS(task->weights_kernels));
+   {  /* FC 1×1: RKNN uses actual OC for weight size, not padded */
+      unsigned wk = op->fc_1x1 ? task->output_channels_real : task->weights_kernels;
+      EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
+                                  task->input_channels * wk);
+      EMIT(REG_CNA_WEIGHT_SIZE1, task->weights_width * task->weights_height *
+                                  task->input_channels);
+      EMIT(REG_CNA_WEIGHT_SIZE2, CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(task->weights_width) |
+                                  CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(task->weights_height) |
+                                  CNA_WEIGHT_SIZE2_WEIGHT_KERNELS(wk));
+   }
    EMIT(REG_CNA_CBUF_CON0, con0);
    EMIT(REG_CNA_CBUF_CON1, CNA_CBUF_CON1_DATA_ENTRIES(task->input_data_entries));
 
@@ -392,13 +399,16 @@ static unsigned fill_per_channel_regcmd(const struct rnpu_model *model,
                              CNA_DATA_SIZE1_DATAIN_CHANNEL(task->input_channels));
    EMIT(REG_CNA_DATA_SIZE2, CNA_DATA_SIZE2_DATAOUT_WIDTH(task->output_width));
    EMIT(REG_CNA_DATA_SIZE3, CNA_DATA_SIZE3_DATAOUT_ATOMICS(task->atomic_count));
-   EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
-                               task->input_channels * task->weights_kernels);
-   EMIT(REG_CNA_WEIGHT_SIZE1, task->weights_width * task->weights_height *
-                               task->input_channels);
-   EMIT(REG_CNA_WEIGHT_SIZE2, CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(task->weights_width) |
-                               CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(task->weights_height) |
-                               CNA_WEIGHT_SIZE2_WEIGHT_KERNELS(task->weights_kernels));
+   {  /* FC 1×1: RKNN uses actual OC for weight size, not padded */
+      unsigned wk = op->fc_1x1 ? task->output_channels_real : task->weights_kernels;
+      EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
+                                  task->input_channels * wk);
+      EMIT(REG_CNA_WEIGHT_SIZE1, task->weights_width * task->weights_height *
+                                  task->input_channels);
+      EMIT(REG_CNA_WEIGHT_SIZE2, CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(task->weights_width) |
+                                  CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(task->weights_height) |
+                                  CNA_WEIGHT_SIZE2_WEIGHT_KERNELS(wk));
+   }
    EMIT(REG_CNA_CBUF_CON0, con0);
    EMIT(REG_CNA_CBUF_CON1, CNA_CBUF_CON1_DATA_ENTRIES(task->input_data_entries));
    EMIT(REG_CNA_CVT_CON0, CNA_CVT_CON0_DATA_SIGN(1) | CNA_CVT_CON0_CVT_TYPE(1) |
@@ -609,13 +619,16 @@ static unsigned fill_hybrid_regcmd(const struct rnpu_model *model,
                              CNA_DATA_SIZE1_DATAIN_CHANNEL(task->input_channels));
    EMIT(REG_CNA_DATA_SIZE2, CNA_DATA_SIZE2_DATAOUT_WIDTH(task->output_width));
    EMIT(REG_CNA_DATA_SIZE3, CNA_DATA_SIZE3_DATAOUT_ATOMICS(task->atomic_count));
-   EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
-                               task->input_channels * task->weights_kernels);
-   EMIT(REG_CNA_WEIGHT_SIZE1, task->weights_width * task->weights_height *
-                               task->input_channels);
-   EMIT(REG_CNA_WEIGHT_SIZE2, CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(task->weights_width) |
-                               CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(task->weights_height) |
-                               CNA_WEIGHT_SIZE2_WEIGHT_KERNELS(task->weights_kernels));
+   {  /* FC 1×1: RKNN uses actual OC for weight size, not padded */
+      unsigned wk = op->fc_1x1 ? task->output_channels_real : task->weights_kernels;
+      EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
+                                  task->input_channels * wk);
+      EMIT(REG_CNA_WEIGHT_SIZE1, task->weights_width * task->weights_height *
+                                  task->input_channels);
+      EMIT(REG_CNA_WEIGHT_SIZE2, CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(task->weights_width) |
+                                  CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(task->weights_height) |
+                                  CNA_WEIGHT_SIZE2_WEIGHT_KERNELS(wk));
+   }
    EMIT(REG_CNA_CBUF_CON0, con0);
    EMIT(REG_CNA_CBUF_CON1, CNA_CBUF_CON1_DATA_ENTRIES(task->input_data_entries));
 
@@ -961,7 +974,7 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
    if (op->fc_1x1) {
       /* FC 1×1 spatial: RKNN-discovered DMA config. CHANNEL_REAL=63 splits
        * 3072 channels into 48 slices of 64, enabling sequential channel reads. */
-      EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(32));
+      EMIT(REG_CNA_CONV_CON2, 0x20);  /* RKNN FC value */
       EMIT(REG_CNA_CONV_CON3, 0x09);
       EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(1) |
                                 CNA_DATA_SIZE0_DATAIN_HEIGHT(1));
@@ -978,13 +991,16 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
    }
    EMIT(REG_CNA_DATA_SIZE2, CNA_DATA_SIZE2_DATAOUT_WIDTH(task->output_width));
    EMIT(REG_CNA_DATA_SIZE3, CNA_DATA_SIZE3_DATAOUT_ATOMICS(task->atomic_count));
-   EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
-                               task->input_channels * task->weights_kernels);
-   EMIT(REG_CNA_WEIGHT_SIZE1, task->weights_width * task->weights_height *
-                               task->input_channels);
-   EMIT(REG_CNA_WEIGHT_SIZE2, CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(task->weights_width) |
-                               CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(task->weights_height) |
-                               CNA_WEIGHT_SIZE2_WEIGHT_KERNELS(task->weights_kernels));
+   {  /* FC 1×1: RKNN uses actual OC for weight size, not padded */
+      unsigned wk = op->fc_1x1 ? task->output_channels_real : task->weights_kernels;
+      EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
+                                  task->input_channels * wk);
+      EMIT(REG_CNA_WEIGHT_SIZE1, task->weights_width * task->weights_height *
+                                  task->input_channels);
+      EMIT(REG_CNA_WEIGHT_SIZE2, CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(task->weights_width) |
+                                  CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(task->weights_height) |
+                                  CNA_WEIGHT_SIZE2_WEIGHT_KERNELS(wk));
+   }
    EMIT(REG_CNA_CBUF_CON0, con0);
    EMIT(REG_CNA_CBUF_CON1, CNA_CBUF_CON1_DATA_ENTRIES(task->input_data_entries));
 
@@ -1088,7 +1104,9 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
                                DPU_BS_OW_CFG_SIZE_E_1(1) |
                                DPU_BS_OW_CFG_SIZE_E_0(1));
    }
-   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(task->output_channels - 1));
+   /* RKNN uses OW_OP=0 for FC (int8 weights, no zero-point correction) */
+   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(
+      op->fc_1x1 ? 0 : task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_0, DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_1, DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
                               DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
@@ -1269,7 +1287,7 @@ static unsigned fill_brdma_continuation_regcmd(const struct rnpu_model *model,
    if (op->fc_1x1) {
       /* FC 1×1 spatial: RKNN-discovered DMA config. CHANNEL_REAL=63 splits
        * 3072 channels into 48 slices of 64, enabling sequential channel reads. */
-      EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(32));
+      EMIT(REG_CNA_CONV_CON2, 0x20);  /* RKNN FC value */
       EMIT(REG_CNA_CONV_CON3, 0x09);
       EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(1) |
                                 CNA_DATA_SIZE0_DATAIN_HEIGHT(1));
@@ -1286,13 +1304,16 @@ static unsigned fill_brdma_continuation_regcmd(const struct rnpu_model *model,
    }
    EMIT(REG_CNA_DATA_SIZE2, CNA_DATA_SIZE2_DATAOUT_WIDTH(task->output_width));
    EMIT(REG_CNA_DATA_SIZE3, CNA_DATA_SIZE3_DATAOUT_ATOMICS(task->atomic_count));
-   EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
-                               task->input_channels * task->weights_kernels);
-   EMIT(REG_CNA_WEIGHT_SIZE1, task->weights_width * task->weights_height *
-                               task->input_channels);
-   EMIT(REG_CNA_WEIGHT_SIZE2, CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(task->weights_width) |
-                               CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(task->weights_height) |
-                               CNA_WEIGHT_SIZE2_WEIGHT_KERNELS(task->weights_kernels));
+   {  /* FC 1×1: RKNN uses actual OC for weight size, not padded */
+      unsigned wk = op->fc_1x1 ? task->output_channels_real : task->weights_kernels;
+      EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
+                                  task->input_channels * wk);
+      EMIT(REG_CNA_WEIGHT_SIZE1, task->weights_width * task->weights_height *
+                                  task->input_channels);
+      EMIT(REG_CNA_WEIGHT_SIZE2, CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(task->weights_width) |
+                                  CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(task->weights_height) |
+                                  CNA_WEIGHT_SIZE2_WEIGHT_KERNELS(wk));
+   }
    EMIT(REG_CNA_CBUF_CON0, con0);
    EMIT(REG_CNA_CBUF_CON1, CNA_CBUF_CON1_DATA_ENTRIES(task->input_data_entries));
 
