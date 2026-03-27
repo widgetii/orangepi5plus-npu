@@ -494,8 +494,10 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
 
                 /* BS_OW_OP: weight zero-point compensation (SDP stage).
                  * Applied AFTER CACC truncation, matching hardware pipeline order.
-                 * Weights stored as (w - 0x80), BS_OW_OP = (0x80 - wzp) corrects. */
-                if (task->bs_ow_op) {
+                 * Weights stored as (w - 0x80), BS_OW_OP = (0x80 - wzp) corrects.
+                 * Only applied when OW_SRC=0 (scalar). When OW_SRC=1 (DMA),
+                 * the register value is a channel count, not a scalar operand. */
+                if (task->bs_ow_op && !(task->bs_ow_cfg & 1)) {
                     int16_t ow_op = (int16_t)task->bs_ow_op;
                     acc += (int32_t)ow_op * sum_inputs;
                 }
