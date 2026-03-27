@@ -6,7 +6,9 @@ echo "=== Running conv tests ==="
 /bin/npu_conv_tests
 echo "Conv tests exit code: $?"
 echo "=== Running MobileNet ==="
-/bin/test_mobilenet /model.tflite 1 /golden.bin /input.bin 653
+RNPU_DEBUG=1 /bin/test_mobilenet /model.tflite 1 /golden.bin /input.bin 653 2>/tmp/dbg.txt
+echo "=== MBv1 debug ==="
+cat /tmp/dbg.txt
 echo "MobileNetV1 exit code: $?"
 if [ -f /bin/test_fc ] && [ -f /fc_model.tflite ]; then
 echo "=== Running FC test ==="
