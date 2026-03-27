@@ -286,6 +286,7 @@ static void lower_fc_as_conv(struct rnpu_model *m, const struct rnpu_tfl_op *top
    op->stride = 1;
    op->padding_same = false;
    op->has_relu = false; /* FC has no fused activation */
+   op->fc_1x1 = true;   /* 1×1 spatial FC: needs special DMA registers */
    op->add_tensor = -1;
 
    op->input_tensor = top->inputs[0];
@@ -1160,7 +1161,7 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
       bool is_conv = (top->builtin_code == TFLITE_OP_CONV_2D ||
                       top->builtin_code == TFLITE_OP_DEPTHWISE_CONV_2D);
       bool is_fc_hw = (top->builtin_code == TFLITE_OP_FULLY_CONNECTED &&
-                       getenv("RNPU_FC_HW"));
+                       !getenv("RNPU_FC_SW"));
       if (is_conv || is_fc_hw) {
          const struct rnpu_tfl_tensor *wt = &m->tfl.tensors[top->inputs[1]];
          if (wt->quant.scales && wt->quant.num_scales > 1) {
@@ -1273,10 +1274,7 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
          m->op_count++;
          break;
       case TFLITE_OP_FULLY_CONNECTED: {
-         if (!getenv("RNPU_FC_HW")) {
-            /* Default: SW path. HW 1×1 conv has a surface stride limitation
-             * that prevents the NPU DMA from reading channel groups > 0
-             * for 1×1 spatial tensors. Enable with RNPU_FC_HW=1. */
+         if (getenv("RNPU_FC_SW")) {
             lower_fully_connected(m, top, op);
             m->op_count++;
             break;

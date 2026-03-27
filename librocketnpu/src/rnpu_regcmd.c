@@ -76,13 +76,24 @@ static unsigned fill_standard_regcmd(const struct rnpu_model *model,
         DPU_RDMA_RDMA_S_POINTER_EXECUTER_PP_EN(1) |
         DPU_RDMA_RDMA_S_POINTER_POINTER_PP_EN(1));
    EMIT(REG_CNA_CONV_CON1, con1);
-   EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(50 + task->stride_y + 1));
-   EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
-                            CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
-   EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(task->input_width) |
-                             CNA_DATA_SIZE0_DATAIN_HEIGHT(task->input_height));
-   EMIT(REG_CNA_DATA_SIZE1, CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL(task->input_channels_real - 1) |
-                             CNA_DATA_SIZE1_DATAIN_CHANNEL(task->input_channels));
+   if (op->fc_1x1) {
+      /* FC 1×1 spatial: RKNN-discovered DMA config. CHANNEL_REAL=63 splits
+       * 3072 channels into 48 slices of 64, enabling sequential channel reads. */
+      EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(32));
+      EMIT(REG_CNA_CONV_CON3, 0x09);
+      EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(1) |
+                                CNA_DATA_SIZE0_DATAIN_HEIGHT(1));
+      EMIT(REG_CNA_DATA_SIZE1, CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL(63) |
+                                CNA_DATA_SIZE1_DATAIN_CHANNEL(task->input_channels));
+   } else {
+      EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(50 + task->stride_y + 1));
+      EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
+                               CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
+      EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(task->input_width) |
+                                CNA_DATA_SIZE0_DATAIN_HEIGHT(task->input_height));
+      EMIT(REG_CNA_DATA_SIZE1, CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL(task->input_channels_real - 1) |
+                                CNA_DATA_SIZE1_DATAIN_CHANNEL(task->input_channels));
+   }
    EMIT(REG_CNA_DATA_SIZE2, CNA_DATA_SIZE2_DATAOUT_WIDTH(task->output_width));
    EMIT(REG_CNA_DATA_SIZE3, CNA_DATA_SIZE3_DATAOUT_ATOMICS(task->atomic_count));
    EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
@@ -947,13 +958,24 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
         DPU_RDMA_RDMA_S_POINTER_EXECUTER_PP_EN(1) |
         DPU_RDMA_RDMA_S_POINTER_POINTER_PP_EN(1));
    EMIT(REG_CNA_CONV_CON1, con1);
-   EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(50 + task->stride_y + 1));
-   EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
-                            CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
-   EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(task->input_width) |
-                             CNA_DATA_SIZE0_DATAIN_HEIGHT(task->input_height));
-   EMIT(REG_CNA_DATA_SIZE1, CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL(task->input_channels_real - 1) |
-                             CNA_DATA_SIZE1_DATAIN_CHANNEL(task->input_channels));
+   if (op->fc_1x1) {
+      /* FC 1×1 spatial: RKNN-discovered DMA config. CHANNEL_REAL=63 splits
+       * 3072 channels into 48 slices of 64, enabling sequential channel reads. */
+      EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(32));
+      EMIT(REG_CNA_CONV_CON3, 0x09);
+      EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(1) |
+                                CNA_DATA_SIZE0_DATAIN_HEIGHT(1));
+      EMIT(REG_CNA_DATA_SIZE1, CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL(63) |
+                                CNA_DATA_SIZE1_DATAIN_CHANNEL(task->input_channels));
+   } else {
+      EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(50 + task->stride_y + 1));
+      EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
+                               CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
+      EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(task->input_width) |
+                                CNA_DATA_SIZE0_DATAIN_HEIGHT(task->input_height));
+      EMIT(REG_CNA_DATA_SIZE1, CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL(task->input_channels_real - 1) |
+                                CNA_DATA_SIZE1_DATAIN_CHANNEL(task->input_channels));
+   }
    EMIT(REG_CNA_DATA_SIZE2, CNA_DATA_SIZE2_DATAOUT_WIDTH(task->output_width));
    EMIT(REG_CNA_DATA_SIZE3, CNA_DATA_SIZE3_DATAOUT_ATOMICS(task->atomic_count));
    EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
@@ -1244,13 +1266,24 @@ static unsigned fill_brdma_continuation_regcmd(const struct rnpu_model *model,
         DPU_RDMA_RDMA_S_POINTER_EXECUTER_PP_EN(1) |
         DPU_RDMA_RDMA_S_POINTER_POINTER_PP_EN(1));
    EMIT(REG_CNA_CONV_CON1, con1);
-   EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(50 + task->stride_y + 1));
-   EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
-                            CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
-   EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(task->input_width) |
-                             CNA_DATA_SIZE0_DATAIN_HEIGHT(task->input_height));
-   EMIT(REG_CNA_DATA_SIZE1, CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL(task->input_channels_real - 1) |
-                             CNA_DATA_SIZE1_DATAIN_CHANNEL(task->input_channels));
+   if (op->fc_1x1) {
+      /* FC 1×1 spatial: RKNN-discovered DMA config. CHANNEL_REAL=63 splits
+       * 3072 channels into 48 slices of 64, enabling sequential channel reads. */
+      EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(32));
+      EMIT(REG_CNA_CONV_CON3, 0x09);
+      EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(1) |
+                                CNA_DATA_SIZE0_DATAIN_HEIGHT(1));
+      EMIT(REG_CNA_DATA_SIZE1, CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL(63) |
+                                CNA_DATA_SIZE1_DATAIN_CHANNEL(task->input_channels));
+   } else {
+      EMIT(REG_CNA_CONV_CON2, CNA_CONV_CON2_FEATURE_GRAINS(50 + task->stride_y + 1));
+      EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
+                               CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
+      EMIT(REG_CNA_DATA_SIZE0, CNA_DATA_SIZE0_DATAIN_WIDTH(task->input_width) |
+                                CNA_DATA_SIZE0_DATAIN_HEIGHT(task->input_height));
+      EMIT(REG_CNA_DATA_SIZE1, CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL(task->input_channels_real - 1) |
+                                CNA_DATA_SIZE1_DATAIN_CHANNEL(task->input_channels));
+   }
    EMIT(REG_CNA_DATA_SIZE2, CNA_DATA_SIZE2_DATAOUT_WIDTH(task->output_width));
    EMIT(REG_CNA_DATA_SIZE3, CNA_DATA_SIZE3_DATAOUT_ATOMICS(task->atomic_count));
    EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
