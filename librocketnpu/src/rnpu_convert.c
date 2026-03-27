@@ -81,25 +81,33 @@ void rnpu_convert_input(uint8_t *npu, const uint8_t *nhwc,
 void rnpu_convert_output(uint8_t *nhwc, const uint8_t *npu,
                          unsigned width, unsigned height, unsigned channels)
 {
+   rnpu_convert_output_ex(nhwc, npu, width, height, channels, true);
+}
+
+void rnpu_convert_output_ex(uint8_t *nhwc, const uint8_t *npu,
+                             unsigned width, unsigned height, unsigned channels,
+                             bool add_offset)
+{
    unsigned groups = DIV_ROUND_UP(channels, FEATURE_ATOMIC_SIZE);
    uint8_t (*out)[width][channels] = (void *)nhwc;
+   uint8_t ofs = add_offset ? 0x80 : 0;
 
    if (groups == 1) {
       const uint8_t *src = npu;
       for (unsigned y = 0; y < height; y++) {
          for (unsigned x = 0; x < width; x++) {
 #ifdef __aarch64__
-            if (channels == FEATURE_ATOMIC_SIZE) {
+            if (channels == FEATURE_ATOMIC_SIZE && add_offset) {
                uint8x16_t v = vld1q_u8(src);
                v = vaddq_u8(v, vdupq_n_u8(0x80));
                vst1q_u8(&out[y][x][0], v);
             } else {
                for (unsigned c = 0; c < channels; c++)
-                  out[y][x][c] = src[c] + 0x80;
+                  out[y][x][c] = src[c] + ofs;
             }
 #else
             for (unsigned c = 0; c < channels; c++)
-               out[y][x][c] = src[c] + 0x80;
+               out[y][x][c] = src[c] + ofs;
 #endif
             src += FEATURE_ATOMIC_SIZE;
          }
@@ -113,7 +121,7 @@ void rnpu_convert_output(uint8_t *nhwc, const uint8_t *npu,
             for (unsigned x = 0; x < width; x++) {
                const uint8_t *src = gb + (y * width + x) * FEATURE_ATOMIC_SIZE;
                for (unsigned c = 0; c < real_c; c++)
-                  out[y][x][base_c + c] = src[c] + 0x80;
+                  out[y][x][base_c + c] = src[c] + ofs;
             }
       }
    }

@@ -45,7 +45,7 @@ static unsigned fill_standard_regcmd(const struct rnpu_model *model,
    unsigned num_tasks = op->task_count;
    unsigned ozp = task->output_zero_point;
    unsigned wzp = task->weights_zero_point;
-   unsigned offset = ozp - 0x80;
+   int offset = (int)ozp - 0x80;
 
    uint64_t act_base = model->activation_bo.dma_addr;
    uint64_t wt_base = model->weight_bo.dma_addr;
@@ -201,7 +201,7 @@ static unsigned fill_standard_regcmd(const struct rnpu_model *model,
                                DPU_BS_OW_CFG_SIZE_E_1(1) |
                                DPU_BS_OW_CFG_SIZE_E_0(1));
    }
-   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(0x80 - wzp));
+   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(task->weights_int8 ? 0 : 0x80 - wzp));
    EMIT(REG_DPU_WDMA_SIZE_0, DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_1, DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
                               DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
@@ -443,7 +443,8 @@ static unsigned fill_per_channel_regcmd(const struct rnpu_model *model,
    EMIT(REG_DPU_DATA_CUBE_HEIGHT, DPU_DATA_CUBE_HEIGHT_HEIGHT(task->output_height - 1));
    EMIT(REG_DPU_DATA_CUBE_NOTCH_ADDR, 0);
    EMIT(REG_DPU_DATA_CUBE_CHANNEL, 0);
-   EMIT(REG_DPU_BS_CFG, 0x13f);
+   /* 0x13f = BS bypass with ReLU active; 0x17f = + BS_RELU_BYPASS (bit 6) */
+   EMIT(REG_DPU_BS_CFG, op->has_relu ? 0x13f : 0x17f);
    EMIT(REG_DPU_BS_ALU_CFG, (uint32_t)op->per_channel_bias);
    EMIT(REG_DPU_BS_MUL_CFG, 0);
    EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0x001f001f);
@@ -453,7 +454,8 @@ static unsigned fill_per_channel_regcmd(const struct rnpu_model *model,
    EMIT(REG_DPU_WDMA_SIZE_0, 0);
    EMIT(REG_DPU_WDMA_SIZE_1, DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
                               DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
-   EMIT(REG_DPU_BN_CFG, 0x12);
+   /* 0x12 = ReLU active (ALU+MUL bypass); 0x53 = all BN bypassed including ReLU */
+   EMIT(REG_DPU_BN_CFG, op->has_relu ? 0x12 : 0x53);
    EMIT(REG_DPU_BN_ALU_CFG, 0);
    EMIT(REG_DPU_BN_MUL_CFG, 0);
    EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
@@ -552,7 +554,7 @@ static unsigned fill_hybrid_regcmd(const struct rnpu_model *model,
    unsigned num_tasks = op->task_count;
    unsigned ozp = task->output_zero_point;
    unsigned wzp = task->weights_zero_point;
-   unsigned offset = ozp - 0x80;
+   int offset = task->output_int8 ? (int)(ozp - 0x100) : (int)(ozp - 0x80);
 
    uint64_t act_base = model->activation_bo.dma_addr;
    uint64_t wt_base = model->weight_bo.dma_addr;
@@ -725,7 +727,8 @@ static unsigned fill_hybrid_regcmd(const struct rnpu_model *model,
     * BS_BYPASS=1 but hardware still uses scalar BS_ALU_CFG via undocumented
     * bits 2-3 — this is the mechanism RKNN uses for per-channel bias. */
    if (mask & (1u << 2))
-      EMIT(REG_DPU_BS_CFG, 0x13f);
+      /* 0x13f = BS bypass with ReLU active; 0x17f = + BS_RELU_BYPASS (bit 6) */
+   EMIT(REG_DPU_BS_CFG, op->has_relu ? 0x13f : 0x17f);
    else
       EMIT(REG_DPU_BS_CFG, DPU_BS_CFG_BS_ALU_ALGO(2) | DPU_BS_CFG_BS_ALU_SRC(1) |
                             DPU_BS_CFG_BS_RELU_BYPASS(1) | DPU_BS_CFG_BS_MUL_BYPASS(1));
@@ -771,7 +774,8 @@ static unsigned fill_hybrid_regcmd(const struct rnpu_model *model,
 
    /* Bit 7: DPU_BN_CFG */
    if (mask & (1u << 7))
-      EMIT(REG_DPU_BN_CFG, 0x12);
+      /* 0x12 = ReLU active (ALU+MUL bypass); 0x53 = all BN bypassed including ReLU */
+   EMIT(REG_DPU_BN_CFG, op->has_relu ? 0x12 : 0x53);
    else
       EMIT(REG_DPU_BN_CFG, DPU_BN_CFG_BN_RELU_BYPASS(1) | DPU_BN_CFG_BN_MUL_BYPASS(1) |
                             DPU_BN_CFG_BN_ALU_BYPASS(1) | DPU_BN_CFG_BN_BYPASS(1));
@@ -1068,7 +1072,8 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
                               DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
 
    /* BN_CFG: ReLU only (matches RKNN: 0x12 = alu_bypass + mul_bypass + relu active) */
-   EMIT(REG_DPU_BN_CFG, 0x12);
+   /* 0x12 = ReLU active (ALU+MUL bypass); 0x53 = all BN bypassed including ReLU */
+   EMIT(REG_DPU_BN_CFG, op->has_relu ? 0x12 : 0x53);
    EMIT(REG_DPU_BN_ALU_CFG, 0);
    EMIT(REG_DPU_BN_MUL_CFG, 0);
    EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
@@ -1403,9 +1408,12 @@ unsigned rnpu_fill_regcmd(const struct rnpu_model *model,
    }
 
    /* For RKNPU per-channel ops (GS=1), use per-channel regcmd with
-    * BN-stage bias addition. Standard regcmd doesn't work for GS=1 on RKNPU. */
+    * BN-stage bias addition — EXCEPT for ops without ReLU (e.g. FC),
+    * where the standard regcmd is preferred because the per-channel
+    * regcmd applies an unavoidable ReLU on real hardware. */
    if (rnpu_active_driver == RNPU_DRIVER_RKNPU &&
-       op->output_channels == 1 && op->output_tensor_channels > 0)
+       op->output_channels == 1 && op->output_tensor_channels > 0 &&
+       op->has_relu)
       return fill_per_channel_regcmd(model, op, dst, task_num);
 
    if (rnpu_hybrid_mask == UINT32_MAX)

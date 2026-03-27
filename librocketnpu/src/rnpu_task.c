@@ -82,6 +82,7 @@ static void fill_task(struct rnpu_operation *op, struct rnpu_split_task *task)
    }
 
    task->output_zero_point = op->output_zero_point;
+   task->output_int8 = op->output_int8;
    task->output_scale = op->output_scale;
 
    if (task->input_channels_real == 1 &&
@@ -125,6 +126,7 @@ static void fill_task(struct rnpu_operation *op, struct rnpu_split_task *task)
    task->weights_width = op->weights_width;
    task->weights_height = op->weights_height;
    task->weights_zero_point = op->weights_zero_point;
+   task->weights_int8 = op->weights_int8;
    task->weights_scale = op->weights_scale;
 
    if (op->depthwise)

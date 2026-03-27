@@ -61,7 +61,7 @@ echo ""
 echo "=== Running MobileNetV1 NPU inference (Grace Hopper) ==="
 LD_LIBRARY_PATH=. ./test_mobilenet "$MODEL" 5 "$GOLDEN" "$INPUT" "$EXPECTED_CLASS"
 
-# Run FC model test (sw_only, no NPU hardware needed)
+# Run FC model test (HW-accelerated via 1x1 conv lowering)
 FC_DIR="${SCRIPT_DIR}/models"
 if [ -f "$FC_DIR/fc_model_int8.tflite" ]; then
     echo ""

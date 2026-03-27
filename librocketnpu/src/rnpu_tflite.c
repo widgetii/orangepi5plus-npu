@@ -138,6 +138,7 @@ static void parse_conv_options(const uint8_t *b, uint32_t ot, struct rnpu_tfl_op
    f = fb_field(b, ot, 0); op->opt.conv.padding = f ? b[f] : 0; /* default SAME=0 */
    f = fb_field(b, ot, 1); op->opt.conv.stride_w = f ? fb_i32(b, f) : 1;
    f = fb_field(b, ot, 2); op->opt.conv.stride_h = f ? fb_i32(b, f) : 1;
+   f = fb_field(b, ot, 3); op->opt.conv.fused_activation = f ? b[f] : 0; /* 0=NONE,1=RELU,3=RELU6 */
    f = fb_field(b, ot, 4); op->opt.conv.dilation_w = f ? fb_i32(b, f) : 1;
    f = fb_field(b, ot, 5); op->opt.conv.dilation_h = f ? fb_i32(b, f) : 1;
 }

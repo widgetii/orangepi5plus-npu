@@ -249,15 +249,47 @@ static void exec_avg_pool(struct rnpu_model *m, struct rnpu_operation *op)
 
 static void exec_reshape(struct rnpu_model *m, struct rnpu_operation *op)
 {
-   /* Reshape is a data reinterpretation. If dimensions change but the
-    * underlying NPU-format layout is compatible, it's a memcpy or no-op.
-    * For MBv1: 1×1×1024 (NPU) → 1×1×1024 (NPU) — same layout, different
-    * TFLite shape metadata. Just copy if different tensors. */
    if (op->input_tensor == op->output_tensor)
       return;
 
    uint8_t *in = tensor_ptr(m, op->input_tensor);
    uint8_t *out = tensor_ptr(m, op->output_tensor);
+
+   if (m->sw_only) {
+      unsigned in_sz = m->tensors[op->input_tensor].size;
+      unsigned out_sz = m->tensors[op->output_tensor].size;
+      memcpy(out, in, MIN2(in_sz, out_sz));
+      return;
+   }
+
+   unsigned iw = op->input_width, ih = op->input_height, ic = op->input_channels;
+   unsigned ow = op->output_width, oh = op->output_height, oc = op->output_channels;
+
+   /* Flatten: [1,H,W,C] → [1,1,1,H*W*C] in NPU interleaved format.
+    * Only needed when spatial dims collapse (iw*ih > 1, ow*oh == 1).
+    * TFLite NHWC flatten: flat_idx = h*W*C + w*C + c */
+   if ((iw * ih > 1) && (ow == 1 && oh == 1)) {
+      unsigned out_sz = DIV_ROUND_UP(oc, FEATURE_ATOMIC_SIZE) * FEATURE_ATOMIC_SIZE;
+      memset(out, 0x80, out_sz); /* fill with zero in NPU offset-binary */
+
+      for (unsigned y = 0; y < ih; y++) {
+         for (unsigned x = 0; x < iw; x++) {
+            for (unsigned c = 0; c < ic; c++) {
+               unsigned ig = c / FEATURE_ATOMIC_SIZE;
+               unsigned ic_off = c % FEATURE_ATOMIC_SIZE;
+               uint8_t val = in[NPU_OFFSET(ig, x, y, iw, ih) + ic_off];
+
+               unsigned flat = x * ih * ic + y * ic + c;
+               unsigned og = flat / FEATURE_ATOMIC_SIZE;
+               unsigned oc_off = flat % FEATURE_ATOMIC_SIZE;
+               out[NPU_OFFSET(og, 0, 0, 1, 1) + oc_off] = val;
+            }
+         }
+      }
+      return;
+   }
+
+   /* Default: same spatial layout or compatible — memcpy */
    unsigned in_sz = m->tensors[op->input_tensor].size;
    unsigned out_sz = m->tensors[op->output_tensor].size;
    memcpy(out, in, MIN2(in_sz, out_sz));
