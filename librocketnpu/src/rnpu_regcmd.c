@@ -45,7 +45,8 @@ static unsigned fill_standard_regcmd(const struct rnpu_model *model,
    unsigned num_tasks = op->task_count;
    unsigned ozp = task->output_zero_point;
    unsigned wzp = task->weights_zero_point;
-   unsigned offset = ozp - 0x80;
+   /* INT8 output needs extra -0x80 so rnpu_convert_output(+0x80) recovers TFLite int8 */
+   int offset = task->output_int8 ? (int)(ozp - 0x100) : (int)(ozp - 0x80);
 
    uint64_t act_base = model->activation_bo.dma_addr;
    uint64_t wt_base = model->weight_bo.dma_addr;
@@ -201,7 +202,7 @@ static unsigned fill_standard_regcmd(const struct rnpu_model *model,
                                DPU_BS_OW_CFG_SIZE_E_1(1) |
                                DPU_BS_OW_CFG_SIZE_E_0(1));
    }
-   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(0x80 - wzp));
+   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(task->weights_int8 ? 0 : 0x80 - wzp));
    EMIT(REG_DPU_WDMA_SIZE_0, DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_1, DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
                               DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
@@ -469,7 +470,7 @@ static unsigned fill_per_channel_regcmd(const struct rnpu_model *model,
    if (scale < 1 << 14) scale |= 1 << 14;
 
    /* BS bypassed — fold bias into OUT_CVT_OFFSET (inexact due to ReLU ordering) */
-   int32_t base_ofs = (int32_t)(ozp - 0x80);
+   int32_t base_ofs = task->output_int8 ? (int32_t)(ozp - 0x100) : (int32_t)(ozp - 0x80);
    int64_t bias_x_scale = (int64_t)op->per_channel_bias * (int64_t)scale;
    int32_t bias_out = (int32_t)nvdla_shift_right_round64(bias_x_scale, shift - 1);
    EMIT(REG_DPU_OUT_CVT_OFFSET, (uint32_t)(base_ofs + bias_out));
@@ -552,7 +553,7 @@ static unsigned fill_hybrid_regcmd(const struct rnpu_model *model,
    unsigned num_tasks = op->task_count;
    unsigned ozp = task->output_zero_point;
    unsigned wzp = task->weights_zero_point;
-   unsigned offset = ozp - 0x80;
+   int offset = task->output_int8 ? (int)(ozp - 0x100) : (int)(ozp - 0x80);
 
    uint64_t act_base = model->activation_bo.dma_addr;
    uint64_t wt_base = model->weight_bo.dma_addr;
@@ -1092,7 +1093,7 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
    }
 
    /* OUT_CVT: uniform scale from max_conv_scale */
-   int offset = (int)ozp - 0x80;
+   int offset = task->output_int8 ? (int)(ozp - 0x100) : (int)ozp - 0x80;
    float conv_scale = (task->input_scale * task->weights_scale) / task->output_scale;
    uint32_t scale_bits = fui(conv_scale);
    unsigned shift = 127 + 31 - 32 - (scale_bits >> 23) + 16;

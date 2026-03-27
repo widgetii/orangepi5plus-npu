@@ -189,11 +189,13 @@ struct rnpu_split_task {
    unsigned input_offset;
    unsigned output_width, output_height, output_channels, output_channels_real;
    unsigned output_zero_point;
+   bool output_int8;
    float output_scale;
    int output_surface_stride;
    unsigned output_offset;
    unsigned weights_width, weights_height, weights_kernels;
    unsigned weights_zero_point;
+   bool weights_int8;
    float weights_scale;
    unsigned input_banks, weights_banks;
    unsigned atomic_count, surfaces_per_row;
@@ -224,10 +226,12 @@ struct rnpu_operation {
 
    unsigned output_width, output_height, output_channels;
    uint8_t output_zero_point;
+   bool output_int8;
    float output_scale;
 
    unsigned weights_width, weights_height;
    uint8_t weights_zero_point;
+   bool weights_int8;  /* true for INT8 weights (wzp=0, no BS_OW_OP offset) */
    float weights_scale;
 
    /* Per-axis quantization */

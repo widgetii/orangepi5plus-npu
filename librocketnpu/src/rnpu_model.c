@@ -74,11 +74,13 @@ static void lower_conv(struct rnpu_model *m, const struct rnpu_tfl_op *top,
    op->output_height = ot->shape[2];
    op->output_channels = ot->shape[3];
    op->output_zero_point = tfl_zp_u8(ot);
+   op->output_int8 = (ot->type == 9);
    op->output_scale = ot->quant.scale;
 
    op->weights_width = wt->shape[1];
    op->weights_height = wt->shape[2];
    op->weights_zero_point = (uint8_t)wt->quant.zero_point;
+   op->weights_int8 = (wt->type == 9);
 
    /* Per-axis vs per-tensor weight scale */
    if (wt->quant.scales && wt->quant.num_scales > 1) {
@@ -112,6 +114,7 @@ static void lower_sw_op(struct rnpu_model *m, const struct rnpu_tfl_op *top,
    op->output_height = ot->shape[2];
    op->output_channels = ot->shape[3];
    op->output_zero_point = tfl_zp_u8(ot);
+   op->output_int8 = (ot->type == 9);
    op->output_scale = ot->quant.scale;
 }
 
@@ -194,6 +197,7 @@ static void lower_sw_op_auto(struct rnpu_model *m, const struct rnpu_tfl_op *top
       op->output_channels = ot->shape[1];
    }
    op->output_zero_point = tfl_zp_u8(ot);
+   op->output_int8 = (ot->type == 9);
    op->output_scale = ot->quant.scale;
 }
 
@@ -308,11 +312,13 @@ static void lower_fc_as_conv(struct rnpu_model *m, const struct rnpu_tfl_op *top
       op->output_channels = ot->shape[ot->shape_len - 1];
    }
    op->output_zero_point = tfl_zp_u8(ot);
+   op->output_int8 = (ot->type == 9);
    op->output_scale = ot->quant.scale;
 
    op->weights_width = 1;
    op->weights_height = 1;
    op->weights_zero_point = (uint8_t)wt->quant.zero_point;
+   op->weights_int8 = (wt->type == 9);
 
    if (wt->quant.scales && wt->quant.num_scales > 1) {
       float max_s = wt->quant.scales[0];
