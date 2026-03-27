@@ -1285,17 +1285,163 @@ static int test_mobilenet_op0(int fd)
     return run_conv_test(fd, "test_mobilenet_op0", &cfg, input, weights, bias, expected);
 }
 
+/* ======================================================================
+ * Test 10: Large tiled conv — triggers CBUF spatial tiling
+ *
+ * 56×56×128→56×56×128 with 1×1 kernel (pointwise conv).
+ * With 128 IC, input needs ~7 banks per slice. With 56 height,
+ * total input banks = ceil(7*56/256) ≈ 2. Weight banks for 128 OC ≈ 2.
+ * Total = 4 < 12 → no tiling. Need bigger input.
+ *
+ * 112×112×32→112×112×32 with 3×3 kernel, stride 1, pad 1.
+ * entries_per_slice = ceil(32/16) * 112 / 8 = 2*14 = 28
+ * input_banks = ceil(28 * 112 / 256) = ceil(12.25) = 13 > 10 → TILED!
+ * ====================================================================== */
+static int test_tiled_conv(int fd)
+{
+    struct conv_config cfg;
+    conv_config_defaults(&cfg);
+    cfg.in_w = 112; cfg.in_h = 112; cfg.in_c = 32;
+    cfg.out_c = 32;
+    cfg.filt_w = 1; cfg.filt_h = 1;
+    cfg.stride_x = 1; cfg.stride_y = 1;
+    cfg.pad_left = 0; cfg.pad_top = 0;
+    cfg.pad_value = 0;
+    cfg.truncate_bits = 0;
+    cfg.bs_ow_op = 0;
+    cfg.out_cvt_scale = 256;
+    cfg.out_cvt_shift = 15;
+
+    static int8_t input[112 * 112 * 32];
+    for (uint32_t i = 0; i < sizeof(input); i++)
+        input[i] = prng_val(i, 99);
+
+    static int8_t weights[32 * 1 * 1 * 32];
+    for (uint32_t i = 0; i < sizeof(weights); i++)
+        weights[i] = (int8_t)((i * 3 + 7) % 9 - 4);
+
+    int32_t bias[32];
+    for (int i = 0; i < 32; i++) bias[i] = (i * 17 - 200);
+
+    uint32_t out_w = 112, out_h = 112;
+    static int8_t expected[112 * 112 * 32];
+
+    for (uint32_t oy = 0; oy < out_h; oy++) {
+        for (uint32_t ox = 0; ox < out_w; ox++) {
+            for (uint32_t oc = 0; oc < 32; oc++) {
+                int32_t acc = 0;
+                for (uint32_t ic = 0; ic < 32; ic++) {
+                    int8_t in_val = input[oy * 112 * 32 + ox * 32 + ic];
+                    int8_t w_val = weights[oc * 32 + ic];
+                    acc += (int32_t)in_val * (int32_t)w_val;
+                }
+                acc += bias[oc];
+                int64_t scaled = nvdla_shift_right_round64(
+                    (int64_t)acc * (int64_t)cfg.out_cvt_scale, cfg.out_cvt_shift);
+                if (scaled > 65535) scaled = 65535;
+                if (scaled < -65536) scaled = -65536;
+                int32_t result = (int32_t)scaled + cfg.out_cvt_offset;
+                if (result < -128) result = -128;
+                if (result > 127) result = 127;
+                expected[oy * 112 * 32 + ox * 32 + oc] = (int8_t)result;
+            }
+        }
+    }
+
+    return run_conv_test(fd, "test_tiled_conv", &cfg, input, weights, bias, expected);
+}
+/* ======================================================================
+ * Test 11: 224x224 tiled conv — matches MBv1 first op dimensions
+ * Triggers CBUF spatial tiling (25 banks needed, 10 available).
+ * ====================================================================== */
+static int test_tiled_224(int fd)
+{
+    struct conv_config cfg;
+    conv_config_defaults(&cfg);
+    cfg.in_w = 224; cfg.in_h = 224; cfg.in_c = 3;
+    cfg.out_c = 16;  /* smaller OC to keep weights manageable */
+    cfg.filt_w = 3; cfg.filt_h = 3;
+    cfg.stride_x = 2; cfg.stride_y = 2;
+    cfg.pad_left = 1; cfg.pad_top = 1;
+    cfg.pad_value = 0;
+    cfg.truncate_bits = 0;
+    cfg.bs_ow_op = (uint16_t)(int16_t)(0x80 - 151);  /* MBv1 wzp=151 */
+    cfg.out_cvt_scale = 30398;
+    cfg.out_cvt_shift = 22;
+    cfg.out_cvt_offset = -128;  /* ozp - 0x80 = 0 - 128 */
+
+    static int8_t input[224 * 224 * 3];
+    for (uint32_t i = 0; i < sizeof(input); i++)
+        input[i] = prng_val(i, 77);
+
+    static int8_t weights[16 * 3 * 3 * 3];
+    for (uint32_t i = 0; i < sizeof(weights); i++)
+        weights[i] = (int8_t)((i * 5 + 11) % 9 - 4);
+
+    int32_t bias[16];
+    for (int i = 0; i < 16; i++) bias[i] = (i * 23 - 150);
+
+    uint32_t out_w = 112, out_h = 112;
+    static int8_t expected[112 * 112 * 16];
+
+    for (uint32_t oy = 0; oy < out_h; oy++) {
+        for (uint32_t ox = 0; ox < out_w; ox++) {
+            for (uint32_t oc = 0; oc < 16; oc++) {
+                int32_t acc = 0;
+                for (uint32_t ky = 0; ky < 3; ky++) {
+                    for (uint32_t kx = 0; kx < 3; kx++) {
+                        int32_t iy = (int32_t)(oy * 2 + ky) - 1;
+                        int32_t ix = (int32_t)(ox * 2 + kx) - 1;
+                        for (uint32_t ic = 0; ic < 3; ic++) {
+                            int8_t in_val;
+                            if (ix < 0 || ix >= 224 || iy < 0 || iy >= 224)
+                                in_val = 0;
+                            else
+                                in_val = input[iy * 224 * 3 + ix * 3 + ic];
+                            int8_t w_val = weights[oc * 3 * 3 * 3 + kx * 3 * 3 + ky * 3 + ic];
+                            acc += (int32_t)in_val * (int32_t)w_val;
+                        }
+                    }
+                }
+                /* BS_OW_OP: weight zero-point compensation */
+                int32_t sum_in = 0;
+                for (uint32_t ky2 = 0; ky2 < 3; ky2++)
+                    for (uint32_t kx2 = 0; kx2 < 3; kx2++) {
+                        int32_t iy2 = (int32_t)(oy * 2 + ky2) - 1;
+                        int32_t ix2 = (int32_t)(ox * 2 + kx2) - 1;
+                        for (uint32_t ic2 = 0; ic2 < 3; ic2++) {
+                            if (ix2 >= 0 && ix2 < 224 && iy2 >= 0 && iy2 < 224)
+                                sum_in += (int32_t)input[iy2 * 224 * 3 + ix2 * 3 + ic2];
+                        }
+                    }
+                acc += (int32_t)(int16_t)cfg.bs_ow_op * sum_in;
+                acc += bias[oc];
+                int64_t scaled = nvdla_shift_right_round64(
+                    (int64_t)acc * (int64_t)cfg.out_cvt_scale, cfg.out_cvt_shift);
+                if (scaled > 65535) scaled = 65535;
+                if (scaled < -65536) scaled = -65536;
+                int32_t result = (int32_t)scaled + cfg.out_cvt_offset;
+                if (result < -128) result = -128;
+                if (result > 127) result = 127;
+                expected[oy * out_w * 16 + ox * 16 + oc] = (int8_t)result;
+            }
+        }
+    }
+
+    return run_conv_test(fd, "test_tiled_224", &cfg, input, weights, bias, expected);
+}
+
 int main(void)
 {
     printf("=== NPU Convolution Test Suite ===\n");
 
     int passed = 0;
-    int total = 9;
+    int total = 11;
 
     int (*tests[])(int) = {
         test_matmul_small, test_matmul_medium, test_conv3x3_stride2,
         test_depthwise3x3, test_bias_dma, test_bn_relu,
-        test_bs_ow_op, test_bs_ow_op_18, test_mobilenet_op0,
+        test_bs_ow_op, test_bs_ow_op_18, test_mobilenet_op0, test_tiled_conv, test_tiled_224,
     };
 
     /* Detect driver type with a probe open */
@@ -1320,3 +1466,4 @@ int main(void)
     printf("=== CONV TESTS: %d/%d passed ===\n", passed, total);
     return (passed == total) ? 0 : 1;
 }
+

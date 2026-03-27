@@ -359,15 +359,11 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     uint32_t in_line_bytes = task->input_line_stride
         ? task->input_line_stride * 4
         : in_h * NPU_FEATURE_ATOMIC_SIZE;
-    uint32_t in_surf_bytes;
-    if (fc_1x1) {
-        /* FC 1×1: surfaces are contiguous (16 bytes each for 1×1 spatial) */
-        in_surf_bytes = in_w * in_line_bytes;
-    } else {
-        in_surf_bytes = task->input_surface_stride
-            ? task->input_surface_stride * 4
-            : in_w * in_line_bytes;
-    }
+    /* Input surface stride: always use W × line_bytes (= W × H × 16).
+     * The register value encodes a hardware-internal DMA parameter that
+     * doesn't directly map to a byte stride. Using it as stride * 4
+     * produced wrong inter-surface offsets, causing MBv1 max_diff=230. */
+    uint32_t in_surf_bytes = in_w * in_line_bytes;
     uint32_t in_buf_size = (in_groups > 1)
         ? (in_groups - 1) * in_surf_bytes + (in_w - 1) * in_line_bytes
           + in_h * NPU_FEATURE_ATOMIC_SIZE
@@ -401,12 +397,23 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     uint32_t out_groups = DIV_ROUND_UP(out_c, NPU_FEATURE_ATOMIC_SIZE);
     uint32_t out_buf_size = out_groups * out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
 
-    uint8_t *in_buf = g_malloc0(in_buf_size);
+    /* For tiled ops, src_addr is offset into the tensor, so
+     * src_addr + in_buf_size may extend beyond the tensor's written extent.
+     * Only DMA-read the tile's actual footprint and pad the rest. */
+    uint32_t in_tile_footprint = (in_w > 0 ? (in_w - 1) : 0) * in_line_bytes
+                                + in_h * NPU_FEATURE_ATOMIC_SIZE;
+    if (in_groups > 1)
+        in_tile_footprint += (in_groups - 1) * in_surf_bytes;
+    if (in_tile_footprint > in_buf_size)
+        in_tile_footprint = in_buf_size;
+    uint8_t *in_buf = g_malloc(in_buf_size);
+    memset(in_buf, (uint8_t)(int8_t)task->pad_value, in_buf_size);
+    npu_dma_read(s, task->src_addr, in_buf, in_tile_footprint);
+
     uint8_t *wt_buf = g_malloc0(wt_buf_size);
     int32_t *bias_buf = g_malloc0(bias_buf_size);
     uint8_t *out_buf = g_malloc0(out_buf_size);
 
-    npu_dma_read(s, task->src_addr, in_buf, in_buf_size);
     npu_dma_read(s, task->weight_addr, wt_buf, wt_buf_size);
 
     if (bias_from_dma && task->bias_addr != 0) {
@@ -585,16 +592,30 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
         }
     }
 
-    /* Output is col-major (matching npu_input_offset) — no transpose needed. */
+    /* Output DMA: write each pixel using full-tensor line stride derived from
+     * output_surface_stride. For tiled ops, out_h is the TILE height, but the
+     * DPU WDMA uses the full tensor's line stride = surf_stride / out_w.
+     * Without this, tiled output pixels are packed at tile stride (out_h*16),
+     * but the next op reads at full tensor stride — causing data misalignment. */
+    {
+        uint32_t out_surf = task->output_surface_stride
+            ? task->output_surface_stride
+            : out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
+        /* Full tensor line stride = surf_stride / out_w */
+        uint32_t out_line = (out_w > 0) ? out_surf / out_w : out_h * NPU_FEATURE_ATOMIC_SIZE;
 
-    if (task->output_surface_stride > 0 && out_groups > 1) {
-        uint32_t group_size = out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
         for (uint32_t g = 0; g < out_groups; g++) {
-            uint32_t dst = task->dst_addr + g * task->output_surface_stride;
-            npu_dma_write(s, dst, out_buf + g * group_size, group_size);
+            for (uint32_t x = 0; x < out_w; x++) {
+                /* Read from tile-layout out_buf */
+                uint32_t tile_off = g * out_w * out_h * NPU_FEATURE_ATOMIC_SIZE
+                                  + x * out_h * NPU_FEATURE_ATOMIC_SIZE;
+                /* Write to DMA at full-tensor stride */
+                uint32_t dma_addr = task->dst_addr + g * out_surf + x * out_line;
+                npu_dma_write(s, dma_addr,
+                              out_buf + tile_off,
+                              out_h * NPU_FEATURE_ATOMIC_SIZE);
+            }
         }
-    } else {
-        npu_dma_write(s, task->dst_addr, out_buf, out_buf_size);
     }
 
     /* Per-task output CRC + first bytes for debugging */
@@ -611,9 +632,9 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
         for (int i = 0; i < 16 && i < (int)out_buf_size; i++)
             hlen += snprintf(hex + hlen, sizeof(hex) - hlen, "%02x ", out_buf[i]);
         qemu_log_mask(LOG_UNIMP,
-                      "rockchip-npu: task %s %ux%ux%u dst=0x%x crc=%04x [%s]\n",
+                      "rockchip-npu: task %s %ux%ux%u dst=0x%x crc=%04x\n",
                       depthwise ? "DW" : "CV",
-                      out_w, out_h, out_c, task->dst_addr, crc, hex);
+                      out_w, out_h, out_c, task->dst_addr, crc);
     }
 
     g_free(in_buf);
