@@ -8,6 +8,27 @@
 #include <math.h>
 #include "rnpu_coefs.h"
 
+/* Convert a raw weight byte to NPU signed domain.
+ * NPU weights are always in offset-binary: 0x80 = zero.
+ * For uint8 tensors: byte - 0x80 (standard offset-binary conversion).
+ * For int8 tensors: the byte IS already signed, just reinterpret.
+ *   (int8_t)byte gives the signed value, which the NPU uses directly. */
+static inline uint8_t weight_to_npu(uint8_t byte, int type)
+{
+   if (type == 9) /* INT8: byte is already signed int8 */
+      return byte;
+   return byte - 0x80; /* UINT8: convert to offset-binary */
+}
+
+/* Weight value for bias correction — returns the signed weight difference
+ * (w - wzp) in the TFLite quantization domain (not NPU domain). */
+static inline int weight_val(uint8_t byte, uint8_t zero_point, int type)
+{
+   if (type == 9) /* INT8 */
+      return (int)(int8_t)byte - (int)(int8_t)zero_point;
+   return (int)byte - (int)zero_point;
+}
+
 /* Shape helpers — handle both 4D conv tensors and 2D FC tensors */
 static unsigned op_channels(const struct rnpu_tfl_tensor *t)
 {
@@ -107,12 +128,12 @@ unsigned rnpu_fill_weights(const struct rnpu_tfl_model *tfl,
                         dst[n++] = 0x0;
                      else if (ic >= input_channels_real) {
                         if (i2 < 16 || (input_channels_real % 32) > 16)
-                           dst[n++] = zero_point - 0x80;
+                           dst[n++] = weight_to_npu(zero_point, wt->type);
                      } else {
                         unsigned flat = oc * weights_width * weights_height * input_channels_real
                                       + x * weights_height * input_channels_real
                                       + y * input_channels_real + ic;
-                        dst[n++] = w_in[flat] - 0x80;
+                        dst[n++] = weight_to_npu(w_in[flat], wt->type);
                      }
                   }
                }
@@ -159,12 +180,12 @@ unsigned rnpu_fill_weights_group(const struct rnpu_tfl_model *tfl,
                         if (oc_local < oc_pad) dst[n++] = 0x0;
                      } else if (icc >= ic_real) {
                         if (i2 < 16 || (ic_real % 32) > 16)
-                           dst[n++] = zp - 0x80;
+                           dst[n++] = weight_to_npu(zp, wt->type);
                      } else {
                         unsigned oc_global = channel_indices[oc_local];
                         unsigned flat = oc_global * ww * wh * ic_real
                                       + x * wh * ic_real + y * ic_real + icc;
-                        dst[n++] = w_in[flat] - 0x80;
+                        dst[n++] = weight_to_npu(w_in[flat], wt->type);
                      }
                   }
                }
@@ -189,28 +210,27 @@ static int32_t calc_bias_correction(const struct rnpu_tfl_model *tfl,
                               : (uint8_t)it->quant.zero_point;
    unsigned ww, wh;
    op_weight_dims(tfl, op, &ww, &wh);
-   /* Weight zero point stays in raw domain (used for weight arithmetic) */
-   int wzp = (uint8_t)wt->quant.zero_point;
+   uint8_t wzp = (uint8_t)wt->quant.zero_point;
+   int wtype = wt->type;
    bool dw = is_depthwise(tfl, op);
    const uint8_t *w = buf->data;
 
    /* Compute bias correction: compensates for (izp - 0x80) offset in CNA input.
     * The weight difference (w_q - wzp) must be computed in the TFLite quantized
-    * domain, not in NPU offset-binary domain. For uint8 weights (wzp=128):
-    * w_q - wzp = w_byte - 128. For int8 weights (wzp=0): w_q - wzp = (int8_t)w_byte. */
+    * domain: uint8 → (int)byte - (int)zp; int8 → (int)(int8_t)byte - (int)(int8_t)zp */
    int32_t corr = 0;
    if (dw) {
       for (unsigned x = 0; x < ww; x++)
          for (unsigned y = 0; y < wh; y++) {
             unsigned flat = x * wh * ic + y * ic + oc;
-            corr += (w[flat] - wzp) * (izp - 0x80);
+            corr += weight_val(w[flat], wzp, wtype) * (izp - 0x80);
          }
    } else {
       for (unsigned x = 0; x < ww; x++)
          for (unsigned y = 0; y < wh; y++)
             for (unsigned i = 0; i < ic; i++) {
                unsigned flat = oc * ww * wh * ic + x * wh * ic + y * ic + i;
-               corr += (w[flat] - wzp) * (izp - 0x80);
+               corr += weight_val(w[flat], wzp, wtype) * (izp - 0x80);
             }
    }
    return corr;

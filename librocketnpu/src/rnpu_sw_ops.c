@@ -279,7 +279,7 @@ static void exec_reshape(struct rnpu_model *m, struct rnpu_operation *op)
                unsigned ic_off = c % FEATURE_ATOMIC_SIZE;
                uint8_t val = in[NPU_OFFSET(ig, x, y, iw, ih) + ic_off];
 
-               unsigned flat = y * iw * ic + x * ic + c;
+               unsigned flat = x * ih * ic + y * ic + c;
                unsigned og = flat / FEATURE_ATOMIC_SIZE;
                unsigned oc_off = flat % FEATURE_ATOMIC_SIZE;
                out[NPU_OFFSET(og, 0, 0, 1, 1) + oc_off] = val;

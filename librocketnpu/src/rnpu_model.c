@@ -1270,7 +1270,8 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
             break;
          }
          const struct rnpu_tfl_tensor *fc_wt = &m->tfl.tensors[top->inputs[1]];
-         if (fc_wt->quant.scales && fc_wt->quant.num_scales > 1) {
+         if (fc_wt->quant.scales && fc_wt->quant.num_scales > 1 &&
+             !getenv("RNPU_FC_SINGLE")) {
             if (rnpu_active_driver == RNPU_DRIVER_RKNPU && !getenv("RNPU_NO_BRDMA")) {
                float min_s = fc_wt->quant.scales[0], max_s = fc_wt->quant.scales[0];
                for (unsigned j = 1; j < fc_wt->quant.num_scales; j++) {
