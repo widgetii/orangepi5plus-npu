@@ -37,5 +37,5 @@ jobs:
         run: bash qemu/ci_run_tests.sh rocket
 
       - name: Run vendor kernel RKNPU tests
-        continue-on-error: true  # vendor kernel has known accuracy gaps (FC BRDMA, tiled conv)
+        continue-on-error: true  # vendor tiled conv tests fail (x-major offset issue)
         run: bash qemu/ci_run_tests.sh vendor
