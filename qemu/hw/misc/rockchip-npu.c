@@ -359,15 +359,14 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     uint32_t in_line_bytes = task->input_line_stride
         ? task->input_line_stride * 4
         : in_h * NPU_FEATURE_ATOMIC_SIZE;
-    /* Input surface stride: always use W × line_bytes (= W × H × 16).
-     * The register value encodes a hardware-internal DMA parameter that
-     * doesn't directly map to a byte stride. Using it as stride * 4
-     * produced wrong inter-surface offsets, causing MBv1 max_diff=230. */
-    uint32_t in_surf_bytes = in_w * in_line_bytes;
+    /* DMA layout: g*surf + iy*line + ix*16.  Height (iy) is the outer
+     * dimension with line_stride; width (ix) is inner with 16-byte stride.
+     * surf = in_h * line_bytes (height rows × line stride). */
+    uint32_t in_surf_bytes = in_h * in_line_bytes;
     uint32_t in_buf_size = (in_groups > 1)
-        ? (in_groups - 1) * in_surf_bytes + (in_w - 1) * in_line_bytes
-          + in_h * NPU_FEATURE_ATOMIC_SIZE
-        : (in_w - 1) * in_line_bytes + in_h * NPU_FEATURE_ATOMIC_SIZE;
+        ? (in_groups - 1) * in_surf_bytes + (in_h - 1) * in_line_bytes
+          + in_w * NPU_FEATURE_ATOMIC_SIZE
+        : (in_h - 1) * in_line_bytes + in_w * NPU_FEATURE_ATOMIC_SIZE;
 
     uint32_t wt_oc = depthwise ? 1 : ALIGN_UP(MAX2(out_c, 2), 2);
     uint32_t wt_ic = MAX2(in_c_real, NPU_FEATURE_ATOMIC_SIZE);
@@ -400,8 +399,8 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     /* For tiled ops, src_addr is offset into the tensor, so
      * src_addr + in_buf_size may extend beyond the tensor's written extent.
      * Only DMA-read the tile's actual footprint and pad the rest. */
-    uint32_t in_tile_footprint = (in_w > 0 ? (in_w - 1) : 0) * in_line_bytes
-                                + in_h * NPU_FEATURE_ATOMIC_SIZE;
+    uint32_t in_tile_footprint = (in_h > 0 ? (in_h - 1) : 0) * in_line_bytes
+                                + in_w * NPU_FEATURE_ATOMIC_SIZE;
     if (in_groups > 1)
         in_tile_footprint += (in_groups - 1) * in_surf_bytes;
     if (in_tile_footprint > in_buf_size)
@@ -473,8 +472,8 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                                 uint32_t g = abs_ic / NPU_FEATURE_ATOMIC_SIZE;
                                 uint32_t c = abs_ic % NPU_FEATURE_ATOMIC_SIZE;
                                 uint32_t off = g * in_surf_bytes
-                                             + ix * in_line_bytes
-                                             + iy * NPU_FEATURE_ATOMIC_SIZE;
+                                             + iy * in_line_bytes
+                                             + ix * NPU_FEATURE_ATOMIC_SIZE;
                                 in_val = (off + c < in_buf_size)
                                     ? (int8_t)in_buf[off + c] : pad_val;
                             }
@@ -592,28 +591,27 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
         }
     }
 
-    /* Output DMA: write each pixel using full-tensor line stride derived from
-     * output_surface_stride. For tiled ops, out_h is the TILE height, but the
-     * DPU WDMA uses the full tensor's line stride = surf_stride / out_w.
-     * Without this, tiled output pixels are packed at tile stride (out_h*16),
-     * but the next op reads at full tensor stride — causing data misalignment. */
+    /* Output DMA: y-major layout matching hardware WDMA.
+     * DMA addr = dst + g*surf + oy*line + ox*16.
+     * out_buf uses npu_output_offset (x-major: ox outer, oy inner).
+     * Transpose pixel-by-pixel when writing to DMA.
+     * out_line = out_w*16 (stride between height rows in y-major). */
     {
+        uint32_t out_line = out_w * NPU_FEATURE_ATOMIC_SIZE;
         uint32_t out_surf = task->output_surface_stride
             ? task->output_surface_stride
-            : out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
-        /* Full tensor line stride = surf_stride / out_w */
-        uint32_t out_line = (out_w > 0) ? out_surf / out_w : out_h * NPU_FEATURE_ATOMIC_SIZE;
+            : out_h * out_line;
 
         for (uint32_t g = 0; g < out_groups; g++) {
-            for (uint32_t x = 0; x < out_w; x++) {
-                /* Read from tile-layout out_buf */
-                uint32_t tile_off = g * out_w * out_h * NPU_FEATURE_ATOMIC_SIZE
-                                  + x * out_h * NPU_FEATURE_ATOMIC_SIZE;
-                /* Write to DMA at full-tensor stride */
-                uint32_t dma_addr = task->dst_addr + g * out_surf + x * out_line;
-                npu_dma_write(s, dma_addr,
-                              out_buf + tile_off,
-                              out_h * NPU_FEATURE_ATOMIC_SIZE);
+            for (uint32_t oy = 0; oy < out_h; oy++) {
+                for (uint32_t ox = 0; ox < out_w; ox++) {
+                    uint32_t src = npu_output_offset(g, ox, oy, out_w, out_h);
+                    uint32_t dma = task->dst_addr + g * out_surf
+                                 + oy * out_line
+                                 + ox * NPU_FEATURE_ATOMIC_SIZE;
+                    npu_dma_write(s, dma, out_buf + src,
+                                  NPU_FEATURE_ATOMIC_SIZE);
+                }
             }
         }
     }
