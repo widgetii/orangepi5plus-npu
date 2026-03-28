@@ -408,7 +408,13 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
         in_tile_footprint = in_buf_size;
     uint8_t *in_buf = g_malloc(in_buf_size);
     memset(in_buf, (uint8_t)(int8_t)task->pad_value, in_buf_size);
-    npu_dma_read(s, task->src_addr, in_buf, in_tile_footprint);
+    /* For tiled ops, src_addr includes input_offset = tile_y * in_line_bytes
+     * (y-major convention).  Convert to x-major: tile_y * 16. */
+    uint32_t src_within = (in_surf_bytes > 0) ? task->src_addr % in_surf_bytes : 0;
+    uint32_t in_tile_y = (in_line_bytes > 0) ? src_within / in_line_bytes : 0;
+    uint32_t src_adj = task->src_addr - in_tile_y * in_line_bytes
+                     + in_tile_y * NPU_FEATURE_ATOMIC_SIZE;
+    npu_dma_read(s, src_adj, in_buf, in_tile_footprint);
 
     uint8_t *wt_buf = g_malloc0(wt_buf_size);
     int32_t *bias_buf = g_malloc0(bias_buf_size);
@@ -594,25 +600,37 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
         }
     }
 
-    /* Output DMA: write each pixel using full-tensor line stride derived from
-     * output_surface_stride. For tiled ops, out_h is the TILE height, but the
-     * DPU WDMA uses the full tensor's line stride = surf_stride / out_w.
-     * Without this, tiled output pixels are packed at tile stride (out_h*16),
-     * but the next op reads at full tensor stride — causing data misalignment. */
+    /* Output DMA: write pixels into the activation BO at the positions
+     * where the next op's input read will find them.  The input read
+     * uses x-major: offset = g*surf + ix*line + iy*16.
+     *
+     * For tiled ops, dst_addr = tensor_base + tile_y * out_line (the tile
+     * offset uses the outer/x stride).  But in x-major the tile offset
+     * should be tile_y * 16 (inner/y stride).  We correct by computing
+     * tile_y and adjusting the base address. */
     {
         uint32_t out_surf = task->output_surface_stride
             ? task->output_surface_stride
             : out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
-        /* Full tensor line stride = surf_stride / out_w */
-        uint32_t out_line = (out_w > 0) ? out_surf / out_w : out_h * NPU_FEATURE_ATOMIC_SIZE;
+        uint32_t out_line = (out_w > 0) ? out_surf / out_w
+                                         : out_h * NPU_FEATURE_ATOMIC_SIZE;
+
+        /* Recover tile_y from the output offset baked into dst_addr.
+         * For non-tiled ops, output_offset = 0, tile_y = 0, no adjustment.
+         * For tiled ops, output_offset = tile_y * out_line.
+         * We detect this by comparing dst_addr modulo out_surf: the
+         * within-group offset should be divisible by out_line. */
+        uint32_t dst_within = task->dst_addr % out_surf;
+        uint32_t tile_y = (out_line > 0) ? dst_within / out_line : 0;
+        /* Adjusted base: replace tile_y * out_line with tile_y * 16 */
+        uint32_t dst_base = task->dst_addr - tile_y * out_line
+                          + tile_y * NPU_FEATURE_ATOMIC_SIZE;
 
         for (uint32_t g = 0; g < out_groups; g++) {
             for (uint32_t x = 0; x < out_w; x++) {
-                /* Read from tile-layout out_buf */
                 uint32_t tile_off = g * out_w * out_h * NPU_FEATURE_ATOMIC_SIZE
                                   + x * out_h * NPU_FEATURE_ATOMIC_SIZE;
-                /* Write to DMA at full-tensor stride */
-                uint32_t dma_addr = task->dst_addr + g * out_surf + x * out_line;
+                uint32_t dma_addr = dst_base + g * out_surf + x * out_line;
                 npu_dma_write(s, dma_addr,
                               out_buf + tile_off,
                               out_h * NPU_FEATURE_ATOMIC_SIZE);
