@@ -324,6 +324,22 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
     qemu_fdt_setprop_string(fdt, "/iommu@fdab9000", "status", "okay");
     qemu_fdt_setprop_cell(fdt, "/iommu@fdab9000", "phandle", iommu_phandle);
 
+    /* QEMU IOMMU mailbox — receives IOVA→GPA mappings from qemu_iommu.ko */
+    qemu_fdt_add_subnode(fdt, "/qemu-iommu@fdaf0000");
+    qemu_fdt_setprop_string(fdt, "/qemu-iommu@fdaf0000", "compatible",
+                            "qemu,iommu-dummy");
+    {
+        uint64_t mb_reg[2] = {
+            cpu_to_be64(0xfdaf0000), cpu_to_be64(0x1000),
+        };
+        qemu_fdt_setprop(fdt, "/qemu-iommu@fdaf0000", "reg",
+                         mb_reg, sizeof(mb_reg));
+    }
+    qemu_fdt_setprop_cell(fdt, "/qemu-iommu@fdaf0000", "#iommu-cells", 0);
+    int qiommu_phandle = qemu_fdt_alloc_phandle(fdt);
+    qemu_fdt_setprop_cell(fdt, "/qemu-iommu@fdaf0000", "phandle",
+                          qiommu_phandle);
+
     /* NPU — single node for vendor rknpu driver */
     qemu_fdt_add_subnode(fdt, "/npu@fdab0000");
     qemu_fdt_setprop_string(fdt, "/npu@fdab0000", "compatible",
@@ -466,8 +482,10 @@ static void *rk3588_create_dtb(MachineState *ms, int *fdt_size)
             qemu_fdt_setprop_string_array(fdt, node, "reset-names",
                                           core_rst_names, 2);
         }
+        /* Per-core nodes use qemu-iommu (Rocket kernel uses qemu_iommu.ko) */
+        uint32_t qiommu_ref = cpu_to_be32(qiommu_phandle);
         qemu_fdt_setprop(fdt, node, "iommus",
-                         &iommu_ref, sizeof(iommu_ref));
+                         &qiommu_ref, sizeof(qiommu_ref));
     }
 
     return fdt;
@@ -633,6 +651,8 @@ static void rk3588_init(MachineState *ms)
 
         DeviceState *iommu_dev = qdev_new(TYPE_ROCKCHIP_IOMMU);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(iommu_dev), &error_fatal);
+        /* Map the mailbox MMIO (region #4) at 0xfdaf0000 for qemu_iommu.ko */
+        sysbus_mmio_map(SYS_BUS_DEVICE(iommu_dev), 4, 0xfdaf0000);
 
         DeviceState *npu = qdev_new(TYPE_ROCKCHIP_NPU);
         RockchipNPUState *npu_s = ROCKCHIP_NPU(npu);

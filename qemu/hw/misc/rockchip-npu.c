@@ -359,15 +359,11 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     uint32_t in_line_bytes = task->input_line_stride
         ? task->input_line_stride * 4
         : in_h * NPU_FEATURE_ATOMIC_SIZE;
-    uint32_t in_surf_bytes;
-    if (fc_1x1) {
-        /* FC 1×1: surfaces are contiguous (16 bytes each for 1×1 spatial) */
-        in_surf_bytes = in_w * in_line_bytes;
-    } else {
-        in_surf_bytes = task->input_surface_stride
-            ? task->input_surface_stride * 4
-            : in_w * in_line_bytes;
-    }
+    /* Input surface stride: always use W × line_bytes (= W × H × 16).
+     * The register value encodes a hardware-internal DMA parameter that
+     * doesn't directly map to a byte stride. Using it as stride * 4
+     * produced wrong inter-surface offsets, causing MBv1 max_diff=230. */
+    uint32_t in_surf_bytes = in_w * in_line_bytes;
     uint32_t in_buf_size = (in_groups > 1)
         ? (in_groups - 1) * in_surf_bytes + (in_w - 1) * in_line_bytes
           + in_h * NPU_FEATURE_ATOMIC_SIZE
@@ -401,12 +397,29 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     uint32_t out_groups = DIV_ROUND_UP(out_c, NPU_FEATURE_ATOMIC_SIZE);
     uint32_t out_buf_size = out_groups * out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
 
-    uint8_t *in_buf = g_malloc0(in_buf_size);
+    /* For tiled ops, src_addr is offset into the tensor, so
+     * src_addr + in_buf_size may extend beyond the tensor's written extent.
+     * Only DMA-read the tile's actual footprint and pad the rest. */
+    uint32_t in_tile_footprint = (in_w > 0 ? (in_w - 1) : 0) * in_line_bytes
+                                + in_h * NPU_FEATURE_ATOMIC_SIZE;
+    if (in_groups > 1)
+        in_tile_footprint += (in_groups - 1) * in_surf_bytes;
+    if (in_tile_footprint > in_buf_size)
+        in_tile_footprint = in_buf_size;
+    uint8_t *in_buf = g_malloc(in_buf_size);
+    memset(in_buf, (uint8_t)(int8_t)task->pad_value, in_buf_size);
+    /* For tiled ops, src_addr includes input_offset = tile_y * in_line_bytes
+     * (y-major convention).  Convert to x-major: tile_y * 16. */
+    uint32_t src_within = (in_surf_bytes > 0) ? task->src_addr % in_surf_bytes : 0;
+    uint32_t in_tile_y = (in_line_bytes > 0) ? src_within / in_line_bytes : 0;
+    uint32_t src_adj = task->src_addr - in_tile_y * in_line_bytes
+                     + in_tile_y * NPU_FEATURE_ATOMIC_SIZE;
+    npu_dma_read(s, src_adj, in_buf, in_tile_footprint);
+
     uint8_t *wt_buf = g_malloc0(wt_buf_size);
     int32_t *bias_buf = g_malloc0(bias_buf_size);
     uint8_t *out_buf = g_malloc0(out_buf_size);
 
-    npu_dma_read(s, task->src_addr, in_buf, in_buf_size);
     npu_dma_read(s, task->weight_addr, wt_buf, wt_buf_size);
 
     if (bias_from_dma && task->bias_addr != 0) {
@@ -490,15 +503,17 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                     }
                 }
 
-                acc = nvdla_truncate(acc, task->truncate_bits);
-
-                /* BS_OW_OP: weight zero-point compensation (SDP stage).
-                 * Applied AFTER CACC truncation, matching hardware pipeline order.
-                 * Weights stored as (w - 0x80), BS_OW_OP = (0x80 - wzp) corrects. */
+                /* BS_OW_OP: weight zero-point compensation.
+                 * The CACC accumulates both the dot-product and OW_OP * input_sum,
+                 * then truncates the combined result.  This ensures OW_OP is scaled
+                 * by the same truncation factor as the accumulation — critical for
+                 * UINT8 models where sum_inputs is large and would otherwise
+                 * overwhelm the truncated accumulation. */
                 if (task->bs_ow_op) {
                     int16_t ow_op = (int16_t)task->bs_ow_op;
                     acc += (int32_t)ow_op * sum_inputs;
                 }
+                acc = nvdla_truncate(acc, task->truncate_bits);
 
                 /* SDP Pipeline: BS → BN → EW → OUT_CVT */
                 {
@@ -585,19 +600,45 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
         }
     }
 
-    /* Output is col-major (matching npu_input_offset) — no transpose needed. */
+    /* Output DMA: write pixels into the activation BO at the positions
+     * where the next op's input read will find them.  The input read
+     * uses x-major: offset = g*surf + ix*line + iy*16.
+     *
+     * For tiled ops, dst_addr = tensor_base + tile_y * out_line (the tile
+     * offset uses the outer/x stride).  But in x-major the tile offset
+     * should be tile_y * 16 (inner/y stride).  We correct by computing
+     * tile_y and adjusting the base address. */
+    {
+        uint32_t out_surf = task->output_surface_stride
+            ? task->output_surface_stride
+            : out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
+        uint32_t out_line = (out_w > 0) ? out_surf / out_w
+                                         : out_h * NPU_FEATURE_ATOMIC_SIZE;
 
-    if (task->output_surface_stride > 0 && out_groups > 1) {
-        uint32_t group_size = out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
+        /* Recover tile_y from the output offset baked into dst_addr.
+         * For non-tiled ops, output_offset = 0, tile_y = 0, no adjustment.
+         * For tiled ops, output_offset = tile_y * out_line.
+         * We detect this by comparing dst_addr modulo out_surf: the
+         * within-group offset should be divisible by out_line. */
+        uint32_t dst_within = task->dst_addr % out_surf;
+        uint32_t tile_y = (out_line > 0) ? dst_within / out_line : 0;
+        /* Adjusted base: replace tile_y * out_line with tile_y * 16 */
+        uint32_t dst_base = task->dst_addr - tile_y * out_line
+                          + tile_y * NPU_FEATURE_ATOMIC_SIZE;
+
         for (uint32_t g = 0; g < out_groups; g++) {
-            uint32_t dst = task->dst_addr + g * task->output_surface_stride;
-            npu_dma_write(s, dst, out_buf + g * group_size, group_size);
+            for (uint32_t x = 0; x < out_w; x++) {
+                uint32_t tile_off = g * out_w * out_h * NPU_FEATURE_ATOMIC_SIZE
+                                  + x * out_h * NPU_FEATURE_ATOMIC_SIZE;
+                uint32_t dma_addr = dst_base + g * out_surf + x * out_line;
+                npu_dma_write(s, dma_addr,
+                              out_buf + tile_off,
+                              out_h * NPU_FEATURE_ATOMIC_SIZE);
+            }
         }
-    } else {
-        npu_dma_write(s, task->dst_addr, out_buf, out_buf_size);
     }
 
-    /* Per-task output CRC + first bytes for debugging */
+    /* Per-task output CRC + DMA trace for debugging */
     {
         uint16_t crc = 0xFFFF;
         for (uint32_t i = 0; i < out_buf_size; i++) {
@@ -605,15 +646,19 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
             for (int j = 0; j < 8; j++)
                 crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
         }
-        /* Log first 16 bytes of output for comparison with board */
-        char hex[64];
-        int hlen = 0;
-        for (int i = 0; i < 16 && i < (int)out_buf_size; i++)
-            hlen += snprintf(hex + hlen, sizeof(hex) - hlen, "%02x ", out_buf[i]);
         qemu_log_mask(LOG_UNIMP,
-                      "rockchip-npu: task %s %ux%ux%u dst=0x%x crc=%04x [%s]\n",
+                      "rockchip-npu: task %s %ux%ux%u ic=%u "
+                      "src=0x%x dst=0x%x surf_in=%u surf_out=%u "
+                      "in[0:4]=%02x%02x%02x%02x out[0:4]=%02x%02x%02x%02x "
+                      "crc=%04x\n",
                       depthwise ? "DW" : "CV",
-                      out_w, out_h, out_c, task->dst_addr, crc, hex);
+                      out_w, out_h, out_c, in_c,
+                      task->src_addr, task->dst_addr,
+                      in_surf_bytes,
+                      task->output_surface_stride,
+                      in_buf[0], in_buf[1], in_buf[2], in_buf[3],
+                      out_buf[0], out_buf[1], out_buf[2], out_buf[3],
+                      crc);
     }
 
     g_free(in_buf);

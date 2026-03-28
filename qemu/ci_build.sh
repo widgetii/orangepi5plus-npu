@@ -220,6 +220,7 @@ cp "$BOOT/test_mobilenet" "$ROOTFS_V/bin/" 2>/dev/null || true
 cp "$BOOT/test_fc" "$ROOTFS_V/bin/" 2>/dev/null || true
 if [ -f "$MODEL" ]; then cp "$MODEL" "$ROOTFS_V/model.tflite"; fi
 if [ -f "$GOLDEN" ]; then cp "$GOLDEN" "$ROOTFS_V/golden.bin"; fi
+if [ -f "$BOOT/grace_hopper_224.bin" ]; then cp "$BOOT/grace_hopper_224.bin" "$ROOTFS_V/input.bin"; fi
 if [ -f "$FC_DIR/fc_model_int8.tflite" ]; then
     cp "$FC_DIR/fc_model_int8.tflite" "$ROOTFS_V/fc_model.tflite"
     cp "$FC_DIR/fc_test_input.bin" "$ROOTFS_V/fc_input.bin"

@@ -94,8 +94,11 @@ fi
 # Check conv tests
 if grep -q "CONV TESTS:" "$LOG"; then
     CONV_RESULT=$(grep "CONV TESTS:" "$LOG" | tail -1)
-    if echo "$CONV_RESULT" | grep -q "9/9 passed"; then
-        echo "PASS: Conv tests (9/9)"
+    CONV_TOTAL=$(echo "$CONV_RESULT" | grep -oP '\d+/\d+ passed' | head -1)
+    CONV_N=$(echo "$CONV_TOTAL" | cut -d/ -f1)
+    CONV_D=$(echo "$CONV_TOTAL" | cut -d/ -f2 | cut -d' ' -f1)
+    if [ "$CONV_N" = "$CONV_D" ] && [ -n "$CONV_N" ]; then
+        echo "PASS: Conv tests ($CONV_TOTAL)"
     else
         echo "FAIL: Conv tests — $CONV_RESULT"
         FAILED=1
@@ -104,15 +107,17 @@ else
     echo "SKIP: Conv tests not found in output"
 fi
 
-# Check MobileNetV1 golden comparison
-# TODO: MobileNetV1 golden check disabled — QEMU output diverges from real HW
-#       golden (max_diff=230, class 853 vs 653). Needs QEMU conv accuracy investigation.
+# Check MobileNetV1 golden comparison (max_diff ≤ 5 tolerance for rounding)
 if grep -q "RESULT:.*bit-exact\|RESULT:.*max_diff" "$LOG"; then
     GOLDEN_RESULT=$(grep "RESULT:.*bit-exact\|RESULT:.*max_diff\|RESULT:.*FAIL" "$LOG" | head -1)
-    if echo "$GOLDEN_RESULT" | grep -q "PASS"; then
+    MAX_DIFF=$(echo "$GOLDEN_RESULT" | grep -oP 'max_diff=\K[0-9]+' || echo "0")
+    if echo "$GOLDEN_RESULT" | grep -q "PASS\|bit-exact"; then
         echo "PASS: MobileNetV1 golden — $GOLDEN_RESULT"
+    elif [ -n "$MAX_DIFF" ] && [ "$MAX_DIFF" -le 5 ]; then
+        echo "PASS: MobileNetV1 golden — $GOLDEN_RESULT (within tolerance)"
     else
-        echo "WARN: MobileNetV1 golden — $GOLDEN_RESULT (not enforced)"
+        echo "FAIL: MobileNetV1 golden — $GOLDEN_RESULT"
+        FAILED=1
     fi
 fi
 
@@ -122,13 +127,14 @@ if grep -q "Top-1 class:" "$LOG"; then
     echo "INFO: MobileNetV1 classification — $CLASS_RESULT"
 fi
 
-# Check MobileNet completed (just warn, don't fail — golden mismatch causes exit 1)
+# Check MobileNet exit code
 if grep -q "MobileNetV1 exit code:" "$LOG"; then
     MBN_EXIT=$(grep "MobileNetV1 exit code:" "$LOG" | tail -1 | tr -d '\r' | awk '{print $NF}')
     if [ "$MBN_EXIT" = "0" ]; then
         echo "PASS: MobileNetV1 completed"
     else
-        echo "WARN: MobileNetV1 exited with code $MBN_EXIT (not enforced)"
+        echo "FAIL: MobileNetV1 exited with code $MBN_EXIT"
+        FAILED=1
     fi
 else
     echo "SKIP: MobileNetV1 result not found"

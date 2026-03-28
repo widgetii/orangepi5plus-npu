@@ -1,5 +1,6 @@
 #!/bin/sh
 mount -t proc proc /proc; mount -t sysfs sysfs /sys; mount -t devtmpfs devtmpfs /dev
+insmod /lib/modules/qemu_iommu.ko 2>/dev/null; insmod /lib/modules/qemu_reset.ko 2>/dev/null
 insmod /lib/modules/drm_shmem_helper.ko; insmod /lib/modules/gpu-sched.ko; insmod /lib/modules/rocket.ko
 for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /dev/accel/accel0 ] && break; sleep 1; done
 echo "=== Running conv tests ==="
