@@ -55,11 +55,110 @@ static hwaddr rk_iommu_decode_pte(uint32_t entry)
     return lo | hi;
 }
 
+/* ======================================================================
+ * Mailbox IOVA→GPA map (for Rocket kernel's qemu_iommu.ko)
+ * ====================================================================== */
+
+void rk_iommu_add_mapping(RockchipIOMMUState *s, uint32_t iova, uint32_t gpa)
+{
+    /* Check for existing mapping (update in place) */
+    for (unsigned i = 0; i < s->mb_count; i++) {
+        if (s->mb_map[i].iova == iova) {
+            s->mb_map[i].gpa = gpa;
+            return;
+        }
+    }
+    if (s->mb_count < RK_IOMMU_MAILBOX_MAX) {
+        s->mb_map[s->mb_count].iova = iova;
+        s->mb_map[s->mb_count].gpa = gpa;
+        s->mb_count++;
+    } else {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "rockchip-iommu: mailbox map full (%u entries)\n",
+                      RK_IOMMU_MAILBOX_MAX);
+    }
+}
+
+static void rk_iommu_remove_mapping(RockchipIOMMUState *s, uint32_t iova)
+{
+    for (unsigned i = 0; i < s->mb_count; i++) {
+        if (s->mb_map[i].iova == iova) {
+            s->mb_map[i] = s->mb_map[s->mb_count - 1];
+            s->mb_count--;
+            return;
+        }
+    }
+}
+
+static hwaddr rk_iommu_mailbox_lookup(RockchipIOMMUState *s, uint32_t iova)
+{
+    uint32_t page = iova & 0xFFFFF000U;
+    uint32_t offset = iova & 0xFFF;
+    for (unsigned i = 0; i < s->mb_count; i++) {
+        if (s->mb_map[i].iova == page) {
+            return (hwaddr)s->mb_map[i].gpa + offset;
+        }
+    }
+    return (hwaddr)-1;  /* not found */
+}
+
+/* Mailbox MMIO: kernel writes IOVA at +0x00, GPA at +0x04, UNMAP at +0x08 */
+static uint64_t rk_iommu_mailbox_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return 0;
+}
+
+static void rk_iommu_mailbox_write(void *opaque, hwaddr addr,
+                                    uint64_t val, unsigned size)
+{
+    RockchipIOMMUState *s = opaque;
+
+    switch (addr) {
+    case 0x00:
+        s->mb_pending_iova = (uint32_t)val;
+        break;
+    case 0x04:
+        rk_iommu_add_mapping(s, s->mb_pending_iova, (uint32_t)val);
+        break;
+    case 0x08:
+        rk_iommu_remove_mapping(s, (uint32_t)val);
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps rk_iommu_mailbox_ops = {
+    .read = rk_iommu_mailbox_read,
+    .write = rk_iommu_mailbox_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/* ======================================================================
+ * Page table translation
+ * ====================================================================== */
+
 hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova)
 {
     /* Use the most recently enabled DTE across all instances */
     uint32_t dte_addr = s->last_active_dte;
     if (!dte_addr) {
+        /* No page table — try mailbox map (Rocket kernel path) */
+        hwaddr gpa = rk_iommu_mailbox_lookup(s, iova);
+        if (gpa != (hwaddr)-1) {
+            return gpa;
+        }
+        /* If mailbox has entries but this IOVA not found, warn */
+        if (s->mb_count > 0) {
+            static int miss_count = 0;
+            if (miss_count < 5) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "rockchip-iommu: mailbox MISS iova=0x%08x "
+                              "(mb_count=%u)\n", iova, s->mb_count);
+                miss_count++;
+            }
+        }
         return (hwaddr)iova;
     }
 
@@ -264,6 +363,12 @@ static void rk_iommu_realize(DeviceState *dev, Error **errp)
                               inst, name, RK_IOMMU_INSTANCE_SIZE);
         sysbus_init_mmio(sbd, &inst->iomem);
     }
+
+    /* Mailbox MMIO region (index 4, after the 4 IOMMU instances) */
+    memory_region_init_io(&s->mailbox_iomem, OBJECT(dev),
+                          &rk_iommu_mailbox_ops, s,
+                          "rockchip-iommu-mailbox", 0x1000);
+    sysbus_init_mmio(sbd, &s->mailbox_iomem);
 
     for (int i = 0; i < 3; i++) {
         sysbus_init_irq(sbd, &s->irq[i]);

@@ -61,6 +61,8 @@ typedef struct RkIOMMUInstance {
     bool paging_enabled;
 } RkIOMMUInstance;
 
+#define RK_IOMMU_MAILBOX_MAX 8192
+
 struct RockchipIOMMUState {
     SysBusDevice parent_obj;
 
@@ -72,7 +74,17 @@ struct RockchipIOMMUState {
 
     /* Guest physical address space for page table reads */
     AddressSpace *dma_as;
+
+    /* Mailbox MMIO region for qemu_iommu.ko IOVA→GPA forwarding */
+    MemoryRegion mailbox_iomem;
+
+    /* Mailbox IOVA→GPA map (from qemu_iommu.ko on Rocket kernel) */
+    struct { uint32_t iova, gpa; } mb_map[RK_IOMMU_MAILBOX_MAX];
+    unsigned mb_count;
+    uint32_t mb_pending_iova;
 };
+
+void rk_iommu_add_mapping(RockchipIOMMUState *s, uint32_t iova, uint32_t gpa);
 
 /*
  * Translate an IOVA to a guest physical address using the page table.
