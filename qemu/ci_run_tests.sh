@@ -140,18 +140,15 @@ else
     echo "SKIP: MobileNetV1 result not found"
 fi
 
-# Check FC test — enforced for Rocket, warned for vendor (BRDMA emulation gap)
+# Check FC test — enforced for both Rocket and vendor kernels
 if grep -q "FC test exit code:" "$LOG"; then
     FC_EXIT=$(grep "FC test exit code:" "$LOG" | tail -1 | tr -d '\r' | awk '{print $NF}')
     if [ "$FC_EXIT" = "0" ]; then
         FC_RESULT=$(grep "RESULT:.*bit-exact\|RESULT:.*max_diff\|RESULT:.*FAIL" "$LOG" | tail -1)
         echo "PASS: FC test — $FC_RESULT"
-    elif [ "$VARIANT" = "rocket" ]; then
+    else
         echo "FAIL: FC test exited with code $FC_EXIT"
         FAILED=1
-    else
-        FC_RESULT=$(grep "RESULT:" "$LOG" | tail -1)
-        echo "WARN: FC test — $FC_RESULT (vendor kernel, not enforced)"
     fi
 else
     echo "SKIP: FC test not found in output"
