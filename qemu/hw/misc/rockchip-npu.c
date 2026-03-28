@@ -331,7 +331,8 @@ static inline int32_t apply_sdp_x_stage(int32_t value, uint32_t cfg,
  * ====================================================================== */
 
 static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
-                                RocketConvTask *task)
+                                RocketConvTask *task,
+                                bool is_first_task)
 {
     uint32_t out_w = task->output_width;
     uint32_t out_h = task->output_height;
@@ -421,9 +422,15 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     uint8_t *in_buf = g_malloc(in_buf_size);
     memset(in_buf, (uint8_t)(int8_t)task->pad_value, in_buf_size);
     /* For tiled ops, src_addr includes input_offset = tile_y * in_line_bytes
-     * (y-major convention).  Convert to x-major: tile_y * 16. */
-    uint32_t src_within = (in_surf_bytes > 0) ? task->src_addr % in_surf_bytes : 0;
-    uint32_t in_tile_y = (in_line_bytes > 0) ? src_within / in_line_bytes : 0;
+     * (y-major convention).  Convert to x-major: tile_y * 16.
+     * The first task in a job never has a tile offset (tile_y = 0), so skip
+     * the correction to avoid false positives from non-aligned IOVAs
+     * (fixes vendor kernel tiled conv — issue #20). */
+    uint32_t in_tile_y = 0;
+    if (!is_first_task && in_surf_bytes > 0) {
+        uint32_t src_within = task->src_addr % in_surf_bytes;
+        in_tile_y = (in_line_bytes > 0) ? src_within / in_line_bytes : 0;
+    }
     uint32_t src_adj = task->src_addr - in_tile_y * in_line_bytes
                      + in_tile_y * NPU_FEATURE_ATOMIC_SIZE;
     npu_dma_read(s, src_adj, in_buf, in_tile_footprint);
@@ -635,13 +642,15 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                                          : out_h * NPU_FEATURE_ATOMIC_SIZE;
 
         /* Recover tile_y from the output offset baked into dst_addr.
-         * For non-tiled ops, output_offset = 0, tile_y = 0, no adjustment.
-         * For tiled ops, output_offset = tile_y * out_line.
-         * We detect this by comparing dst_addr modulo out_surf: the
-         * within-group offset should be divisible by out_line. */
-        uint32_t dst_within = task->dst_addr % out_surf;
-        uint32_t tile_y = (out_line > 0) ? dst_within / out_line : 0;
-        /* Adjusted base: replace tile_y * out_line with tile_y * 16 */
+         * The first task in a job never has a tile offset (tile_y = 0),
+         * so skip the modular recovery to avoid false positives from
+         * non-aligned IOVAs (fixes vendor kernel tiled conv — issue #20).
+         * For subsequent chained tasks, use dst_addr % out_surf. */
+        uint32_t tile_y = 0;
+        if (!is_first_task) {
+            uint32_t dst_within = task->dst_addr % out_surf;
+            tile_y = (out_line > 0) ? dst_within / out_line : 0;
+        }
         uint32_t dst_base = task->dst_addr - tile_y * out_line
                           + tile_y * NPU_FEATURE_ATOMIC_SIZE;
 
@@ -697,6 +706,7 @@ static void execute_job(RockchipNPUState *s, RocketNPUCore *core,
 {
     uint32_t current_addr = base_addr;
     uint32_t current_count = (encoded_amounts + 1) * 2;
+    bool is_first_task = true;
 
     while (current_count > 0 && current_addr != 0) {
         if (current_count > NPU_MAX_REGCMD_ENTRIES) {
@@ -740,7 +750,8 @@ static void execute_job(RockchipNPUState *s, RocketNPUCore *core,
                       task.output_channels,
                       task.src_addr, task.dst_addr,
                       task.weight_addr, task.bias_addr);
-        execute_convolution(s, core, &task);
+        execute_convolution(s, core, &task, is_first_task);
+        is_first_task = false;
 
         uint32_t next_addr = task.next_base_addr;
         uint32_t next_encoded = task.next_reg_amounts;
