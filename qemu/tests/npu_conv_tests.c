@@ -1431,17 +1431,84 @@ static int test_tiled_224(int fd)
     return run_conv_test(fd, "test_tiled_224", &cfg, input, weights, bias, expected);
 }
 
+/* ======================================================================
+ * Test 12: 64→128 pointwise conv with truncate=1, ow_op=24, offset=-128
+ *
+ * Matches MBv1 op[04] parameters exactly. If this fails, the QEMU conv
+ * engine has a bug for this configuration. If it passes, the issue is
+ * in the data flow between ops.
+ * ====================================================================== */
+static int test_pointwise_64_128(int fd)
+{
+    struct conv_config cfg;
+    conv_config_defaults(&cfg);
+    cfg.in_w = 4; cfg.in_h = 4; cfg.in_c = 64;
+    cfg.out_c = 128;
+    cfg.filt_w = 1; cfg.filt_h = 1;
+    cfg.stride_x = 1; cfg.stride_y = 1;
+    cfg.pad_left = 0; cfg.pad_top = 0;
+    cfg.pad_value = 0;
+    cfg.truncate_bits = 1;
+    cfg.bs_ow_op = 24;  /* 0x80 - wzp where wzp=104 */
+    cfg.out_cvt_scale = 31769;
+    cfg.out_cvt_shift = 20;
+    cfg.out_cvt_offset = -128;  /* ozp_u8 - 0x80 = 0 - 128 */
+
+    static int8_t input[4 * 4 * 64];
+    for (uint32_t i = 0; i < sizeof(input); i++)
+        input[i] = prng_val(i, 55);
+
+    static int8_t weights[128 * 1 * 1 * 64];
+    for (uint32_t i = 0; i < sizeof(weights); i++)
+        weights[i] = (int8_t)((i * 7 + 13) % 11 - 5);
+
+    int32_t bias[128];
+    for (int i = 0; i < 128; i++) bias[i] = (i * 37 - 2000);
+
+    uint32_t out_w = 4, out_h = 4;
+    static int8_t expected[4 * 4 * 128];
+
+    for (uint32_t oy = 0; oy < out_h; oy++) {
+        for (uint32_t ox = 0; ox < out_w; ox++) {
+            for (uint32_t oc = 0; oc < 128; oc++) {
+                int32_t acc = 0;
+                int32_t sum_in = 0;
+                for (uint32_t ic = 0; ic < 64; ic++) {
+                    int8_t in_val = input[oy * 4 * 64 + ox * 64 + ic];
+                    int8_t w_val = weights[oc * 64 + ic];
+                    acc += (int32_t)in_val * (int32_t)w_val;
+                    sum_in += (int32_t)in_val;
+                }
+                acc = nvdla_truncate(acc, 1);
+                acc += (int32_t)(int16_t)cfg.bs_ow_op * sum_in;
+                acc += bias[oc];
+                int64_t scaled = nvdla_shift_right_round64(
+                    (int64_t)acc * (int64_t)cfg.out_cvt_scale, cfg.out_cvt_shift);
+                if (scaled > 65535) scaled = 65535;
+                if (scaled < -65536) scaled = -65536;
+                int32_t result = (int32_t)scaled + cfg.out_cvt_offset;
+                if (result < -128) result = -128;
+                if (result > 127) result = 127;
+                expected[oy * out_w * 128 + ox * 128 + oc] = (int8_t)result;
+            }
+        }
+    }
+
+    return run_conv_test(fd, "test_pointwise_64_128", &cfg, input, weights, bias, expected);
+}
+
 int main(void)
 {
     printf("=== NPU Convolution Test Suite ===\n");
 
     int passed = 0;
-    int total = 11;
+    int total = 12;
 
     int (*tests[])(int) = {
         test_matmul_small, test_matmul_medium, test_conv3x3_stride2,
         test_depthwise3x3, test_bias_dma, test_bn_relu,
         test_bs_ow_op, test_bs_ow_op_18, test_mobilenet_op0, test_tiled_conv, test_tiled_224,
+        test_pointwise_64_128,
     };
 
     /* Detect driver type with a probe open */

@@ -94,8 +94,11 @@ fi
 # Check conv tests
 if grep -q "CONV TESTS:" "$LOG"; then
     CONV_RESULT=$(grep "CONV TESTS:" "$LOG" | tail -1)
-    if echo "$CONV_RESULT" | grep -q "9/9 passed"; then
-        echo "PASS: Conv tests (9/9)"
+    CONV_TOTAL=$(echo "$CONV_RESULT" | grep -oP '\d+/\d+ passed' | head -1)
+    CONV_N=$(echo "$CONV_TOTAL" | cut -d/ -f1)
+    CONV_D=$(echo "$CONV_TOTAL" | cut -d/ -f2 | cut -d' ' -f1)
+    if [ "$CONV_N" = "$CONV_D" ] && [ -n "$CONV_N" ]; then
+        echo "PASS: Conv tests ($CONV_TOTAL)"
     else
         echo "FAIL: Conv tests — $CONV_RESULT"
         FAILED=1
