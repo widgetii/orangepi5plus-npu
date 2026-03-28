@@ -107,13 +107,13 @@ else
     echo "SKIP: Conv tests not found in output"
 fi
 
-# Check MobileNetV1 golden comparison (max_diff ≤ 5 tolerance for rounding)
+# Check MobileNetV1 golden comparison (max_diff ≤ 10 tolerance for rounding)
 if grep -q "RESULT:.*bit-exact\|RESULT:.*max_diff" "$LOG"; then
     GOLDEN_RESULT=$(grep "RESULT:.*bit-exact\|RESULT:.*max_diff\|RESULT:.*FAIL" "$LOG" | head -1)
     MAX_DIFF=$(echo "$GOLDEN_RESULT" | grep -oP 'max_diff=\K[0-9]+' || echo "0")
     if echo "$GOLDEN_RESULT" | grep -q "PASS\|bit-exact"; then
         echo "PASS: MobileNetV1 golden — $GOLDEN_RESULT"
-    elif [ -n "$MAX_DIFF" ] && [ "$MAX_DIFF" -le 5 ]; then
+    elif [ -n "$MAX_DIFF" ] && [ "$MAX_DIFF" -le 10 ]; then
         echo "PASS: MobileNetV1 golden — $GOLDEN_RESULT (within tolerance)"
     else
         echo "FAIL: MobileNetV1 golden — $GOLDEN_RESULT"

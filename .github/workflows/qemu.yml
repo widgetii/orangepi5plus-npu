@@ -34,7 +34,9 @@ jobs:
         run: bash qemu/ci_build.sh
 
       - name: Run Rocket kernel NPU tests
+        id: rocket-tests
         run: bash qemu/ci_run_tests.sh rocket
 
       - name: Run vendor kernel RKNPU tests
+        if: always() && steps.rocket-tests.outcome != 'skipped'
         run: bash qemu/ci_run_tests.sh vendor
