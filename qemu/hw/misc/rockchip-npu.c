@@ -509,14 +509,19 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                  * by the same truncation factor as the accumulation — critical for
                  * UINT8 models where sum_inputs is large and would otherwise
                  * overwhelm the truncated accumulation. */
-                if (task->bs_ow_op) {
+                /* BS_OW_OP: For standard path (no BRDMA MUL), the register
+                 * value is the direct OW_OP.  For BRDMA path (per-channel
+                 * MUL active), the register uses N-1 encoding. */
+                {
                     int16_t ow_op = (int16_t)task->bs_ow_op;
-                    acc += (int32_t)ow_op * sum_inputs;
+                    if (mul_scale_buf)
+                        ow_op = (int16_t)(task->bs_ow_op + 1);
+                    if (ow_op)
+                        acc += (int32_t)ow_op * sum_inputs;
                 }
                 acc = nvdla_truncate(acc, task->truncate_bits);
 
                 /* SDP Pipeline: BS → BN → EW → OUT_CVT */
-                bool bs_mul_fused = false;
                 {
                     bool bs_alu_src = (task->bs_cfg >> 8) & 1;
                     int32_t bs_alu_op = bs_alu_src ? bias_buf[oc]
@@ -529,39 +534,10 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                         int16_t per_ch_mul = mul_scale_buf[oc];
                         eff_bs_mul_cfg = (eff_bs_mul_cfg & 0x0000ffff) |
                                          ((uint32_t)(uint16_t)per_ch_mul << 16);
-
-                        /* Fused MUL+CVT: hardware combines BS MUL and OUT_CVT
-                         * into a single multiply-accumulate to avoid double
-                         * rounding.  Apply ALU (bias) first, then compute
-                         * the combined result in one 64-bit operation. */
-                        if (!(task->bs_cfg & 0x01) && !(task->bs_cfg & 0x10)) {
-                            /* Apply ALU (bias add) */
-                            if (!(task->bs_cfg & 0x02)) {
-                                uint32_t algo = (task->bs_cfg >> 16) & 0xf;
-                                switch (algo) {
-                                case 2: acc += bs_alu_op; break;
-                                default: break;
-                                }
-                            }
-                            /* Fused MUL × OUT_CVT in one step */
-                            unsigned mul_shift = (eff_bs_mul_cfg >> 8) & 0x3f;
-                            int64_t combined = (int64_t)acc * (int64_t)per_ch_mul
-                                             * (int64_t)out_cvt_scale;
-                            int64_t scaled = nvdla_shift_right_round64(
-                                combined, mul_shift + out_cvt_shift);
-                            if (scaled > 65535) scaled = 65535;
-                            if (scaled < -65536) scaled = -65536;
-                            acc = (int32_t)scaled + out_cvt_offset;
-                            if (acc < -128) acc = -128;
-                            if (acc > 127) acc = 127;
-                            bs_mul_fused = true;
-                        }
                     }
-                    if (!bs_mul_fused) {
-                        acc = apply_sdp_x_stage(acc, task->bs_cfg, bs_alu_op,
-                                                 eff_bs_mul_cfg,
-                                                 (int32_t)task->bs_relux_cmp);
-                    }
+                    acc = apply_sdp_x_stage(acc, task->bs_cfg, bs_alu_op,
+                                             eff_bs_mul_cfg,
+                                             (int32_t)task->bs_relux_cmp);
                 }
 
                 acc = apply_sdp_x_stage(acc, task->bn_cfg,
@@ -610,19 +586,13 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                     }
                 }
 
-                int32_t result;
-                if (bs_mul_fused) {
-                    /* Already computed in fused MUL+CVT path */
-                    result = acc;
-                } else {
-                    int64_t scaled = nvdla_shift_right_round64(
-                        (int64_t)acc * (int64_t)out_cvt_scale, out_cvt_shift);
-                    if (scaled > 65535) scaled = 65535;
-                    if (scaled < -65536) scaled = -65536;
-                    result = (int32_t)scaled + out_cvt_offset;
-                    if (result < -128) result = -128;
-                    if (result > 127) result = 127;
-                }
+                int64_t scaled = nvdla_shift_right_round64(
+                    (int64_t)acc * (int64_t)out_cvt_scale, out_cvt_shift);
+                if (scaled > 65535) scaled = 65535;
+                if (scaled < -65536) scaled = -65536;
+                int32_t result = (int32_t)scaled + out_cvt_offset;
+                if (result < -128) result = -128;
+                if (result > 127) result = 127;
 
                 uint32_t og = oc / NPU_FEATURE_ATOMIC_SIZE;
                 uint32_t oc_within = oc % NPU_FEATURE_ATOMIC_SIZE;
