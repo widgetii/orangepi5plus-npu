@@ -252,7 +252,11 @@ struct RockchipNPUState {
     AddressSpace *dma_as;
 };
 
-/* NPU tensor offset macros */
+/* NPU tensor offset macros.
+ * Input: x-major [group][x][y][c16] — matches CNA DMA read convention
+ *   and librocketnpu's rnpu_convert_input (loops x outer, y inner).
+ * Output: y-major [group][y][x][c16] — matches DPU DMA write convention
+ *   and librocketnpu's rnpu_convert_output: offset = (y * W + x) * 16. */
 static inline uint32_t npu_input_offset(uint32_t g, uint32_t x, uint32_t y,
                                          uint32_t w, uint32_t h)
 {
@@ -265,8 +269,8 @@ static inline uint32_t npu_output_offset(uint32_t g, uint32_t x, uint32_t y,
                                           uint32_t w, uint32_t h)
 {
     return g * w * h * NPU_FEATURE_ATOMIC_SIZE +
-           x * h * NPU_FEATURE_ATOMIC_SIZE +
-           y * NPU_FEATURE_ATOMIC_SIZE;
+           y * w * NPU_FEATURE_ATOMIC_SIZE +
+           x * NPU_FEATURE_ATOMIC_SIZE;
 }
 
 #endif /* HW_MISC_ROCKCHIP_NPU_H */

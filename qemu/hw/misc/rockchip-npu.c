@@ -331,8 +331,7 @@ static inline int32_t apply_sdp_x_stage(int32_t value, uint32_t cfg,
  * ====================================================================== */
 
 static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
-                                RocketConvTask *task,
-                                bool is_first_task)
+                                RocketConvTask *task)
 {
     uint32_t out_w = task->output_width;
     uint32_t out_h = task->output_height;
@@ -360,10 +359,9 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
     uint32_t in_line_bytes = task->input_line_stride
         ? task->input_line_stride * 4
         : in_h * NPU_FEATURE_ATOMIC_SIZE;
-    /* Input surface stride: always use W × line_bytes (= W × H × 16).
+    /* Input surface stride: W × line_bytes (x-major: column-major layout).
      * The register value encodes a hardware-internal DMA parameter that
-     * doesn't directly map to a byte stride. Using it as stride * 4
-     * produced wrong inter-surface offsets, causing MBv1 max_diff=230. */
+     * doesn't directly map to a byte stride. */
     uint32_t in_surf_bytes = in_w * in_line_bytes;
     uint32_t in_buf_size = (in_groups > 1)
         ? (in_groups - 1) * in_surf_bytes + (in_w - 1) * in_line_bytes
@@ -421,19 +419,10 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
         in_tile_footprint = in_buf_size;
     uint8_t *in_buf = g_malloc(in_buf_size);
     memset(in_buf, (uint8_t)(int8_t)task->pad_value, in_buf_size);
-    /* For tiled ops, src_addr includes input_offset = tile_y * in_line_bytes
-     * (y-major convention).  Convert to x-major: tile_y * 16.
-     * The first task in a job never has a tile offset (tile_y = 0), so skip
-     * the correction to avoid false positives from non-aligned IOVAs
-     * (fixes vendor kernel tiled conv — issue #20). */
-    uint32_t in_tile_y = 0;
-    if (!is_first_task && in_surf_bytes > 0) {
-        uint32_t src_within = task->src_addr % in_surf_bytes;
-        in_tile_y = (in_line_bytes > 0) ? src_within / in_line_bytes : 0;
-    }
-    uint32_t src_adj = task->src_addr - in_tile_y * in_line_bytes
-                     + in_tile_y * NPU_FEATURE_ATOMIC_SIZE;
-    npu_dma_read(s, src_adj, in_buf, in_tile_footprint);
+    /* Y-major DMA: src_addr already includes the correct y-major tile
+     * offset (tile_y * line_stride), so use it directly — no correction
+     * needed (fixes issue #23). */
+    npu_dma_read(s, task->src_addr, in_buf, in_tile_footprint);
 
     uint8_t *wt_buf = g_malloc0(wt_buf_size);
     int32_t *bias_buf = g_malloc0(bias_buf_size);
@@ -497,6 +486,7 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                             } else {
                                 uint32_t g = abs_ic / NPU_FEATURE_ATOMIC_SIZE;
                                 uint32_t c = abs_ic % NPU_FEATURE_ATOMIC_SIZE;
+                                /* x-major: col (ix) at line stride, row (iy) at 16 */
                                 uint32_t off = g * in_surf_bytes
                                              + ix * in_line_bytes
                                              + iy * NPU_FEATURE_ATOMIC_SIZE;
@@ -626,42 +616,23 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
         }
     }
 
-    /* Output DMA: write pixels into the activation BO at the positions
-     * where the next op's input read will find them.  The input read
-     * uses x-major: offset = g*surf + ix*line + iy*16.
-     *
-     * For tiled ops, dst_addr = tensor_base + tile_y * out_line (the tile
-     * offset uses the outer/x stride).  But in x-major the tile offset
-     * should be tile_y * 16 (inner/y stride).  We correct by computing
-     * tile_y and adjusting the base address. */
+    /* Output DMA: write pixels in y-major layout (row-major), matching
+     * the real hardware and librocketnpu's rnpu_convert_output.
+     * dst_addr already includes the correct y-major tile offset
+     * (tile_y * out_w * 16), so no tile correction is needed. */
     {
         uint32_t out_surf = task->output_surface_stride
             ? task->output_surface_stride
             : out_w * out_h * NPU_FEATURE_ATOMIC_SIZE;
-        uint32_t out_line = (out_w > 0) ? out_surf / out_w
-                                         : out_h * NPU_FEATURE_ATOMIC_SIZE;
-
-        /* Recover tile_y from the output offset baked into dst_addr.
-         * The first task in a job never has a tile offset (tile_y = 0),
-         * so skip the modular recovery to avoid false positives from
-         * non-aligned IOVAs (fixes vendor kernel tiled conv — issue #20).
-         * For subsequent chained tasks, use dst_addr % out_surf. */
-        uint32_t tile_y = 0;
-        if (!is_first_task) {
-            uint32_t dst_within = task->dst_addr % out_surf;
-            tile_y = (out_line > 0) ? dst_within / out_line : 0;
-        }
-        uint32_t dst_base = task->dst_addr - tile_y * out_line
-                          + tile_y * NPU_FEATURE_ATOMIC_SIZE;
 
         for (uint32_t g = 0; g < out_groups; g++) {
-            for (uint32_t x = 0; x < out_w; x++) {
-                uint32_t tile_off = g * out_w * out_h * NPU_FEATURE_ATOMIC_SIZE
-                                  + x * out_h * NPU_FEATURE_ATOMIC_SIZE;
-                uint32_t dma_addr = dst_base + g * out_surf + x * out_line;
+            for (uint32_t y = 0; y < out_h; y++) {
+                uint32_t tile_off = npu_output_offset(g, 0, y, out_w, out_h);
+                uint32_t dma_addr = task->dst_addr + g * out_surf
+                                  + y * out_w * NPU_FEATURE_ATOMIC_SIZE;
                 npu_dma_write(s, dma_addr,
                               out_buf + tile_off,
-                              out_h * NPU_FEATURE_ATOMIC_SIZE);
+                              out_w * NPU_FEATURE_ATOMIC_SIZE);
             }
         }
     }
@@ -706,7 +677,6 @@ static void execute_job(RockchipNPUState *s, RocketNPUCore *core,
 {
     uint32_t current_addr = base_addr;
     uint32_t current_count = (encoded_amounts + 1) * 2;
-    bool is_first_task = true;
 
     while (current_count > 0 && current_addr != 0) {
         if (current_count > NPU_MAX_REGCMD_ENTRIES) {
@@ -750,8 +720,7 @@ static void execute_job(RockchipNPUState *s, RocketNPUCore *core,
                       task.output_channels,
                       task.src_addr, task.dst_addr,
                       task.weight_addr, task.bias_addr);
-        execute_convolution(s, core, &task, is_first_task);
-        is_first_task = false;
+        execute_convolution(s, core, &task);
 
         uint32_t next_addr = task.next_base_addr;
         uint32_t next_encoded = task.next_reg_amounts;

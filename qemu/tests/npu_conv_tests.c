@@ -503,7 +503,8 @@ static uint32_t packed_weight_size(uint32_t out_c, uint32_t in_c,
  * Input/output layout conversion
  * ====================================================================== */
 
-/* NHWC → NPU x-major interleaved: [group][x][y][c16] */
+/* NHWC → NPU x-major interleaved: [group][x][y][c16]
+ * Matches the CNA DMA read convention and librocketnpu's rnpu_convert_input. */
 static void nhwc_to_npu_input(const int8_t *nhwc, uint8_t *npu,
                                uint32_t w, uint32_t h, uint32_t c)
 {
@@ -537,10 +538,10 @@ static void npu_output_to_nhwc(const uint8_t *npu, int8_t *nhwc,
             for (uint32_t ch = 0; ch < c; ch++) {
                 uint32_t g = ch / NPU_FEATURE_ATOMIC_SIZE;
                 uint32_t c_within = ch % NPU_FEATURE_ATOMIC_SIZE;
-                /* x-major: matching NPU_OFFSET in librocketnpu */
+                /* y-major: matching librocketnpu's rnpu_convert_output */
                 uint32_t off = g * w * h * NPU_FEATURE_ATOMIC_SIZE
-                             + x * h * NPU_FEATURE_ATOMIC_SIZE
-                             + y * NPU_FEATURE_ATOMIC_SIZE
+                             + y * w * NPU_FEATURE_ATOMIC_SIZE
+                             + x * NPU_FEATURE_ATOMIC_SIZE
                              + c_within;
                 nhwc[y * w * c + x * c + ch] = (int8_t)npu[off];
             }
@@ -677,7 +678,7 @@ static unsigned build_conv_regcmd(uint64_t *buf, const struct conv_config *cfg,
     *p++ = emit(TARGET_CNA, 0x1070, in_addr);
     *p++ = emit(TARGET_CNA, 0x1074, 0);
     *p++ = emit(TARGET_CNA, 0x1078, 0x0f0f0000);
-    /* Line/surface stride in register units (bytes / 4), matching librocketnpu */
+    /* Line/surface stride in register units (bytes / 4), x-major (column stride) */
     uint32_t line_stride = cfg->in_h * NPU_FEATURE_ATOMIC_SIZE / 4;
     uint32_t surf_stride = cfg->in_w * cfg->in_h * NPU_FEATURE_ATOMIC_SIZE / 4;
     *p++ = emit(TARGET_CNA, 0x107c, line_stride);
