@@ -62,6 +62,7 @@ typedef struct RkIOMMUInstance {
 } RkIOMMUInstance;
 
 #define RK_IOMMU_MAILBOX_MAX 8192
+#define RK_IOMMU_TLB_SIZE    8192  /* must be power of 2 */
 
 struct RockchipIOMMUState {
     SysBusDevice parent_obj;
@@ -74,6 +75,10 @@ struct RockchipIOMMUState {
 
     /* Guest physical address space for page table reads */
     AddressSpace *dma_as;
+
+    /* IOMMU TLB: direct-mapped cache of page translations.
+     * Flushed on ZAP_CACHE command, matching real hardware behavior. */
+    struct { uint32_t iova, gpa; bool valid; } tlb[RK_IOMMU_TLB_SIZE];
 
     /* Mailbox MMIO region for qemu_iommu.ko IOVA→GPA forwarding */
     MemoryRegion mailbox_iomem;
