@@ -162,13 +162,20 @@ hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova)
         return (hwaddr)iova;
     }
 
+    /* TLB lookup */
+    uint32_t page = iova & 0xFFFFF000U;
+    uint32_t offset = iova & 0xFFF;
+    uint32_t tlb_idx = (page >> 12) & (RK_IOMMU_TLB_SIZE - 1);
+    if (s->tlb[tlb_idx].valid && s->tlb[tlb_idx].iova == page) {
+        return (hwaddr)s->tlb[tlb_idx].gpa + offset;
+    }
+
     /* Strip valid/present bit from DTE_ADDR register value.
      * DTE_ADDR is page-aligned with bit 0 = valid flag. */
     hwaddr dt_base = (hwaddr)(dte_addr & ~1U);
 
     /* DTE index from IOVA[31:22] */
     uint32_t dte_idx = (iova >> 22) & 0x3FF;
-    uint32_t offset = iova & 0xFFF;
 
     /* Read DTE */
     uint32_t dte;
@@ -205,6 +212,12 @@ hwaddr rk_iommu_translate(RockchipIOMMUState *s, uint32_t iova)
 
     /* Decode page physical address from PTE (4KB page) */
     hwaddr page_phys = rk_iommu_decode_pte(pte);
+
+    /* Cache in TLB */
+    s->tlb[tlb_idx].iova = page;
+    s->tlb[tlb_idx].gpa = (uint32_t)page_phys;
+    s->tlb[tlb_idx].valid = true;
+
     hwaddr result = page_phys + offset;
     static int xlate_count = 0;
     if (xlate_count < 20) {
@@ -288,7 +301,9 @@ void rk_iommu_instance_write(RkIOMMUInstance *inst, hwaddr addr,
             inst->status &= ~RK_IOMMU_STATUS_STALL_ACTIVE;
             break;
         case RK_IOMMU_CMD_ZAP_CACHE:
-            /* No cache to zap */
+            if (inst->parent) {
+                memset(inst->parent->tlb, 0, sizeof(inst->parent->tlb));
+            }
             break;
         case RK_IOMMU_CMD_FORCE_RESET:
             inst->dte_addr = 0;
