@@ -503,9 +503,13 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                                                     kx, ky, filt_w, filt_h,
                                                     in_c_real, 1, true);
                             } else {
-                                w_val = read_weight(wt_buf, oc, abs_ic,
-                                                    kx, ky, filt_w, filt_h,
-                                                    in_c_real, out_c, false);
+                                /* Padded channels beyond wt_oc have zero weight */
+                                if (oc >= wt_oc)
+                                    w_val = 0;
+                                else
+                                    w_val = read_weight(wt_buf, oc, abs_ic,
+                                                        kx, ky, filt_w, filt_h,
+                                                        in_c_real, wt_oc, false);
                             }
 
                             acc += (int32_t)in_val * (int32_t)w_val;
