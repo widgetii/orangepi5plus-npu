@@ -369,7 +369,19 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
           + in_h * NPU_FEATURE_ATOMIC_SIZE
         : (in_w - 1) * in_line_bytes + in_h * NPU_FEATURE_ATOMIC_SIZE;
 
-    uint32_t wt_oc = depthwise ? 1 : ALIGN_UP(MAX2(out_c, 2), 2);
+    /* Weight kernel count: normally the padded output channel count.
+     * But when output_channels_real < output_channels and > 2, the
+     * weight packing skips channels beyond output_channels_real
+     * (matching librocketnpu's fill_weights loop). */
+    uint32_t wt_oc;
+    if (depthwise) {
+        wt_oc = 1;
+    } else if (task->output_channels_real > 2 &&
+               task->output_channels_real < out_c) {
+        wt_oc = ALIGN_UP(task->output_channels_real, 2);
+    } else {
+        wt_oc = ALIGN_UP(MAX2(out_c, 2), 2);
+    }
     uint32_t wt_ic = MAX2(in_c_real, NPU_FEATURE_ATOMIC_SIZE);
     uint32_t wt_ic_group = depthwise ? NPU_WEIGHT_ATOMIC_SIZE * 2
                                       : NPU_WEIGHT_ATOMIC_SIZE;
