@@ -856,12 +856,9 @@ static void compile_regcmds(struct rnpu_model *m)
          rc_offset += ALIGN_UP(size_bytes, 64);
       }
 
-      /* Patch chain pointers between tasks within this op.
-       * BRDMA ops: skip chaining — each task submitted as separate job. */
-      if (!op->use_brdma_per_channel) {
-         for (unsigned t = 0; t < op->task_count - 1; t++)
-            patch_chain(m, op, t, op, t + 1);
-      }
+      /* Patch chain pointers between tasks within this op. */
+      for (unsigned t = 0; t < op->task_count - 1; t++)
+         patch_chain(m, op, t, op, t + 1);
    }
 
    /* Third pass: patch cross-operation chain pointers for RKNPU batching.
@@ -899,6 +896,8 @@ static bool can_merge_rknpu(struct rnpu_model *m, unsigned i)
       return false;
    if (a->output_tensor_channels == 0 || b->output_tensor_channels == 0)
       return false;
+   if (a->use_brdma_per_channel || b->use_brdma_per_channel)
+      return false;
    return a->output_tensor == b->output_tensor;
 }
 
@@ -917,19 +916,14 @@ static void build_execution_plan(struct rnpu_model *m)
    m->segment_count = ns;
 
    /* Count HW resources.
-    * BRDMA ops: 1 job per task (can't chain BRDMA tasks on RKNPU).
-    * Standard ops: merge per-channel groups into one job. */
+    * Standard + BRDMA ops: 1 multi-task job per op, merge per-channel groups. */
    unsigned total_jobs = 0, total_tasks = 0;
    for (unsigned i = 0; i < m->op_count; i++) {
       if (m->ops[i].type == RNPU_OP_CONV) {
          total_tasks += m->ops[i].task_count;
-         if (m->ops[i].use_brdma_per_channel) {
-            total_jobs += m->ops[i].task_count;
-         } else {
-            total_jobs++;
-            while (can_merge_rknpu(m, i))
-               { total_tasks += m->ops[i + 1].task_count; i++; }
-         }
+         total_jobs++;
+         while (can_merge_rknpu(m, i))
+            { total_tasks += m->ops[i + 1].task_count; i++; }
       }
    }
 
@@ -946,33 +940,8 @@ static void build_execution_plan(struct rnpu_model *m)
       if (m->ops[i].type != RNPU_OP_CONV) continue;
       struct rnpu_operation *cur = &m->ops[i];
 
-      if (cur->use_brdma_per_channel) {
-         /* BRDMA: each task is a separate 1-task job */
-         for (unsigned t = 0; t < cur->task_count; t++) {
-            m->hw_tasks[ti].regcmd = cur->tasks[t].regcfg_addr;
-            m->hw_tasks[ti].regcmd_count = cur->tasks[t].regcfg_amount;
-
-            unsigned hi = ji * handles_per_job;
-            m->in_handles[hi] = m->weight_bo.handle;
-            m->in_handles[hi + 1] = m->regcmd_bo.handle;
-            m->in_handles[hi + 2] = m->bias_bo.handle ? m->bias_bo.handle : m->weight_bo.handle;
-            if (handles_per_job > 3)
-               m->in_handles[hi + 3] = m->brdma_bo.handle;
-            m->out_handles[ji] = m->activation_bo.handle;
-
-            struct drm_rocket_job *job = &m->jobs[ji];
-            job->task_struct_size = sizeof(struct drm_rocket_task);
-            job->tasks = (uint64_t)(uintptr_t)&m->hw_tasks[ti];
-            job->task_count = 1;
-            job->in_bo_handles = (uint64_t)(uintptr_t)&m->in_handles[hi];
-            job->in_bo_handle_count = handles_per_job;
-            job->out_bo_handles = (uint64_t)(uintptr_t)&m->out_handles[ji];
-            job->out_bo_handle_count = 1;
-            ji++;
-            ti++;
-         }
-      } else {
-         /* Standard: multi-task job with chain pointers */
+      {
+         /* Multi-task job with chain pointers (standard + BRDMA) */
          unsigned first_task = ti;
          unsigned merged_task_count = 0;
          unsigned j = i;
@@ -1020,11 +989,8 @@ static void build_execution_plan(struct rnpu_model *m)
          seg->op_count = 0;
          unsigned seg_jobs = 0;
          while (i < m->op_count && m->ops[i].type == RNPU_OP_CONV) {
-            if (m->ops[i].use_brdma_per_channel) {
-               seg_jobs += m->ops[i].task_count;
-            } else if (seg->op_count == 0 || !can_merge_rknpu(m, i - 1)) {
+            if (seg->op_count == 0 || !can_merge_rknpu(m, i - 1))
                seg_jobs++;
-            }
             seg->op_count++;
             i++;
          }
