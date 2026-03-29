@@ -332,7 +332,7 @@ static inline int32_t apply_sdp_x_stage(int32_t value, uint32_t cfg,
 
 static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
                                 RocketConvTask *task,
-                                uint32_t first_src_addr,
+                                bool is_first_task,
                                 uint32_t first_dst_addr)
 {
     uint32_t out_w = task->output_width;
@@ -422,12 +422,15 @@ static void execute_convolution(RockchipNPUState *s, RocketNPUCore *core,
         in_tile_footprint = in_buf_size;
     uint8_t *in_buf = g_malloc(in_buf_size);
     memset(in_buf, (uint8_t)(int8_t)task->pad_value, in_buf_size);
-    /* For tiled ops, src_addr = first_task_src + tile_y * in_line_bytes.
+    /* For tiled ops, src_addr includes input_offset = tile_y * in_line_bytes.
      * Convert to x-major offset: tile_y * 16.
-     * Use relative offset from first task to avoid dependence on absolute
-     * IOVA alignment (fixes vendor kernel — issues #20, #24). */
-    uint32_t in_rel_offset = task->src_addr - first_src_addr;
-    uint32_t in_tile_y = (in_line_bytes > 0) ? in_rel_offset / in_line_bytes : 0;
+     * First task in a job has tile_y = 0, skip to avoid false positives
+     * from non-aligned IOVAs (issue #20). */
+    uint32_t in_tile_y = 0;
+    if (!is_first_task && in_surf_bytes > 0) {
+        uint32_t src_within = task->src_addr % in_surf_bytes;
+        in_tile_y = (in_line_bytes > 0) ? src_within / in_line_bytes : 0;
+    }
     uint32_t src_adj = task->src_addr - in_tile_y * in_line_bytes
                      + in_tile_y * NPU_FEATURE_ATOMIC_SIZE;
     npu_dma_read(s, src_adj, in_buf, in_tile_footprint);
@@ -700,8 +703,8 @@ static void execute_job(RockchipNPUState *s, RocketNPUCore *core,
 {
     uint32_t current_addr = base_addr;
     uint32_t current_count = (encoded_amounts + 1) * 2;
-    uint32_t first_src = 0, first_dst = 0, first_wt = 0;
-    bool have_first = false;
+    uint32_t first_dst = 0, first_wt = 0;
+    bool is_first_task = true;
 
     while (current_count > 0 && current_addr != 0) {
         if (current_count > NPU_MAX_REGCMD_ENTRIES) {
@@ -745,16 +748,15 @@ static void execute_job(RockchipNPUState *s, RocketNPUCore *core,
                       task.output_channels,
                       task.src_addr, task.dst_addr,
                       task.weight_addr, task.bias_addr);
-        /* Track first task's addresses per operation (for relative tile
+        /* Track first task's dst_addr per operation (for relative tile
          * offsets).  Reset when weight_addr changes — different weights
          * means a different operation in a multi-op chain. */
-        if (!have_first || task.weight_addr != first_wt) {
-            first_src = task.src_addr;
+        if (is_first_task || task.weight_addr != first_wt) {
             first_dst = task.dst_addr;
             first_wt = task.weight_addr;
-            have_first = true;
         }
-        execute_convolution(s, core, &task, first_src, first_dst);
+        execute_convolution(s, core, &task, is_first_task, first_dst);
+        is_first_task = false;
 
         uint32_t next_addr = task.next_base_addr;
         uint32_t next_encoded = task.next_reg_amounts;
