@@ -700,7 +700,7 @@ static void execute_job(RockchipNPUState *s, RocketNPUCore *core,
 {
     uint32_t current_addr = base_addr;
     uint32_t current_count = (encoded_amounts + 1) * 2;
-    uint32_t first_src = 0, first_dst = 0;
+    uint32_t first_src = 0, first_dst = 0, first_wt = 0;
     bool have_first = false;
 
     while (current_count > 0 && current_addr != 0) {
@@ -745,9 +745,13 @@ static void execute_job(RockchipNPUState *s, RocketNPUCore *core,
                       task.output_channels,
                       task.src_addr, task.dst_addr,
                       task.weight_addr, task.bias_addr);
-        if (!have_first) {
+        /* Track first task's addresses per operation (for relative tile
+         * offsets).  Reset when weight_addr changes — different weights
+         * means a different operation in a multi-op chain. */
+        if (!have_first || task.weight_addr != first_wt) {
             first_src = task.src_addr;
             first_dst = task.dst_addr;
+            first_wt = task.weight_addr;
             have_first = true;
         }
         execute_convolution(s, core, &task, first_src, first_dst);
