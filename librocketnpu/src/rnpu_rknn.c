@@ -32,7 +32,7 @@ static int is_brdma_chunk(const uint8_t *chunk)
       if (mul[k] < 0 || mul[k] > 16384) return 0;
       if (mul[k] > 0) non_zero++;
    }
-   return non_zero >= 4; /* need strong MUL signal, not just padding */
+   return non_zero >= 6; /* need strong MUL signal, not just padding */
 }
 
 int rnpu_rknn_parse(const char *rknn_path, struct rnpu_rknn_model *out)
@@ -114,13 +114,13 @@ int rnpu_rknn_parse(const char *rknn_path, struct rnpu_rknn_model *out)
    out->ops = calloc(group_count, sizeof(struct rnpu_rknn_op));
    out->op_count = group_count;
 
-   /* Filter: only keep groups with oc_pad >= 32 (real BRDMA ops).
+   /* Filter: only keep groups with oc_pad >= 16 (real BRDMA ops).
     * Smaller groups are likely false positives from weight data. */
    unsigned valid_count = 0;
    for (unsigned i = 0; i < group_count; i++) {
       unsigned nchunks = groups[i].size / 64;
       unsigned oc_pad = nchunks * 8;
-      if (oc_pad < 32) continue;
+      if (oc_pad < 16) continue;
 
       out->ops[valid_count].brdma_data = malloc(groups[i].size);
       memcpy(out->ops[valid_count].brdma_data, data + groups[i].file_offset, groups[i].size);
@@ -173,14 +173,14 @@ int rnpu_rknn_match_op(const struct rnpu_rknn_model *m,
       if (m->ops[i].matched) continue;
       if (!m->ops[i].brdma_data) continue;
 
-      /* RKNN pads OC to multiples of 8. Our oc should be <= rknn's oc. */
+      /* RKNN pads OC to multiples of 8. Match with both our padded oc
+       * and raw ALIGN_UP(oc, 8) since RKNN may use smaller padding. */
       unsigned rknn_oc = m->ops[i].output_channels;
-      /* rknn_oc is oc_pad (padded to 8), our oc is real OC.
-       * Compute our expected oc_pad and compare. */
       unsigned our_oc_pad = oc;
       if (our_oc_pad < 32) our_oc_pad = 32;
       our_oc_pad = ((our_oc_pad + 15) / 16) * 16;
-      if (rknn_oc != our_oc_pad) continue;
+      unsigned raw_oc_pad = ((oc + 7) / 8) * 8;
+      if (rknn_oc != our_oc_pad && rknn_oc != raw_oc_pad) continue;
 
       /* Compare bias signs as a fingerprint */
       const int32_t *rknn_biases = m->ops[i].biases;
@@ -209,14 +209,18 @@ int rnpu_rknn_match_op(const struct rnpu_rknn_model *m,
    if (best >= 0 && best_score >= 4)
       return best;
 
-   /* Fallback: first unmatched with matching oc_pad */
+   /* Fallback: first unmatched with matching oc_pad.
+    * Try both our padded oc and raw ALIGN_UP(oc, 8) since RKNN
+    * stores oc_pad = nchunks * 8 which may be smaller than our padding. */
    unsigned our_oc_pad = oc;
    if (our_oc_pad < 32) our_oc_pad = 32;
    our_oc_pad = ((our_oc_pad + 15) / 16) * 16;
+   unsigned raw_oc_pad = ((oc + 7) / 8) * 8;
    for (unsigned i = 0; i < m->op_count; i++) {
       if (m->ops[i].matched) continue;
       if (!m->ops[i].brdma_data) continue;
-      if (m->ops[i].output_channels == our_oc_pad)
+      if (m->ops[i].output_channels == our_oc_pad ||
+          m->ops[i].output_channels == raw_oc_pad)
          return (int)i;
    }
 
