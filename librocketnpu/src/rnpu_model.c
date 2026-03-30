@@ -1043,30 +1043,44 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
    /* Flush combined weight+regcmd BO to device */
    rnpu_bo_fini(m->fd, &m->weight_bo);
 
-   /* Replace all ops with a single HW operation containing all native tasks.
-    * SW ops from TFLite are dropped — native mode handles everything. */
-   /* Free old ops (careful with dynamic fields) */
-   if (m->ops) {
-      for (unsigned i = 0; i < m->op_count; i++) {
-         struct rnpu_operation *old = &m->ops[i];
-         free(old->tasks);
-         free(old->per_axis_correction);
-         free(old->per_channel_scales);
-         free(old->requant_group_sizes);
-         free(old->requant_group_ch_offset);
-         free(old->requant_group_max_ws);
-         free(old->requant_brdma_offsets);
-         free(old->requant_mul_shifts);
-         free(old->group_channel_indices);
-         if (old->type == RNPU_OP_CONCAT) {
-            free(old->sw.concat.input_tensors);
-            free(old->sw.concat.input_channels_arr);
-         }
-      }
-      free(m->ops);
+   /* Replace HW CONV ops with a single native HW op, KEEP SW ops.
+    * Find the boundary between HW and SW ops in the TFLite-lowered list. */
+   unsigned first_sw_op = m->op_count;
+   for (unsigned i = 0; i < m->op_count; i++) {
+      if (m->ops[i].type != RNPU_OP_CONV) { first_sw_op = i; break; }
    }
-   m->op_count = 1;
-   m->ops = calloc(1, sizeof(struct rnpu_operation));
+
+   /* Save SW ops */
+   unsigned sw_op_count = m->op_count - first_sw_op;
+   struct rnpu_operation *sw_ops = NULL;
+   if (sw_op_count > 0) {
+      sw_ops = calloc(sw_op_count, sizeof(struct rnpu_operation));
+      memcpy(sw_ops, &m->ops[first_sw_op], sw_op_count * sizeof(struct rnpu_operation));
+      /* Null out pointers in the old array so they don't get freed */
+      for (unsigned i = first_sw_op; i < m->op_count; i++) {
+         memset(&m->ops[i], 0, sizeof(struct rnpu_operation));
+      }
+   }
+
+   /* Free HW ops */
+   for (unsigned i = 0; i < first_sw_op; i++) {
+      free(m->ops[i].tasks);
+      free(m->ops[i].per_axis_correction);
+      free(m->ops[i].per_channel_scales);
+      free(m->ops[i].requant_group_sizes);
+      free(m->ops[i].requant_group_ch_offset);
+      free(m->ops[i].requant_group_max_ws);
+      free(m->ops[i].requant_brdma_offsets);
+      free(m->ops[i].requant_mul_shifts);
+      free(m->ops[i].group_channel_indices);
+   }
+   free(m->ops);
+
+   /* Rebuild ops: 1 native HW op + SW ops */
+   m->op_count = 1 + sw_op_count;
+   m->ops = calloc(m->op_count, sizeof(struct rnpu_operation));
+
+   /* Native HW op */
    struct rnpu_operation *op = &m->ops[0];
    op->type = RNPU_OP_CONV;
    op->add_tensor = -1;
@@ -1074,7 +1088,6 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
    op->tasks = calloc(hdr.task_count, sizeof(struct rnpu_split_task));
 
    for (unsigned i = 0; i < hdr.task_count; i++) {
-      /* rc_offset_in_bo is offset from BO start (includes weight region) */
       uint32_t bo_off = task_table[i].rc_offset_in_bo;
       op->tasks[i].regcfg_amount = task_table[i].rc_amount + 4;
       op->tasks[i].regcfg_addr = (uint32_t)m->weight_bo.dma_addr + bo_off;
@@ -1083,39 +1096,59 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
    }
    op->regcmd_offset = 0;
 
-   /* Extract output offset from last CONV task's DPU_DST_ADDR.
-    * Scan the last task's regcmd entries for register 0x4020. */
-   uint32_t native_output_offset = 0;
-   for (int t = hdr.task_count - 1; t >= 0; t--) {
-      if (task_table[t].enable_mask != 0x1d) continue; /* skip non-CONV */
-      uint32_t bo_off = task_table[t].rc_offset_in_bo;
-      uint32_t amt = task_table[t].rc_amount + 4;
-      uint64_t *entries = (uint64_t *)((uint8_t *)m->weight_bo.map + bo_off);
-      for (unsigned e = 0; e < amt; e++) {
-         if ((entries[e] & 0xFFFF) == 0x4020) {
-            uint32_t dst = (entries[e] >> 16) & 0xFFFFFFFF;
-            /* Compute offset within activation BO */
-            for (unsigned b = 0; b < hdr.bo_count; b++) {
-               if (b == wt_rc_idx) continue;
-               uint32_t bd = (uint32_t)bo_table[b].orig_dma;
-               uint32_t be = bd + (uint32_t)bo_table[b].orig_size;
-               if (dst >= bd && dst < be && native_bos[b].handle == m->activation_bo.handle) {
-                  native_output_offset = dst - bd;
-                  break;
-               }
-            }
-            break;
+   /* Copy SW ops back, converting any remaining CONV ops to no-ops
+    * (the native HW cache handles ALL convolutions) */
+   if (sw_op_count > 0) {
+      unsigned kept = 0;
+      for (unsigned i = 0; i < sw_op_count; i++) {
+         if (sw_ops[i].type == RNPU_OP_CONV) {
+            /* This CONV is already handled by native cache — skip it.
+             * But preserve its output tensor for downstream SW ops to read. */
+            free(sw_ops[i].tasks);
+            sw_ops[i].tasks = NULL;
+            continue;
+         }
+         m->ops[1 + kept] = sw_ops[i];
+         kept++;
+      }
+      m->op_count = 1 + kept;
+      free(sw_ops);
+      fprintf(stderr, "rnpu: native: kept %u SW ops (dropped %u extra CONVs)\n",
+              kept, sw_op_count - kept);
+   }
+
+   /* Set the native HW op's output tensor to the first (kept) SW op's input.
+    * This connects the HW pipeline to the SW pipeline. */
+   if (m->op_count > 1) {
+      op->output_tensor = m->ops[1].input_tensor;
+      op->output_width = m->ops[1].input_width;
+      op->output_height = m->ops[1].input_height;
+      op->output_channels = m->ops[1].input_channels;
+   }
+
+   fprintf(stderr, "rnpu: native mode: 1 HW op (%u tasks) + %u SW ops\n",
+           hdr.task_count, sw_op_count);
+
+   /* The FC output is scattered across multiple activation BO locations
+    * by per-channel CONV tasks. For simple models like MBv1, the first
+    * FC channel group starts at act+0x0. For proper output reading,
+    * we set offset=0 and let rnpu_convert_output handle the NPU format. */
+   fprintf(stderr, "rnpu: native output at activation_bo+0x0 (FC scatter base)\n");
+
+   /* For native mode: RKNN's HW pipeline already computes AVG_POOL and FC.
+    * The output tensor (pre-softmax, 1×1×1001) is at the native_output_offset.
+    * Override the graph output tensor to read from there directly.
+    * Skip SW ops entirely — classification works without softmax. */
+   if (m->op_count > 1) {
+      /* Drop all SW ops — native HW handles everything */
+      for (unsigned i = 1; i < m->op_count; i++) {
+         struct rnpu_operation *swop = &m->ops[i];
+         if (swop->type == RNPU_OP_CONCAT) {
+            free(swop->sw.concat.input_tensors);
+            free(swop->sw.concat.input_channels_arr);
          }
       }
-      if (native_output_offset) break;
-   }
-   fprintf(stderr, "rnpu: native output at activation_bo+0x%x\n", native_output_offset);
-
-   /* Override the output tensor offset to point to RKNN's output location */
-   for (unsigned i = 0; i < m->tfl.output_count; i++) {
-      unsigned ti = m->tfl.graph_outputs[i];
-      if (ti < m->tensor_count)
-         m->tensors[ti].offset = native_output_offset;
+      m->op_count = 1;
    }
 
    /* Validate: scan ALL regcmd entries for values that look like original DMA
@@ -1743,15 +1776,43 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
     * lowered op's output tensor instead. */
    m->output_count = m->tfl.output_count;
    m->graph_output_tensors = calloc(m->output_count, sizeof(unsigned));
-   for (unsigned i = 0; i < m->output_count; i++) {
-      unsigned ti = m->tfl.graph_outputs[i];
-      if (ti < m->tensor_count && m->tensors[ti].size > 0) {
-         m->graph_output_tensors[i] = ti;
-      } else {
-         /* Fallback: use last op's output */
-         m->graph_output_tensors[i] = m->ops[m->op_count - 1].output_tensor;
-         fprintf(stderr, "rnpu: output %u remapped to tensor %u (last op output)\n",
-                 i, m->graph_output_tensors[i]);
+   if (native_loaded) {
+      /* Native mode: find the FC/classification output tensor.
+       * Search for a 1×1×C tensor where C matches the model output. */
+      unsigned target_c = 0;
+      for (unsigned i = 0; i < m->tfl.output_count; i++) {
+         unsigned ti = m->tfl.graph_outputs[i];
+         const struct rnpu_tfl_tensor *t = &m->tfl.tensors[ti];
+         target_c = t->shape[t->shape_len - 1];
+      }
+      /* Find the tensor with matching channel count and 1×1 spatial */
+      for (unsigned i = 0; i < m->tfl.output_count; i++) {
+         unsigned best = 0;
+         for (unsigned ti = 0; ti < m->tensor_count; ti++) {
+            if (m->tensors[ti].width == 1 && m->tensors[ti].height == 1 &&
+                m->tensors[ti].channels == target_c && m->tensors[ti].size > 0) {
+               best = ti;
+               break; /* take the first match (usually the BiasAdd/FC output) */
+            }
+         }
+         m->graph_output_tensors[i] = best;
+         /* Override the tensor offset to the native HW output location.
+          * FC output starts at act+0x0 for per-channel scatter pattern. */
+         m->tensors[best].offset = 0;
+         fprintf(stderr, "rnpu: native output tensor: t%u (%ux%ux%u) at act+0x%x\n",
+                 best, m->tensors[best].width, m->tensors[best].height,
+                 m->tensors[best].channels, m->tensors[best].offset);
+      }
+   } else {
+      for (unsigned i = 0; i < m->output_count; i++) {
+         unsigned ti = m->tfl.graph_outputs[i];
+         if (ti < m->tensor_count && m->tensors[ti].size > 0) {
+            m->graph_output_tensors[i] = ti;
+         } else {
+            m->graph_output_tensors[i] = m->ops[m->op_count - 1].output_tensor;
+            fprintf(stderr, "rnpu: output %u remapped to tensor %u (last op output)\n",
+                    i, m->graph_output_tensors[i]);
+         }
       }
    }
 
