@@ -1052,6 +1052,7 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
    EMIT(REG_CNA_DCOMP_AMOUNT14, 0); EMIT(REG_CNA_DCOMP_AMOUNT15, 0);
 
    EMIT(REG_CNA_CVT_CON5, task->input_channels_real == 1 ? 65535 : 0);
+   /* REG_1180: RKNN sets 0xfff but causes timeout — investigate separately */
 
    EMIT(REG_CNA_PAD_CON1, (int32_t)task->input_zero_point - 0x80);
 
@@ -1104,7 +1105,8 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
                                DPU_BS_OW_CFG_SIZE_E_1(1) |
                                DPU_BS_OW_CFG_SIZE_E_0(1));
    }
-   /* RKNN uses OW_OP=0 for FC (int8 weights, no zero-point correction) */
+   /* OW_OP: weight zero-point correction. RKNN uses 0 for BRDMA ops
+    * but our BRDMA path still needs it for correct output. */
    EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(
       op->fc_1x1 ? 0 : task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_0, DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
