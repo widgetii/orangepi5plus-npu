@@ -925,21 +925,20 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
    }
    fclose(f);
 
-   /* Create a single BO for the combined weight+regcmd data.
-    * Use weight_bo for weight region, regcmd_bo for regcmd region.
-    * But since they're in the same DMA BO in RKNN, we use weight_bo
-    * for everything and point regcmd into it. */
+   /* CRITICAL: RKNN uses the wt+rc BO as a single contiguous region.
+    * The regcmd area is reused as scratch/activation during REFORMAT tasks.
+    * We MUST keep it as ONE BO to preserve the memory layout. */
    uint32_t weight_size = hdr.rc_start_offset;
-   uint32_t regcmd_size = hdr.wt_rc_size - hdr.rc_start_offset;
 
-   /* Create weight BO (holds all weight data) */
-   rnpu_bo_create(m->fd, weight_size, &m->weight_bo);
-   memcpy(m->weight_bo.map, wt_rc_data, weight_size);
-   rnpu_bo_fini(m->fd, &m->weight_bo);
+   /* Create single combined BO for weight+regcmd */
+   rnpu_bo_create(m->fd, hdr.wt_rc_size, &m->weight_bo);
+   memcpy(m->weight_bo.map, wt_rc_data, hdr.wt_rc_size);
 
-   /* Create regcmd BO (holds all regcmd data) */
-   rnpu_bo_create(m->fd, regcmd_size, &m->regcmd_bo);
-   memcpy(m->regcmd_bo.map, wt_rc_data + hdr.rc_start_offset, regcmd_size);
+   /* Point regcmd_bo to the regcmd region within weight_bo (shared DMA space) */
+   m->regcmd_bo.handle = m->weight_bo.handle;
+   m->regcmd_bo.dma_addr = m->weight_bo.dma_addr + hdr.rc_start_offset;
+   m->regcmd_bo.map = (uint8_t *)m->weight_bo.map + hdr.rc_start_offset;
+   m->regcmd_bo.size = hdr.wt_rc_size - hdr.rc_start_offset;
 
    /* Patch DMA addresses in regcmd region */
    uint64_t orig_wt_dma = hdr.wt_rc_dma;
@@ -979,9 +978,9 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
    unsigned patched = 0;
 
    for (unsigned t = 0; t < hdr.task_count; t++) {
-      uint32_t rc_off = task_table[t].rc_offset_in_bo - hdr.rc_start_offset;
+      uint32_t rc_off = task_table[t].rc_offset_in_bo;
       uint32_t rc_amt = task_table[t].rc_amount + 4;
-      uint64_t *entries = (uint64_t *)((uint8_t *)m->regcmd_bo.map + rc_off);
+      uint64_t *entries = (uint64_t *)((uint8_t *)m->weight_bo.map + rc_off);
 
       for (unsigned e = 0; e < rc_amt; e++) {
          uint16_t reg = entries[e] & 0xFFFF;
@@ -997,11 +996,8 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
 
             uint32_t off = val - bd;
             if (b == (unsigned)hdr.wt_rc_bo_idx) {
-               /* Weight region or regcmd region */
-               if (off < weight_size)
-                  new_val = (uint32_t)m->weight_bo.dma_addr + off;
-               else
-                  new_val = (uint32_t)m->regcmd_bo.dma_addr + (off - hdr.rc_start_offset);
+               /* Combined wt+rc BO — single contiguous mapping */
+               new_val = (uint32_t)m->weight_bo.dma_addr + off;
             } else if (native_bos[b].handle) {
                new_val = (uint32_t)native_bos[b].dma_addr + off;
             }
@@ -1017,7 +1013,9 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
       }
    }
 
-   rnpu_bo_fini(m->fd, &m->regcmd_bo);
+   /* Flush combined BO (weight_bo contains both weights and regcmds).
+    * Don't flush regcmd_bo separately — it shares the same DMA handle. */
+   /* weight_bo already flushed above — no need to flush again */
 
    /* Replace all ops with a single HW operation containing all native tasks.
     * SW ops from TFLite are dropped — native mode handles everything. */
@@ -1050,19 +1048,18 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
    op->tasks = calloc(hdr.task_count, sizeof(struct rnpu_split_task));
 
    for (unsigned i = 0; i < hdr.task_count; i++) {
-      uint32_t rc_off = task_table[i].rc_offset_in_bo - hdr.rc_start_offset;
-      /* Cache stores RKNN's regcfg_amount (already minus EXTRA_AMOUNT=4).
-       * Our submit path subtracts EXTRA_AMOUNT again, so add it back here. */
+      /* rc_offset_in_bo is offset from BO start (includes weight region) */
+      uint32_t bo_off = task_table[i].rc_offset_in_bo;
       op->tasks[i].regcfg_amount = task_table[i].rc_amount + 4;
-      op->tasks[i].regcfg_addr = (uint32_t)m->regcmd_bo.dma_addr + rc_off;
+      op->tasks[i].regcfg_addr = (uint32_t)m->weight_bo.dma_addr + bo_off;
       op->tasks[i].enable_mask = task_table[i].enable_mask;
    }
    op->regcmd_offset = 0;
 
    /* Debug: print task 0 key registers after patching */
    {
-      uint32_t rc_off = task_table[0].rc_offset_in_bo - hdr.rc_start_offset;
-      uint64_t *e0 = (uint64_t *)((uint8_t *)m->regcmd_bo.map + rc_off);
+      uint32_t rc_off = task_table[0].rc_offset_in_bo;
+      uint64_t *e0 = (uint64_t *)((uint8_t *)m->weight_bo.map + rc_off);
       uint32_t amt = task_table[0].rc_amount + 4;
       fprintf(stderr, "rnpu: task[0] regcmd at rc_bo+0x%x, %u entries:\n", rc_off, amt);
       for (unsigned e = 0; e < amt; e++) {
