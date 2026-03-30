@@ -41,4 +41,14 @@ extern uint32_t *rnpu_native_op_indices;
 extern uint8_t *rnpu_native_raw_task_bo;
 extern uint32_t rnpu_native_raw_task_bo_size;
 
+/* Native cache submit segments */
+struct rnpu_native_segment {
+   uint32_t flags;
+   uint32_t sc_start;
+   uint32_t sc_count;
+   uint32_t task_number;
+};
+extern struct rnpu_native_segment *rnpu_native_segments;
+extern unsigned rnpu_native_segment_count;
+
 #endif /* RNPU_DRM_H */

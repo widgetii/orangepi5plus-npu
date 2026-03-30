@@ -255,9 +255,11 @@ int ioctl(int fd, unsigned long request, ...) {
             snprintf(mpath, sizeof(mpath), "/tmp/rknn_dump/submit_%d.txt", submit_count);
             FILE *mf = fopen(mpath, "w");
             if (mf) {
-                fprintf(mf, "submit=%d flags=0x%x tasks=%u task_obj=0x%llx core_mask=0x%x\n",
+                fprintf(mf, "submit=%d flags=0x%x tasks=%u task_obj=0x%llx core_mask=0x%x "
+                        "sc_start=%u sc_count=%u\n",
                         submit_count, s->flags, s->task_number,
-                        (unsigned long long)s->task_obj_addr, s->core_mask);
+                        (unsigned long long)s->task_obj_addr, s->core_mask,
+                        s->subcore_task[0].task_start, s->subcore_task[0].task_number);
                 fprintf(mf, "bo_count=%d\n", bo_count);
                 for (int i = 0; i < bo_count; i++)
                     fprintf(mf, "bo[%d] handle=%u dma=0x%llx obj=0x%llx size=%llu\n",
