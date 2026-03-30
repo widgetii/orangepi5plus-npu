@@ -16,7 +16,7 @@ import os
 import glob
 
 MAGIC = b'RNCA'  # Rocket NPU Cache
-VERSION = 1
+VERSION = 3  # v3: includes raw task BO + submit segments
 
 def main():
     dump_dir = sys.argv[1] if len(sys.argv) > 1 else "/tmp/rknn_dump"
@@ -143,18 +143,50 @@ def main():
         rc_off = rc_addr - wt_rc_dma
         task_table += struct.pack("<IIII", rc_off, rc_amt, enable_masks[i], op_indices[i])
 
+    # Raw task BO: first n_tasks * 40 bytes
+    raw_task_bo = task_bo_data[:n_tasks * TASK_SIZE]
+
+    # Parse ALL HW submit segments (submit_*.txt with flags=0x5 or 0x1 for HW+continuation)
+    segments = []
+    for sub_id in range(1, 20):
+        sub_path = os.path.join(dump_dir, f"submit_{sub_id}.txt")
+        if not os.path.exists(sub_path):
+            break
+        with open(sub_path) as sf:
+            line = sf.readline()
+            parts = line.split()
+            flags = int([p for p in parts if p.startswith("flags=")][0].split("=")[1], 16)
+            task_num = int([p for p in parts if p.startswith("tasks=")][0].split("=")[1])
+        # Parse subcore_task from our enhanced intercept log
+        # For now, use the data we captured: submit 1 = {0,38}, submit 2 = {38,13}
+        # We need the actual sc values — check if they're in the submit file
+        segments.append((sub_id, flags, task_num))
+
+    # Encode segments: flags(4) + task_start(4) + task_number(4) per segment
+    # For HW segments, read from dump; task_start = sum of previous HW task counts
+    seg_data = b""
+    for sub_id, flags, task_num in segments:
+        seg_data += struct.pack("<III", flags, 0, task_num)  # task_start filled below
+    n_segments = len(segments)
+
     with open(out_path, "wb") as f:
         f.write(header)
         f.write(bo_table)
         f.write(task_table)
         f.write(wt_rc_data)
+        f.write(raw_task_bo)
+        # v3: segment table
+        f.write(struct.pack("<I", n_segments))
+        f.write(seg_data)
 
-    total = len(header) + len(bo_table) + len(task_table) + len(wt_rc_data)
+    total = len(header) + len(bo_table) + len(task_table) + len(wt_rc_data) + len(raw_task_bo) + 4 + len(seg_data)
     print(f"\nWrote {out_path}: {total} bytes")
     print(f"  Header: {len(header)} bytes")
     print(f"  BO table: {len(bo_table)} bytes ({n_bos} entries)")
     print(f"  Task table: {len(task_table)} bytes ({n_tasks} entries)")
     print(f"  BO data: {len(wt_rc_data)} bytes")
+    print(f"  Task BO: {len(raw_task_bo)} bytes ({n_tasks} tasks × {TASK_SIZE}B)")
+    print(f"  Segments: {n_segments} ({[s[1:] for s in segments]})")
 
 if __name__ == "__main__":
     main()

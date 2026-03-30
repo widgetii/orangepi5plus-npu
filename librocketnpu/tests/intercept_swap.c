@@ -238,9 +238,13 @@ int ioctl(int fd, unsigned long request, ...) {
         struct rknpu_submit *s = arg;
         submit_count++;
 
-        fprintf(stderr, "SWAP: SUBMIT[%d] flags=0x%x tasks=%u obj=0x%llx mask=0x%x\n",
+        fprintf(stderr, "SWAP: SUBMIT[%d] flags=0x%x tasks=%u obj=0x%llx mask=0x%x "
+                "sc[0]={%u,%u} sc[1]={%u,%u} sc[2]={%u,%u}\n",
                 submit_count, s->flags, s->task_number,
-                (unsigned long long)s->task_obj_addr, s->core_mask);
+                (unsigned long long)s->task_obj_addr, s->core_mask,
+                s->subcore_task[0].task_start, s->subcore_task[0].task_number,
+                s->subcore_task[1].task_start, s->subcore_task[1].task_number,
+                s->subcore_task[2].task_start, s->subcore_task[2].task_number);
 
         /* Mode DUMP_ALL: Dump every BO + task array + per-task regcmd to /tmp/rknn_dump/ */
         if (getenv("DUMP_ALL_BOS")) {

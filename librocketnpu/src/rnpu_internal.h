@@ -365,6 +365,8 @@ struct rnpu_model {
    struct drm_rocket_task *hw_tasks;
    uint32_t *hw_task_enable_masks;  /* RKNPU: per-task enable_mask (native cache) */
    uint32_t *hw_task_op_indices;   /* RKNPU: per-task op_idx (native cache) */
+   uint8_t *native_task_bo_data;   /* Raw captured RKNN task BO data */
+   uint32_t native_task_bo_size;   /* Size of native_task_bo_data */
    uint32_t *in_handles;   /* flat array: per-job input handles */
    uint32_t *out_handles;  /* flat array: per-job output handles */
    unsigned job_count;

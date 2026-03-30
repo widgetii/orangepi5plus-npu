@@ -905,7 +905,7 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
       return -1;
    }
 
-   if (hdr.version != 1 || hdr.bo_count < 2 || hdr.task_count == 0) {
+   if (hdr.version < 1 || hdr.version > 3 || hdr.bo_count < 2 || hdr.task_count == 0) {
       fprintf(stderr, "rnpu: invalid cache version %u\n", hdr.version);
       fclose(f);
       return -1;
@@ -925,6 +925,18 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
       fprintf(stderr, "rnpu: cache file truncated\n");
       free(wt_rc_data); free(bo_table); free(task_table); fclose(f);
       return -1;
+   }
+   /* v2: read raw task BO data (appended after wt_rc_data) */
+   if (hdr.version >= 2) {
+      uint32_t task_bo_sz = hdr.task_count * 40; /* sizeof(rknpu_task) = 40 */
+      m->native_task_bo_data = malloc(task_bo_sz);
+      if (fread(m->native_task_bo_data, 1, task_bo_sz, f) != task_bo_sz) {
+         fprintf(stderr, "rnpu: cache missing task BO data\n");
+         free(m->native_task_bo_data);
+         m->native_task_bo_data = NULL;
+      } else {
+         m->native_task_bo_size = task_bo_sz;
+      }
    }
    fclose(f);
 
@@ -1896,6 +1908,8 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
             /* Normal mode: submit all jobs in segment at once */
             rnpu_native_enable_masks = m->hw_task_enable_masks;
             rnpu_native_op_indices = m->hw_task_op_indices;
+            rnpu_native_raw_task_bo = m->native_task_bo_data;
+            rnpu_native_raw_task_bo_size = m->native_task_bo_size;
             int ret = rnpu_submit(m->fd, &m->jobs[hw_job_idx], seg->job_count);
             if (ret) {
                fprintf(stderr, "rnpu: segment submit failed (%u jobs)\n", seg->job_count);

@@ -172,6 +172,8 @@ struct rknpu_action { uint32_t flags; uint32_t value; };
 enum rnpu_driver_type rnpu_active_driver = RNPU_DRIVER_ROCKET;
 uint32_t *rnpu_native_enable_masks = NULL;
 uint32_t *rnpu_native_op_indices = NULL;
+uint8_t *rnpu_native_raw_task_bo = NULL;
+uint32_t rnpu_native_raw_task_bo_size = 0;
 
 /* ======================================================================
  * BO operations — dual-driver
@@ -389,21 +391,104 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
 
       /* Fill task descriptors into cached BO */
       struct rknpu_task *task = (struct rknpu_task *)task_bo_cache.map;
-      for (uint32_t t = 0; t < ntasks; t++) {
-         struct drm_rocket_task *rt =
-            &((struct drm_rocket_task *)(uintptr_t)job->tasks)[t];
-         struct rknpu_task *tp = &task[t];
-         memset(tp, 0, sizeof(*tp));
-         tp->op_idx = (rnpu_native_op_indices && rnpu_native_op_indices[global_task_idx])
-                      ? rnpu_native_op_indices[global_task_idx] : j;
-         uint32_t emask = (rnpu_native_enable_masks && rnpu_native_enable_masks[global_task_idx])
-                          ? rnpu_native_enable_masks[global_task_idx] : 0xf;
-         tp->enable_mask = emask;
-         tp->int_mask = 0x300;
-         tp->int_clear = 0x1ffff;
-         tp->regcfg_amount = rt->regcmd_count - RKNPU_PC_DATA_EXTRA_AMOUNT;
-         tp->regcmd_addr = (uint64_t)rt->regcmd;
-         global_task_idx++;
+      if (rnpu_native_raw_task_bo && rnpu_native_raw_task_bo_size >= ntasks * sizeof(struct rknpu_task)) {
+         /* Native cache: use captured RKNN task structs.
+          * CRITICAL: RKNN splits submits by enable_mask — CONV tasks (0x1d)
+          * in one batch, REFORMAT (0x18) in another. The kernel uses
+          * subcore_task[0].task_number for the hardware batch size. */
+         struct rknpu_task *raw = (struct rknpu_task *)rnpu_native_raw_task_bo;
+
+         /* RKNN submit pattern: sc={0, first_batch_count} with PINGPONG.
+          * The PC hardware follows chain pointers through ALL tasks (CONV→
+          * REFORMAT→CONV→...) beyond the sc task count. The sc count only
+          * controls IRQ timing, not execution boundary.
+          *
+          * Match RKNN: count first CONV block for sc, submit once. */
+         uint32_t first_conv_end = 0;
+         while (first_conv_end < ntasks && raw[first_conv_end].enable_mask == 0x1d)
+            first_conv_end++;
+
+         /* Copy ALL tasks into task BO */
+         memcpy(task, raw, ntasks * sizeof(struct rknpu_task));
+         struct rknpu_mem_sync tms = {
+            .flags = 1, .obj_addr = task_bo_cache.obj_addr,
+            .size = ntasks * sizeof(struct rknpu_task)
+         };
+         ioctl(fd, DRM_IOCTL_RKNPU_MEM_SYNC, &tms);
+
+         /* Single submit: sc={0, first_conv_block}, flags=PINGPONG.
+          * Hardware chains through ALL 114 tasks via regcmd chain pointers. */
+         {
+            struct rknpu_submit sub = {
+               .flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG,
+               .timeout = 6000,
+               .task_number = ntasks,
+               .task_obj_addr = task_bo_cache.obj_addr,
+               .core_mask = 0x1,
+               .fence_fd = -1,
+               .subcore_task = {
+                  {0, first_conv_end}, {0, first_conv_end}, {0, first_conv_end},
+                  {0, first_conv_end}, {0, first_conv_end},
+               },
+            };
+            int sret = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub);
+            if (sret) {
+               fprintf(stderr, "rnpu: native submit failed: %s (%u tasks, sc=%u)\n",
+                       strerror(errno), ntasks, first_conv_end);
+               return sret;
+            }
+         }
+
+         /* Second submit: REFORMAT batch (matching RKNN's second submit).
+          * sc = {first_conv_end, non_conv_count} */
+         if (first_conv_end < ntasks) {
+            uint32_t reformat_end = first_conv_end;
+            while (reformat_end < ntasks && raw[reformat_end].enable_mask != 0x1d)
+               reformat_end++;
+            uint32_t reformat_count = reformat_end - first_conv_end;
+
+            struct rknpu_submit sub = {
+               .flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK,
+               .timeout = 6000,
+               .task_start = first_conv_end,
+               .task_number = ntasks - first_conv_end,
+               .task_obj_addr = task_bo_cache.obj_addr,
+               .core_mask = 0x1,
+               .fence_fd = -1,
+               .subcore_task = {
+                  {first_conv_end, reformat_count},
+                  {first_conv_end, reformat_count},
+                  {first_conv_end, reformat_count},
+                  {first_conv_end, reformat_count},
+                  {first_conv_end, reformat_count},
+               },
+            };
+            int sret = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub);
+            if (sret) {
+               fprintf(stderr, "rnpu: native REFORMAT submit failed: %s\n",
+                       strerror(errno));
+               return sret;
+            }
+         }
+         global_task_idx += ntasks;
+         continue; /* skip the normal submit below */
+      } else {
+         for (uint32_t t = 0; t < ntasks; t++) {
+            struct drm_rocket_task *rt =
+               &((struct drm_rocket_task *)(uintptr_t)job->tasks)[t];
+            struct rknpu_task *tp = &task[t];
+            memset(tp, 0, sizeof(*tp));
+            tp->op_idx = (rnpu_native_op_indices && rnpu_native_op_indices[global_task_idx])
+                         ? rnpu_native_op_indices[global_task_idx] : j;
+            uint32_t emask = (rnpu_native_enable_masks && rnpu_native_enable_masks[global_task_idx])
+                             ? rnpu_native_enable_masks[global_task_idx] : 0xf;
+            tp->enable_mask = emask;
+            tp->int_mask = 0x300;
+            tp->int_clear = 0x1ffff;
+            tp->regcfg_amount = rt->regcmd_count - RKNPU_PC_DATA_EXTRA_AMOUNT;
+            tp->regcmd_addr = (uint64_t)rt->regcmd;
+            global_task_idx++;
+         }
       }
 
       struct rknpu_submit submit = {

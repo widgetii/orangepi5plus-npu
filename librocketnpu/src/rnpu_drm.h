@@ -38,5 +38,7 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count);
  * Indexed by flat task index across all jobs. NULL = use default (0xf). */
 extern uint32_t *rnpu_native_enable_masks;
 extern uint32_t *rnpu_native_op_indices;
+extern uint8_t *rnpu_native_raw_task_bo;
+extern uint32_t rnpu_native_raw_task_bo_size;
 
 #endif /* RNPU_DRM_H */
