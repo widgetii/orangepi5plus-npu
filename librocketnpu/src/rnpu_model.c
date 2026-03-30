@@ -1011,6 +1011,32 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
       }
    }
 
+   /* Find output BOs: remaining native BOs that aren't task/wt_rc/act/input.
+    * Match by size against TFLite output tensor sizes. */
+   m->native_output_bo_count = 0;
+   for (unsigned i = 0; i < m->tfl.output_count && i < 8; i++) {
+      unsigned ti = m->tfl.graph_outputs[i];
+      const struct rnpu_tfl_tensor *t = &m->tfl.tensors[ti];
+      unsigned out_bytes = 1;
+      for (int d = 0; d < t->shape_len; d++) out_bytes *= t->shape[d];
+
+      for (unsigned b = 0; b < hdr.bo_count; b++) {
+         if (b == 0 || b == wt_rc_idx || b == act_bo_idx) continue;
+         if (native_bos[b].handle == m->native_input_bo.handle) continue;
+         bool used = false;
+         for (unsigned j = 0; j < m->native_output_bo_count; j++)
+            if (m->native_output_bos[j].handle == native_bos[b].handle) { used = true; break; }
+         if (used) continue;
+         if (bo_table[b].orig_size >= out_bytes &&
+             bo_table[b].orig_size <= out_bytes * 2) {
+            m->native_output_bos[m->native_output_bo_count++] = native_bos[b];
+            fprintf(stderr, "rnpu: native output %u → BO[%u] (%u bytes)\n",
+                    i, b, (unsigned)bo_table[b].orig_size);
+            break;
+         }
+      }
+   }
+
    /* Patch DMA addresses in regcmd entries.
     * If IOMMU gave us the same addresses, patching count will be 0. */
    uint32_t weight_size = hdr.rc_start_offset;
@@ -2221,6 +2247,17 @@ int rnpu_get_output(rnpu_model_t *m, int idx, void *out, size_t max_size)
    struct rnpu_npu_tensor *t = &m->tensors[ti];
    unsigned nhwc_size = t->width * t->height * t->channels;
    if (max_size < nhwc_size) return -1;
+
+   /* Native cache with separate output BOs: read directly from output BO.
+    * RKNN's REFORMAT tasks write linear NHWC data to dedicated output BOs. */
+   if ((unsigned)idx < m->native_output_bo_count && m->native_output_bos[idx].handle) {
+      rnpu_bo_prep(m->fd, &m->native_output_bos[idx]);
+      uint8_t *data = (uint8_t *)m->native_output_bos[idx].map;
+      /* REFORMAT output is already linear NHWC int8 — just copy + convert to uint8 */
+      for (unsigned i = 0; i < nhwc_size; i++)
+         ((uint8_t *)out)[i] = (uint8_t)((int8_t)data[i] + 128);
+      return nhwc_size;
+   }
 
    uint8_t *npu = (uint8_t *)m->activation_bo.map + t->offset;
 
