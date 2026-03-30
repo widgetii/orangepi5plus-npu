@@ -34,4 +34,8 @@ void rnpu_bo_destroy(int fd, struct rnpu_bo *bo);
 /* Submit jobs to NPU. Returns 0 on success. */
 int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count);
 
+/* Optional per-task enable_mask for RKNPU native cache mode.
+ * Indexed by flat task index across all jobs. NULL = use default (0xf). */
+extern uint32_t *rnpu_native_enable_masks;
+
 #endif /* RNPU_DRM_H */

@@ -833,6 +833,255 @@ static void patch_chain(struct rnpu_model *m,
    *chain_count |= (uint64_t)regs_to_fetch << 16;
 }
 
+/* ---- Native .rknn_cache loader ---- */
+
+/* Cache file format:
+ * Header: magic(4) version(4) bo_count(4) task_count(4)
+ *         submit_flags(4) pad(4)
+ *         wt_rc_bo_idx(4) wt_rc_size(4) wt_rc_dma(8)
+ *         rc_start_offset(4) pad(4)
+ * Per-BO: orig_dma(8) orig_size(8)
+ * Per-task: rc_offset_in_bo(4) rc_amount(4)
+ * Data: wt_rc_bo data */
+
+struct rnca_header {
+   uint32_t magic;
+   uint32_t version;
+   uint32_t bo_count;
+   uint32_t task_count;
+   uint32_t submit_flags;
+   uint32_t pad0;
+   uint32_t wt_rc_bo_idx;
+   uint32_t wt_rc_size;
+   uint64_t wt_rc_dma;
+   uint32_t rc_start_offset;
+   uint32_t pad1;
+};
+
+struct rnca_bo_entry {
+   uint64_t orig_dma;
+   uint64_t orig_size;
+};
+
+struct rnca_task_entry {
+   uint32_t rc_offset_in_bo;
+   uint32_t rc_amount;
+   uint32_t enable_mask;
+};
+
+/* DMA address registers that need patching in native mode */
+static int is_native_dma_reg(uint16_t reg)
+{
+   switch (reg) {
+   case 0x0010: /* PC_BASE_ADDRESS */
+   case 0x1070: /* CNA_WT_BASE_ADDR */
+   case 0x1110: /* RDMA_SRC_BASE_ADDR */
+   case 0x1184: /* Unknown DMA */
+   case 0x4020: /* DPU_DST_BASE_ADDR */
+   case 0x4080: /* DPU_OUT_CVT_OFFSET (sometimes DMA) */
+   case 0x5018: /* RDMA activation addr */
+   case 0x5020: /* RDMA_BS_BASE_ADDR */
+   case 0x5038: /* RDMA related */
+   case 0x6070: /* PC related */
+   case 0x701c: /* PC related */
+      return 1;
+   default:
+      return 0;
+   }
+}
+
+static int load_native_cache(struct rnpu_model *m, const char *cache_path)
+{
+   FILE *f = fopen(cache_path, "rb");
+   if (!f) return -1;
+
+   /* Read header */
+   struct rnca_header hdr;
+   if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != 0x41434e52 /* "RNCA" LE */) {
+      fclose(f);
+      return -1;
+   }
+
+   if (hdr.version != 1 || hdr.bo_count < 2 || hdr.task_count == 0) {
+      fprintf(stderr, "rnpu: invalid cache version %u\n", hdr.version);
+      fclose(f);
+      return -1;
+   }
+
+   /* Read BO table */
+   struct rnca_bo_entry *bo_table = calloc(hdr.bo_count, sizeof(struct rnca_bo_entry));
+   fread(bo_table, sizeof(struct rnca_bo_entry), hdr.bo_count, f);
+
+   /* Read task table */
+   struct rnca_task_entry *task_table = calloc(hdr.task_count, sizeof(struct rnca_task_entry));
+   fread(task_table, sizeof(struct rnca_task_entry), hdr.task_count, f);
+
+   /* Read weight+regcmd BO data */
+   uint8_t *wt_rc_data = malloc(hdr.wt_rc_size);
+   if (fread(wt_rc_data, 1, hdr.wt_rc_size, f) != hdr.wt_rc_size) {
+      fprintf(stderr, "rnpu: cache file truncated\n");
+      free(wt_rc_data); free(bo_table); free(task_table); fclose(f);
+      return -1;
+   }
+   fclose(f);
+
+   /* Create a single BO for the combined weight+regcmd data.
+    * Use weight_bo for weight region, regcmd_bo for regcmd region.
+    * But since they're in the same DMA BO in RKNN, we use weight_bo
+    * for everything and point regcmd into it. */
+   uint32_t weight_size = hdr.rc_start_offset;
+   uint32_t regcmd_size = hdr.wt_rc_size - hdr.rc_start_offset;
+
+   /* Create weight BO (holds all weight data) */
+   rnpu_bo_create(m->fd, weight_size, &m->weight_bo);
+   memcpy(m->weight_bo.map, wt_rc_data, weight_size);
+   rnpu_bo_fini(m->fd, &m->weight_bo);
+
+   /* Create regcmd BO (holds all regcmd data) */
+   rnpu_bo_create(m->fd, regcmd_size, &m->regcmd_bo);
+   memcpy(m->regcmd_bo.map, wt_rc_data + hdr.rc_start_offset, regcmd_size);
+
+   /* Patch DMA addresses in regcmd region */
+   uint64_t orig_wt_dma = hdr.wt_rc_dma;
+   uint64_t orig_wt_end = orig_wt_dma + hdr.wt_rc_size;
+
+   /* Allocate separate BOs matching RKNN's layout.
+    * RKNN uses: BO[0]=tasks, BO[1]=wt+rc (already loaded), BO[2]=activation,
+    * BO[3]=input, BO[4]=metadata. We need separate act + input BOs. */
+   struct rnpu_bo native_bos[8] = {{0}};
+   unsigned native_bo_count = hdr.bo_count;
+
+   for (unsigned b = 0; b < hdr.bo_count; b++) {
+      if (b == (unsigned)hdr.wt_rc_bo_idx || b == 0 /* task BO */) continue;
+      uint64_t sz = bo_table[b].orig_size;
+      if (sz == 0) continue;
+      rnpu_bo_create(m->fd, (uint32_t)sz, &native_bos[b]);
+   }
+
+   /* The activation BO must be the largest native BO (for I/O) */
+   unsigned act_bo_idx = 0;
+   for (unsigned b = 0; b < hdr.bo_count; b++) {
+      if (native_bos[b].handle && bo_table[b].orig_size > bo_table[act_bo_idx].orig_size)
+         act_bo_idx = b;
+   }
+   /* Override model's activation_bo with the native one for I/O */
+   if (native_bos[act_bo_idx].handle) {
+      /* Free the previously allocated activation BO */
+      if (m->activation_bo.handle) {
+         munmap(m->activation_bo.map, m->activation_bo.size);
+         /* Note: not destroying since allocate_tensors created it */
+      }
+      m->activation_bo = native_bos[act_bo_idx];
+   }
+
+   /* Patch DMA addresses in regcmd region.
+    * For each task's entries, replace original BO addresses with new ones. */
+   unsigned patched = 0;
+
+   for (unsigned t = 0; t < hdr.task_count; t++) {
+      uint32_t rc_off = task_table[t].rc_offset_in_bo - hdr.rc_start_offset;
+      uint32_t rc_amt = task_table[t].rc_amount + 4;
+      uint64_t *entries = (uint64_t *)((uint8_t *)m->regcmd_bo.map + rc_off);
+
+      for (unsigned e = 0; e < rc_amt; e++) {
+         uint16_t reg = entries[e] & 0xFFFF;
+         uint32_t val = (entries[e] >> 16) & 0xFFFFFFFF;
+         if (!is_native_dma_reg(reg) || val == 0) continue;
+
+         uint32_t new_val = val;
+         /* Check each original BO range and map to our new BO */
+         for (unsigned b = 0; b < hdr.bo_count; b++) {
+            uint32_t bd = (uint32_t)bo_table[b].orig_dma;
+            uint32_t be = bd + (uint32_t)bo_table[b].orig_size;
+            if (val < bd || val >= be) continue;
+
+            uint32_t off = val - bd;
+            if (b == (unsigned)hdr.wt_rc_bo_idx) {
+               /* Weight region or regcmd region */
+               if (off < weight_size)
+                  new_val = (uint32_t)m->weight_bo.dma_addr + off;
+               else
+                  new_val = (uint32_t)m->regcmd_bo.dma_addr + (off - hdr.rc_start_offset);
+            } else if (native_bos[b].handle) {
+               new_val = (uint32_t)native_bos[b].dma_addr + off;
+            }
+            break;
+         }
+
+         if (new_val != val) {
+            entries[e] = (entries[e] & 0xFFFF000000000000ULL) |
+                         ((uint64_t)new_val << 16) |
+                         (entries[e] & 0xFFFF);
+            patched++;
+         }
+      }
+   }
+
+   rnpu_bo_fini(m->fd, &m->regcmd_bo);
+
+   /* Replace all ops with a single HW operation containing all native tasks.
+    * SW ops from TFLite are dropped — native mode handles everything. */
+   /* Free old ops (careful with dynamic fields) */
+   if (m->ops) {
+      for (unsigned i = 0; i < m->op_count; i++) {
+         struct rnpu_operation *old = &m->ops[i];
+         free(old->tasks);
+         free(old->per_axis_correction);
+         free(old->per_channel_scales);
+         free(old->requant_group_sizes);
+         free(old->requant_group_ch_offset);
+         free(old->requant_group_max_ws);
+         free(old->requant_brdma_offsets);
+         free(old->requant_mul_shifts);
+         free(old->group_channel_indices);
+         if (old->type == RNPU_OP_CONCAT) {
+            free(old->sw.concat.input_tensors);
+            free(old->sw.concat.input_channels_arr);
+         }
+      }
+      free(m->ops);
+   }
+   m->op_count = 1;
+   m->ops = calloc(1, sizeof(struct rnpu_operation));
+   struct rnpu_operation *op = &m->ops[0];
+   op->type = RNPU_OP_CONV;
+   op->add_tensor = -1;
+   op->task_count = hdr.task_count;
+   op->tasks = calloc(hdr.task_count, sizeof(struct rnpu_split_task));
+
+   for (unsigned i = 0; i < hdr.task_count; i++) {
+      uint32_t rc_off = task_table[i].rc_offset_in_bo - hdr.rc_start_offset;
+      /* Cache stores RKNN's regcfg_amount (already minus EXTRA_AMOUNT=4).
+       * Our submit path subtracts EXTRA_AMOUNT again, so add it back here. */
+      op->tasks[i].regcfg_amount = task_table[i].rc_amount + 4;
+      op->tasks[i].regcfg_addr = (uint32_t)m->regcmd_bo.dma_addr + rc_off;
+      op->tasks[i].enable_mask = task_table[i].enable_mask;
+   }
+   op->regcmd_offset = 0;
+
+   /* Debug: print task 0 key registers after patching */
+   {
+      uint32_t rc_off = task_table[0].rc_offset_in_bo - hdr.rc_start_offset;
+      uint64_t *e0 = (uint64_t *)((uint8_t *)m->regcmd_bo.map + rc_off);
+      uint32_t amt = task_table[0].rc_amount + 4;
+      fprintf(stderr, "rnpu: task[0] regcmd at rc_bo+0x%x, %u entries:\n", rc_off, amt);
+      for (unsigned e = 0; e < amt; e++) {
+         uint16_t reg = e0[e] & 0xFFFF;
+         uint32_t val = (e0[e] >> 16) & 0xFFFFFFFF;
+         if (reg == 0x1070 || reg == 0x1110 || reg == 0x4020 || reg == 0x5020 || reg == 0x0010)
+            fprintf(stderr, "  [%3u] reg=0x%04x val=0x%08x\n", e, reg, val);
+      }
+   }
+
+   fprintf(stderr, "rnpu: loaded native cache: %u tasks, %u bytes, %u DMA patched\n",
+           hdr.task_count, hdr.wt_rc_size, patched);
+
+   free(wt_rc_data);
+   free(bo_table);
+   free(task_table);
+   return 0;
+}
+
 static void compile_regcmds(struct rnpu_model *m)
 {
    /* First pass: split tasks and estimate regcmd sizes */
@@ -947,6 +1196,7 @@ static void build_execution_plan(struct rnpu_model *m)
    if (total_jobs > 0) {
       m->jobs = calloc(total_jobs, sizeof(struct drm_rocket_job));
       m->hw_tasks = calloc(total_tasks, sizeof(struct drm_rocket_task));
+      m->hw_task_enable_masks = calloc(total_tasks, sizeof(uint32_t));
       m->in_handles = calloc(total_jobs * handles_per_job, sizeof(uint32_t));
       m->out_handles = calloc(total_jobs, sizeof(uint32_t));
    }
@@ -966,6 +1216,8 @@ static void build_execution_plan(struct rnpu_model *m)
             for (unsigned t = 0; t < op->task_count; t++) {
                m->hw_tasks[ti].regcmd = op->tasks[t].regcfg_addr;
                m->hw_tasks[ti].regcmd_count = op->tasks[t].regcfg_amount;
+               if (m->hw_task_enable_masks)
+                  m->hw_task_enable_masks[ti] = op->tasks[t].enable_mask;
                ti++;
                merged_task_count++;
             }
@@ -1335,50 +1587,73 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
    /* Allocate activation BO */
    allocate_tensors(m);
 
-   /* Compile weights and biases into shared BOs */
-   compile_weights_and_biases(m);
-
-   /* Try loading sibling .rknn file for BRDMA data override */
-   struct rnpu_rknn_model rknn_model = {0};
-   struct rnpu_rknn_model *rknn_ptr = NULL;
-   {
-      /* Construct .rknn path from .tflite path */
+   /* Try native .rknn_cache path first (RKNPU only) */
+   bool native_loaded = false;
+   if (rnpu_active_driver == RNPU_DRIVER_RKNPU) {
       size_t plen = strlen(tflite_path);
-      char *rknn_path = malloc(plen + 8);
-      strcpy(rknn_path, tflite_path);
-      /* Replace .tflite extension with .rknn */
-      char *ext = strrchr(rknn_path, '.');
-      if (ext && strcmp(ext, ".tflite") == 0) {
-         strcpy(ext, ".rknn");
-      } else {
-         /* Append .rknn */
-         strcat(rknn_path, ".rknn");
-      }
-      /* Check if file exists */
-      if (access(rknn_path, R_OK) == 0) {
-         if (rnpu_rknn_parse(rknn_path, &rknn_model) == 0 && rknn_model.op_count > 0) {
-            rknn_ptr = &rknn_model;
-            m->has_rknn = true;
+      char *cache_path = malloc(plen + 16);
+      strcpy(cache_path, tflite_path);
+      char *ext = strrchr(cache_path, '.');
+      if (ext) strcpy(ext, ".rknn_cache");
+      else strcat(cache_path, ".rknn_cache");
+
+      if (access(cache_path, R_OK) == 0) {
+         if (load_native_cache(m, cache_path) == 0) {
+            native_loaded = true;
+            build_execution_plan(m);
          }
       }
-      free(rknn_path);
+      free(cache_path);
    }
 
-   /* Compile BRDMA data for RKNPU per-channel ops */
-   compile_brdma_data(m, rknn_ptr);
+   if (!native_loaded) {
+      /* Standard path: compile from TFLite */
+      compile_weights_and_biases(m);
 
-   /* Free .rknn model data (BRDMA blobs already copied into BOs) */
-   if (rknn_ptr)
-      rnpu_rknn_free(&rknn_model);
+      /* Try loading sibling .rknn file for BRDMA data override */
+      struct rnpu_rknn_model rknn_model = {0};
+      struct rnpu_rknn_model *rknn_ptr = NULL;
+      {
+         size_t plen = strlen(tflite_path);
+         char *rknn_path = malloc(plen + 8);
+         strcpy(rknn_path, tflite_path);
+         char *ext = strrchr(rknn_path, '.');
+         if (ext && strcmp(ext, ".tflite") == 0) {
+            strcpy(ext, ".rknn");
+         } else {
+            strcat(rknn_path, ".rknn");
+         }
+         if (access(rknn_path, R_OK) == 0) {
+            if (rnpu_rknn_parse(rknn_path, &rknn_model) == 0 && rknn_model.op_count > 0) {
+               rknn_ptr = &rknn_model;
+               m->has_rknn = true;
+            }
+         }
+         free(rknn_path);
+      }
 
-   /* Generate register commands */
-   compile_regcmds(m);
+      compile_brdma_data(m, rknn_ptr);
+      if (rknn_ptr)
+         rnpu_rknn_free(&rknn_model);
 
-   /* Build execution plan */
-   build_execution_plan(m);
+      compile_regcmds(m);
+      build_execution_plan(m);
+   }
 
    /* Store graph I/O info */
-   if (m->op_count > 0) {
+   if (native_loaded) {
+      /* Native mode: use TFLite graph I/O directly */
+      m->graph_input_tensor = m->tfl.graph_inputs[0];
+      /* Set fake op dimensions from first TFLite input tensor */
+      const struct rnpu_tfl_tensor *it = &m->tfl.tensors[m->graph_input_tensor];
+      if (it->shape_len >= 4) {
+         m->ops[0].input_width = it->shape[1];
+         m->ops[0].input_height = it->shape[2];
+         m->ops[0].input_channels = it->shape[3];
+      }
+      m->ops[0].input_tensor = m->graph_input_tensor;
+      m->ops[0].input_zero_point = (uint8_t)it->quant.zero_point;
+   } else if (m->op_count > 0) {
       m->graph_input_tensor = m->ops[0].input_tensor;
    }
 
@@ -1583,6 +1858,7 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
             rnpu_bo_prep(m->fd, &m->activation_bo);
          } else {
             /* Normal mode: submit all jobs in segment at once */
+            rnpu_native_enable_masks = m->hw_task_enable_masks;
             int ret = rnpu_submit(m->fd, &m->jobs[hw_job_idx], seg->job_count);
             if (ret) {
                fprintf(stderr, "rnpu: segment submit failed (%u jobs)\n", seg->job_count);
