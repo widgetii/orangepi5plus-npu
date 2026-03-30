@@ -151,17 +151,26 @@ insmod /root/npu-research/rknpu-driver/rknpu_trace.ko
 # Verify: /dev/dri/card1 appears, dmesg shows RKNPU_TRACE
 ```
 
+### WARNING: Do NOT rmmod or unbind
+
+**NEVER** run `rmmod rknpu_trace` or unbind the driver while the
+system is running. The RKNPU driver's remove/teardown path triggers
+IOMMU domain release and power domain cascade that **crashes the
+kernel** (I2C timeouts → power controller failure → kernel hang).
+
+This applies to both the built-in driver AND our module. The only
+safe way to switch drivers is to **reboot**.
+
+To iterate on the module code:
+1. Make changes to the source
+2. Rebuild: `make -j4`
+3. **Reboot** the board
+4. `insmod rknpu_trace.ko`
+
 ### Restoring the built-in driver
 
 Remove `initcall_blacklist=rknpu_init` from `/boot/armbianEnv.txt`
-and reboot.
-
-### Why unbind doesn't work
-
-Direct unbind (`echo fdab0000.npu > .../RKNPU/unbind`) crashes the
-kernel due to IOMMU teardown + power domain cascade. The
-`initcall_blacklist` approach avoids this by preventing the built-in
-from ever probing.
+and reboot. Do NOT try to rmmod + restore at runtime.
 
 ### Build symlink fix
 
