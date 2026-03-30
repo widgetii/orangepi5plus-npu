@@ -133,6 +133,8 @@ static void fill_task(struct rnpu_operation *op, struct rnpu_split_task *task)
       task->weights_kernels = 1;
    else if (op->output_channels == 1 && op->output_tensor_channels > 0)
       task->weights_kernels = 2;
+   else if (op->rknn_brdma_override)
+      task->weights_kernels = ALIGN_UP(op->output_channels, 2);
    else
       task->weights_kernels = ALIGN_UP(MAX2(op->output_channels, 32), 2);
 
