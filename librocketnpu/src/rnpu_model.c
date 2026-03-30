@@ -728,9 +728,9 @@ static void compile_brdma_data(struct rnpu_model *m,
       }
       if (!top) continue;
 
-      /* Try .rknn override: match by bias values and channel count */
-      if (rknn && rknn->op_count > 0 && op->requant_group_count <= 1) {
-         /* Get raw TFLite biases for matching */
+      /* Try .rknn override: use RKNN's pre-computed BRDMA data (bias + MUL).
+       * This forces single-group mode — RKNN processes all OC in one task. */
+      if (rknn && rknn->op_count > 0) {
          int bias_idx = top->inputs[2];
          const struct rnpu_tfl_buffer *bias_buf =
             &m->tfl.buffers[m->tfl.tensors[bias_idx].buffer_index];
@@ -739,17 +739,33 @@ static void compile_brdma_data(struct rnpu_model *m,
 
          int ri = rnpu_rknn_match_op(rknn, tfl_biases, oc);
          if (ri >= 0) {
-            /* Use .rknn BRDMA data directly */
+            /* Force single-group: RKNN uses one BRDMA task for all channels */
+            if (op->requant_group_count > 1) {
+               op->requant_group_count = 1;
+               if (op->group_channel_indices) {
+                  free(op->group_channel_indices);
+                  op->group_channel_indices = NULL;
+               }
+            }
+            /* Use global max weight scale (matching RKNN's conv_scale) */
+            float max_ws = op->per_channel_scales[0];
+            for (unsigned c = 1; c < op->per_channel_scale_count; c++)
+               if (op->per_channel_scales[c] > max_ws)
+                  max_ws = op->per_channel_scales[c];
+            op->weights_scale = max_ws;
+
+            /* Copy RKNN's BRDMA data (biases + MUL values) */
             uint8_t *dst = (uint8_t *)m->brdma_bo.map + op->brdma_offset;
             unsigned copy_sz = op->brdma_size < rknn->ops[ri].brdma_size ?
                                op->brdma_size : rknn->ops[ri].brdma_size;
             memcpy(dst, rknn->ops[ri].brdma_data, copy_sz);
 
-            /* Mark as .rknn override — BRDMA MUL correction will be skipped.
-             * OUT_CVT values stay computed from our TFLite scales (same formula
-             * as RKNN uses). The key difference is per-channel MUL values. */
             op->rknn_brdma_override = true;
             op->brdma_mul_shift = 14;
+
+            /* Update task weights_scale to match (tasks were created before this) */
+            for (unsigned t = 0; t < op->task_count; t++)
+               op->tasks[t].weights_scale = max_ws;
 
             rknn->ops[ri].matched = true;
             rknn_matched++;
