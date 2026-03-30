@@ -54,15 +54,89 @@ rebuild the full kernel from the upstream branch source causes:
   (`echo fdab0000.npu > /sys/bus/platform/drivers/RKNPU/unbind`) —
   causes kernel panic due to IOMMU teardown races
 
-## Loading the module
+## Tracing the built-in driver with kprobes (RECOMMENDED)
 
-The stock RKNPU driver is **built-in** (`CONFIG_ROCKCHIP_RKNPU=y`),
-not a module. To replace it with our instrumented version:
+No module swap needed. The vendor kernel has ftrace and kprobes enabled,
+allowing us to trace all 92 RKNPU kernel functions from the built-in driver.
 
-**TODO**: Implement safe driver swap mechanism. Options under investigation:
-- `driver_override` sysfs approach (set override before unbind)
-- Kernel shim module that does atomic unbind + rebind
-- Devicetree overlay with different compatible string
+### Setup
+
+```bash
+# Set up kprobes on submit and IRQ handlers
+# rknpu_submit struct offsets: flags(+0) timeout(+4) task_start(+8)
+# task_number(+12) core_mask(+56). x1 = pointer to struct.
+echo 'p:rknpu_sub __rknpu_submit_ioctl flags=+0(%x1):u32 timeout=+4(%x1):u32 task_start=+8(%x1):u32 task_num=+12(%x1):u32 core_mask=+56(%x1):u32' > /sys/kernel/debug/tracing/kprobe_events
+echo 'p:rknpu_irq0 rknpu_core0_irq_handler' >> /sys/kernel/debug/tracing/kprobe_events
+
+# Enable probes
+echo 1 > /sys/kernel/debug/tracing/events/kprobes/enable
+echo > /sys/kernel/debug/tracing/trace
+echo 1 > /sys/kernel/debug/tracing/tracing_on
+```
+
+### Running a trace
+
+```bash
+# Clear buffer, run workload, read trace
+echo > /sys/kernel/debug/tracing/trace
+./test_mobilenet /root/npu-research/mobilenet_v1.tflite 1
+cat /sys/kernel/debug/tracing/trace | grep rknpu_sub
+```
+
+### Example output
+
+```
+test_mobilenet-2810 [004] d.... 191.345131: rknpu_sub: flags=5 timeout=6000 task_start=0 task_num=3 core_mask=0
+test_mobilenet-2810 [004] d.... 191.345481: rknpu_sub: flags=5 timeout=6000 task_start=0 task_num=2 core_mask=0
+```
+
+### Tracing RKNN for comparison
+
+```bash
+echo > /sys/kernel/debug/tracing/trace
+LD_PRELOAD=/tmp/intercept_swap.so DUMP_REGCMD=0 python3 run_rknn_intercept.py
+cat /sys/kernel/debug/tracing/trace | grep rknpu_sub
+```
+
+RKNN submit pattern (YOLO):
+```
+flags=5 task_start=0   task_num=591  core_mask=1   # HW segment 1 (591 chained tasks)
+flags=1 task_start=197 task_num=12   core_mask=1   # SW segment (no pingpong)
+flags=5 task_start=201 task_num=42   core_mask=1   # HW segment 2
+flags=1 task_start=215 task_num=9    core_mask=1   # SW segment
+flags=5 task_start=218 task_num=21   core_mask=1   # HW segment 3
+flags=1 task_start=225 task_num=6    core_mask=1   # SW segment
+```
+
+### Cleanup
+
+```bash
+echo 0 > /sys/kernel/debug/tracing/events/kprobes/enable
+echo > /sys/kernel/debug/tracing/kprobe_events
+```
+
+### Available RKNPU functions (92 total)
+
+Key functions for tracing:
+- `__rknpu_submit_ioctl` — submit entry point (args: dev, rknpu_submit*)
+- `rknpu_job_next` — job dispatch to hardware
+- `rknpu_job_schedule` — job scheduling
+- `rknpu_core{0,1,2}_irq_handler` — IRQ completion per core
+- `__rknpu_gem_create_ioctl` — BO allocation
+- `__rknpu_gem_sync_ioctl` — cache sync
+
+Full list: `grep rknpu /sys/kernel/debug/tracing/available_filter_functions`
+
+## Loading the instrumented module (BLOCKED)
+
+The stock RKNPU driver is **built-in** (`CONFIG_ROCKCHIP_RKNPU=y`).
+Replacing it with our module requires unbinding the built-in, which
+crashes the kernel (IOMMU teardown + power domain cascade).
+
+Attempted approaches (all failed):
+- `driver_override` sysfs + unbind — hangs, I2C timeouts, power failures
+- Direct unbind from userspace — kernel panic
+- Different module name (`RKNPU_TRACE`) loads but can't bind to device
 
 ## Files
 

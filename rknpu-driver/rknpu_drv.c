@@ -1632,7 +1632,7 @@ static struct platform_driver rknpu_driver = {
 	.remove = rknpu_remove,
 	.driver = {
 		.owner = THIS_MODULE,
-		.name = "RKNPU",
+		.name = "RKNPU_TRACE",
 #ifndef FPGA_PLATFORM
 		.pm = &rknpu_pm_ops,
 #endif
