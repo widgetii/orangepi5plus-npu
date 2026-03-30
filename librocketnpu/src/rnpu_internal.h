@@ -347,6 +347,8 @@ struct rnpu_model {
    struct rnpu_bo activation_bo;
    struct rnpu_bo brdma_bo;  /* RKNPU: per-channel bias+mul_scale data */
    struct rnpu_bo native_input_bo;  /* Native cache: separate input BO */
+   struct rnpu_bo native_output_bos[8];  /* Native cache: per-output BOs */
+   unsigned native_output_bo_count;
 
    /* Native cache submit segments (RKNN's exact submit pattern) */
    struct {
