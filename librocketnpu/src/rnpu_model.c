@@ -905,7 +905,7 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
       return -1;
    }
 
-   if (hdr.version < 1 || hdr.version > 3 || hdr.bo_count < 2 || hdr.task_count == 0) {
+   if (hdr.version < 1 || hdr.version > 4 || hdr.bo_count < 2 || hdr.task_count == 0) {
       fprintf(stderr, "rnpu: invalid cache version %u\n", hdr.version);
       fclose(f);
       return -1;
@@ -936,6 +936,23 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
          m->native_task_bo_data = NULL;
       } else {
          m->native_task_bo_size = task_bo_sz;
+      }
+   }
+   /* v4: read segment table */
+   if (hdr.version >= 4) {
+      uint32_t n_segs = 0;
+      if (fread(&n_segs, 4, 1, f) == 1 && n_segs > 0 && n_segs < 100) {
+         m->native_segments = calloc(n_segs, sizeof(*m->native_segments));
+         m->native_segment_count = n_segs;
+         for (unsigned i = 0; i < n_segs; i++) {
+            uint32_t buf[4];
+            if (fread(buf, 16, 1, f) != 1) break;
+            m->native_segments[i].flags = buf[0];
+            m->native_segments[i].sc_start = buf[1];
+            m->native_segments[i].sc_count = buf[2];
+            m->native_segments[i].task_number = buf[3];
+         }
+         fprintf(stderr, "rnpu: %u native submit segments\n", n_segs);
       }
    }
    fclose(f);
@@ -2034,6 +2051,8 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
             rnpu_native_op_indices = m->hw_task_op_indices;
             rnpu_native_raw_task_bo = m->native_task_bo_data;
             rnpu_native_raw_task_bo_size = m->native_task_bo_size;
+            rnpu_native_segments = (struct rnpu_native_segment *)m->native_segments;
+            rnpu_native_segment_count = m->native_segment_count;
             int ret = rnpu_submit(m->fd, &m->jobs[hw_job_idx], seg->job_count);
             if (ret) {
                fprintf(stderr, "rnpu: segment submit failed (%u jobs)\n", seg->job_count);

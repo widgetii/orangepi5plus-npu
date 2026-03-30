@@ -348,6 +348,15 @@ struct rnpu_model {
    struct rnpu_bo brdma_bo;  /* RKNPU: per-channel bias+mul_scale data */
    struct rnpu_bo native_input_bo;  /* Native cache: separate input BO */
 
+   /* Native cache submit segments (RKNN's exact submit pattern) */
+   struct {
+      uint32_t flags;
+      uint32_t sc_start;
+      uint32_t sc_count;
+      uint32_t task_number;
+   } *native_segments;
+   unsigned native_segment_count;
+
    /* Tensors */
    struct rnpu_npu_tensor *tensors;
    unsigned tensor_count;

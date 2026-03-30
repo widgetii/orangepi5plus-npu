@@ -16,7 +16,7 @@ import os
 import glob
 
 MAGIC = b'RNCA'  # Rocket NPU Cache
-VERSION = 3  # v3: includes raw task BO + submit segments
+VERSION = 4  # v4: segment table with sc_start/sc_count from intercept
 
 def main():
     dump_dir = sys.argv[1] if len(sys.argv) > 1 else "/tmp/rknn_dump"
@@ -146,27 +146,46 @@ def main():
     # Raw task BO: first n_tasks * 40 bytes
     raw_task_bo = task_bo_data[:n_tasks * TASK_SIZE]
 
-    # Parse ALL HW submit segments (submit_*.txt with flags=0x5 or 0x1 for HW+continuation)
+    # Parse submit segments from intercept stderr log.
+    # The intercept logs: SWAP: SUBMIT[N] flags=0xF tasks=T ... sc[0]={start,count}
+    # We need to find these lines — they're in stderr during the capture.
+    # Parse from submit_*.txt files which contain the first line of each submit.
+    # But sc values are only in the SWAP: SUBMIT lines (stderr), not in submit_*.txt.
+    # So we parse from the submit_*.txt which has 'submit=N flags=... tasks=...'
+    # and extract sc from a separate source.
+    #
+    # Better approach: parse sc directly from the raw task BO + submit metadata.
+    # The submit_*.txt has task_obj and task counts. The sc values from intercept are:
+    # stored in the SUBMIT log lines. Let me check if submit_*.txt has them.
+
+    # Actually, let's just hardcode the extraction from intercept stderr.
+    # The gen script should be run right after the intercept capture.
+    # Parse all SWAP: SUBMIT lines from a log file if available.
     segments = []
-    for sub_id in range(1, 20):
+    for sub_id in range(1, 50):
         sub_path = os.path.join(dump_dir, f"submit_{sub_id}.txt")
         if not os.path.exists(sub_path):
             break
         with open(sub_path) as sf:
-            line = sf.readline()
-            parts = line.split()
-            flags = int([p for p in parts if p.startswith("flags=")][0].split("=")[1], 16)
-            task_num = int([p for p in parts if p.startswith("tasks=")][0].split("=")[1])
-        # Parse subcore_task from our enhanced intercept log
-        # For now, use the data we captured: submit 1 = {0,38}, submit 2 = {38,13}
-        # We need the actual sc values — check if they're in the submit file
-        segments.append((sub_id, flags, task_num))
+            line = sf.readline().strip()
+        parts = line.split()
+        flags = int([p for p in parts if p.startswith("flags=")][0].split("=")[1], 16)
+        task_num = int([p for p in parts if p.startswith("tasks=")][0].split("=")[1])
+        # Parse sc_start and sc_count if present (v4 intercept format)
+        sc_start = sc_count = 0
+        for p in parts:
+            if p.startswith("sc_start="): sc_start = int(p.split("=")[1])
+            if p.startswith("sc_count="): sc_count = int(p.split("=")[1])
+        segments.append({"flags": flags, "task_number": task_num,
+                         "sc_start": sc_start, "sc_count": sc_count})
 
-    # Encode segments: flags(4) + task_start(4) + task_number(4) per segment
-    # For HW segments, read from dump; task_start = sum of previous HW task counts
+    for i, seg in enumerate(segments):
+        print(f"  Segment {i+1}: flags=0x{seg['flags']:x} sc={{{seg['sc_start']},{seg['sc_count']}}} task_number={seg['task_number']}")
+
+    # Encode segments: flags(4) + sc_start(4) + sc_count(4) + task_number(4) per segment
     seg_data = b""
-    for sub_id, flags, task_num in segments:
-        seg_data += struct.pack("<III", flags, 0, task_num)  # task_start filled below
+    for seg in segments:
+        seg_data += struct.pack("<IIII", seg["flags"], seg["sc_start"], seg["sc_count"], seg["task_number"])
     n_segments = len(segments)
 
     with open(out_path, "wb") as f:
@@ -186,7 +205,7 @@ def main():
     print(f"  Task table: {len(task_table)} bytes ({n_tasks} entries)")
     print(f"  BO data: {len(wt_rc_data)} bytes")
     print(f"  Task BO: {len(raw_task_bo)} bytes ({n_tasks} tasks × {TASK_SIZE}B)")
-    print(f"  Segments: {n_segments} ({[s[1:] for s in segments]})")
+    print(f"  Segments: {n_segments}")
 
 if __name__ == "__main__":
     main()
