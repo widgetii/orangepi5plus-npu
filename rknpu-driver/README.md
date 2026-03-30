@@ -127,16 +127,50 @@ Key functions for tracing:
 
 Full list: `grep rknpu /sys/kernel/debug/tracing/available_filter_functions`
 
-## Loading the instrumented module (BLOCKED)
+## Loading the instrumented module
 
 The stock RKNPU driver is **built-in** (`CONFIG_ROCKCHIP_RKNPU=y`).
-Replacing it with our module requires unbinding the built-in, which
-crashes the kernel (IOMMU teardown + power domain cascade).
+To replace it with our instrumented module:
 
-Attempted approaches (all failed):
-- `driver_override` sysfs + unbind — hangs, I2C timeouts, power failures
-- Direct unbind from userspace — kernel panic
-- Different module name (`RKNPU_TRACE`) loads but can't bind to device
+### One-time setup
+
+Add `initcall_blacklist=rknpu_init` to kernel boot args:
+
+```bash
+# Edit /boot/armbianEnv.txt, prepend to extraargs:
+extraargs=initcall_blacklist=rknpu_init cma=256M panic=10 ...
+```
+
+Reboot. The built-in RKNPU driver won't probe (dmesg shows
+`initcall rknpu_init blacklisted`). The NPU device is unbound.
+
+### Loading our module
+
+```bash
+insmod /root/npu-research/rknpu-driver/rknpu_trace.ko
+# Verify: /dev/dri/card1 appears, dmesg shows RKNPU_TRACE
+```
+
+### Restoring the built-in driver
+
+Remove `initcall_blacklist=rknpu_init` from `/boot/armbianEnv.txt`
+and reboot.
+
+### Why unbind doesn't work
+
+Direct unbind (`echo fdab0000.npu > .../RKNPU/unbind`) crashes the
+kernel due to IOMMU teardown + power domain cascade. The
+`initcall_blacklist` approach avoids this by preventing the built-in
+from ever probing.
+
+### Build symlink fix
+
+If `modules_install` was run from the wrong kernel tree, fix the
+build symlink:
+```bash
+rm /lib/modules/6.1.115-vendor-rk35xx/build
+ln -s /usr/src/linux-headers-6.1.115-vendor-rk35xx /lib/modules/6.1.115-vendor-rk35xx/build
+```
 
 ## Files
 

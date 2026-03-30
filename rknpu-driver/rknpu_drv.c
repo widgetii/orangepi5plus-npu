@@ -1640,18 +1640,18 @@ static struct platform_driver rknpu_driver = {
 	},
 };
 
-static int rknpu_init(void)
+static int rknpu_trace_init_driver(void)
 {
 	return platform_driver_register(&rknpu_driver);
 }
 
-static void rknpu_exit(void)
+static void rknpu_trace_exit_driver(void)
 {
 	platform_driver_unregister(&rknpu_driver);
 }
 
-late_initcall(rknpu_init);
-module_exit(rknpu_exit);
+module_init(rknpu_trace_init_driver);
+module_exit(rknpu_trace_exit_driver);
 
 MODULE_DESCRIPTION("RKNPU driver");
 MODULE_AUTHOR("Felix Zeng <felix.zeng@rock-chips.com>");
