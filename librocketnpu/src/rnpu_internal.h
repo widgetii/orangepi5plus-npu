@@ -203,6 +203,8 @@ struct rnpu_split_task {
    unsigned atomic_count, surfaces_per_row;
    unsigned regcfg_amount;
    uint32_t regcfg_addr;
+   uint32_t enable_mask;         /* RKNPU task enable_mask (0 = use default) */
+   uint32_t native_op_idx;      /* RKNPU task op_idx from native cache */
    uint32_t brdma_group_offset;  /* BRDMA BO offset for this task's requant group */
    unsigned requant_group_idx;   /* which requant group this task belongs to */
 };
@@ -344,6 +346,7 @@ struct rnpu_model {
    struct rnpu_bo regcmd_bo;
    struct rnpu_bo activation_bo;
    struct rnpu_bo brdma_bo;  /* RKNPU: per-channel bias+mul_scale data */
+   struct rnpu_bo native_input_bo;  /* Native cache: separate input BO */
 
    /* Tensors */
    struct rnpu_npu_tensor *tensors;
@@ -360,6 +363,10 @@ struct rnpu_model {
    /* Pre-built submit data */
    struct drm_rocket_job *jobs;
    struct drm_rocket_task *hw_tasks;
+   uint32_t *hw_task_enable_masks;  /* RKNPU: per-task enable_mask (native cache) */
+   uint32_t *hw_task_op_indices;   /* RKNPU: per-task op_idx (native cache) */
+   uint8_t *native_task_bo_data;   /* Raw captured RKNN task BO data */
+   uint32_t native_task_bo_size;   /* Size of native_task_bo_data */
    uint32_t *in_handles;   /* flat array: per-job input handles */
    uint32_t *out_handles;  /* flat array: per-job output handles */
    unsigned job_count;
