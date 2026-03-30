@@ -179,6 +179,30 @@ static void exec_resize_nearest(struct rnpu_model *m, struct rnpu_operation *op)
    }
 }
 
+static void exec_quantize(struct rnpu_model *m, struct rnpu_operation *op)
+{
+   uint8_t *in = tensor_ptr(m, op->input_tensor);
+   uint8_t *out = tensor_ptr(m, op->output_tensor);
+   float scale = op->input_scale / op->output_scale;
+   int in_zp = (int)(int8_t)op->input_zero_point;
+   int out_zp = (int)(int8_t)op->output_zero_point;
+
+   unsigned total;
+   if (m->sw_only) {
+      total = op->input_width * op->input_height * op->input_channels;
+   } else {
+      total = DIV_ROUND_UP(op->input_channels, FEATURE_ATOMIC_SIZE) *
+              op->input_width * op->input_height * FEATURE_ATOMIC_SIZE;
+   }
+   for (unsigned i = 0; i < total; i++) {
+      int v = (int)(int8_t)in[i] - in_zp;
+      int q = (int)roundf((float)v * scale) + out_zp;
+      if (q < -128) q = -128;
+      if (q > 127) q = 127;
+      out[i] = (uint8_t)(int8_t)q;
+   }
+}
+
 static void exec_avg_pool(struct rnpu_model *m, struct rnpu_operation *op)
 {
    unsigned in_w = op->input_width, in_h = op->input_height;
@@ -447,6 +471,7 @@ void rnpu_execute_sw_op(struct rnpu_model *m, unsigned op_index)
    case RNPU_OP_RESHAPE:        exec_reshape(m, op); break;
    case RNPU_OP_SOFTMAX:        exec_softmax(m, op); break;
    case RNPU_OP_FULLY_CONNECTED: exec_fully_connected(m, op); break;
+   case RNPU_OP_QUANTIZE:        exec_quantize(m, op); break;
    default: break;
    }
 }
