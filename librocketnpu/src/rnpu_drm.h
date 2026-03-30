@@ -37,5 +37,6 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count);
 /* Optional per-task enable_mask for RKNPU native cache mode.
  * Indexed by flat task index across all jobs. NULL = use default (0xf). */
 extern uint32_t *rnpu_native_enable_masks;
+extern uint32_t *rnpu_native_op_indices;
 
 #endif /* RNPU_DRM_H */

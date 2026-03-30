@@ -867,6 +867,7 @@ struct rnca_task_entry {
    uint32_t rc_offset_in_bo;
    uint32_t rc_amount;
    uint32_t enable_mask;
+   uint32_t op_idx;
 };
 
 /* DMA address registers that need patching in native mode */
@@ -876,9 +877,11 @@ static int is_native_dma_reg(uint16_t reg)
    case 0x0010: /* PC_BASE_ADDRESS */
    case 0x1070: /* CNA_WT_BASE_ADDR */
    case 0x1110: /* RDMA_SRC_BASE_ADDR */
-   case 0x1184: /* Unknown DMA */
+   /* 0x1184 — scalar value (zero point offsets like -128, -32640), not DMA */
    case 0x4020: /* DPU_DST_BASE_ADDR */
-   case 0x4080: /* DPU_OUT_CVT_OFFSET (sometimes DMA) */
+   /* 0x4080 = OUT_CVT_OFFSET — scalar value, NOT a DMA address.
+    * Values like 0xFFFFFF80 (-128) overlap BO ranges but aren't addresses. */
+   case 0x4110: /* WDMA_BASE_ADDR */
    case 0x5018: /* RDMA activation addr */
    case 0x5020: /* RDMA_BS_BASE_ADDR */
    case 0x5038: /* RDMA related */
@@ -925,53 +928,63 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
    }
    fclose(f);
 
-   /* CRITICAL: RKNN uses the wt+rc BO as a single contiguous region.
-    * The regcmd area is reused as scratch/activation during REFORMAT tasks.
-    * We MUST keep it as ONE BO to preserve the memory layout. */
-   uint32_t weight_size = hdr.rc_start_offset;
+   /* Allocate ALL BOs in RKNN's exact order and sizes.
+    * IOMMU deterministically assigns DMA addresses by allocation order+size,
+    * so matching RKNN's allocation pattern gives identical DMA addresses = zero patching. */
 
-   /* Create single combined BO for weight+regcmd */
-   rnpu_bo_create(m->fd, hdr.wt_rc_size, &m->weight_bo);
-   memcpy(m->weight_bo.map, wt_rc_data, hdr.wt_rc_size);
+   /* Free the activation BO that allocate_tensors created (wrong size/order) */
+   if (m->activation_bo.handle)
+      rnpu_bo_destroy(m->fd, &m->activation_bo);
 
-   /* Point regcmd_bo to the regcmd region within weight_bo (shared DMA space) */
+   struct rnpu_bo native_bos[8] = {{0}};
+
+   /* Allocate ALL BOs including BO[0] (task BO placeholder) to match IOMMU order */
+   for (unsigned b = 0; b < hdr.bo_count; b++) {
+      uint64_t sz = bo_table[b].orig_size;
+      if (sz == 0) continue;
+      rnpu_bo_create(m->fd, (uint32_t)sz, &native_bos[b]);
+      fprintf(stderr, "rnpu: native BO[%u]: dma=0x%llx size=%llu (orig dma=0x%llx)\n",
+              b, (unsigned long long)native_bos[b].dma_addr,
+              (unsigned long long)sz, (unsigned long long)bo_table[b].orig_dma);
+   }
+
+   /* Copy weight+regcmd data into the combined BO */
+   unsigned wt_rc_idx = hdr.wt_rc_bo_idx;
+   memcpy(native_bos[wt_rc_idx].map, wt_rc_data, hdr.wt_rc_size);
+
+   /* Set model's BO pointers */
+   m->weight_bo = native_bos[wt_rc_idx];
    m->regcmd_bo.handle = m->weight_bo.handle;
    m->regcmd_bo.dma_addr = m->weight_bo.dma_addr + hdr.rc_start_offset;
    m->regcmd_bo.map = (uint8_t *)m->weight_bo.map + hdr.rc_start_offset;
    m->regcmd_bo.size = hdr.wt_rc_size - hdr.rc_start_offset;
 
-   /* Patch DMA addresses in regcmd region */
-   uint64_t orig_wt_dma = hdr.wt_rc_dma;
-   uint64_t orig_wt_end = orig_wt_dma + hdr.wt_rc_size;
-
-   /* Allocate separate BOs matching RKNN's layout.
-    * RKNN uses: BO[0]=tasks, BO[1]=wt+rc (already loaded), BO[2]=activation,
-    * BO[3]=input, BO[4]=metadata. We need separate act + input BOs. */
-   struct rnpu_bo native_bos[8] = {{0}};
-   unsigned native_bo_count = hdr.bo_count;
-
-   for (unsigned b = 0; b < hdr.bo_count; b++) {
-      if (b == (unsigned)hdr.wt_rc_bo_idx || b == 0 /* task BO */) continue;
-      uint64_t sz = bo_table[b].orig_size;
-      if (sz == 0) continue;
-      rnpu_bo_create(m->fd, (uint32_t)sz, &native_bos[b]);
-   }
-
-   /* The activation BO must be the largest native BO (for I/O) */
+   /* Find and set activation BO (largest non-wt_rc BO) */
    unsigned act_bo_idx = 0;
-   for (unsigned b = 0; b < hdr.bo_count; b++) {
+   for (unsigned b = 1; b < hdr.bo_count; b++) {
+      if (b == wt_rc_idx) continue;
       if (native_bos[b].handle && bo_table[b].orig_size > bo_table[act_bo_idx].orig_size)
          act_bo_idx = b;
    }
-   /* Override model's activation_bo with the native one for I/O */
-   if (native_bos[act_bo_idx].handle) {
-      /* Free the previously allocated activation BO */
-      if (m->activation_bo.handle) {
-         munmap(m->activation_bo.map, m->activation_bo.size);
-         /* Note: not destroying since allocate_tensors created it */
-      }
+   if (native_bos[act_bo_idx].handle)
       m->activation_bo = native_bos[act_bo_idx];
+
+   /* Find input BO (matches input tensor size) */
+   unsigned input_pixels = m->tfl.tensors[m->tfl.graph_inputs[0]].shape[1] *
+                           m->tfl.tensors[m->tfl.graph_inputs[0]].shape[2] *
+                           m->tfl.tensors[m->tfl.graph_inputs[0]].shape[3];
+   for (unsigned b = 0; b < hdr.bo_count; b++) {
+      if (b == wt_rc_idx || b == act_bo_idx) continue;
+      if (native_bos[b].handle && bo_table[b].orig_size >= input_pixels &&
+          bo_table[b].orig_size <= input_pixels + 4096) {
+         m->native_input_bo = native_bos[b];
+         break;
+      }
    }
+
+   /* Patch DMA addresses in regcmd entries.
+    * If IOMMU gave us the same addresses, patching count will be 0. */
+   uint32_t weight_size = hdr.rc_start_offset;
 
    /* Patch DMA addresses in regcmd region.
     * For each task's entries, replace original BO addresses with new ones. */
@@ -1015,7 +1028,8 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
 
    /* Flush combined BO (weight_bo contains both weights and regcmds).
     * Don't flush regcmd_bo separately — it shares the same DMA handle. */
-   /* weight_bo already flushed above — no need to flush again */
+   /* Flush combined weight+regcmd BO to device */
+   rnpu_bo_fini(m->fd, &m->weight_bo);
 
    /* Replace all ops with a single HW operation containing all native tasks.
     * SW ops from TFLite are dropped — native mode handles everything. */
@@ -1053,25 +1067,40 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
       op->tasks[i].regcfg_amount = task_table[i].rc_amount + 4;
       op->tasks[i].regcfg_addr = (uint32_t)m->weight_bo.dma_addr + bo_off;
       op->tasks[i].enable_mask = task_table[i].enable_mask;
+      op->tasks[i].native_op_idx = task_table[i].op_idx;
    }
    op->regcmd_offset = 0;
 
-   /* Debug: print task 0 key registers after patching */
-   {
-      uint32_t rc_off = task_table[0].rc_offset_in_bo;
-      uint64_t *e0 = (uint64_t *)((uint8_t *)m->weight_bo.map + rc_off);
-      uint32_t amt = task_table[0].rc_amount + 4;
-      fprintf(stderr, "rnpu: task[0] regcmd at rc_bo+0x%x, %u entries:\n", rc_off, amt);
-      for (unsigned e = 0; e < amt; e++) {
-         uint16_t reg = e0[e] & 0xFFFF;
-         uint32_t val = (e0[e] >> 16) & 0xFFFFFFFF;
-         if (reg == 0x1070 || reg == 0x1110 || reg == 0x4020 || reg == 0x5020 || reg == 0x0010)
-            fprintf(stderr, "  [%3u] reg=0x%04x val=0x%08x\n", e, reg, val);
+   /* Validate: scan ALL regcmd entries for values that look like original DMA
+    * addresses (still in old BO ranges) — these are unpatched and will crash. */
+   unsigned unpatched = 0;
+   for (unsigned t = 0; t < hdr.task_count; t++) {
+      uint32_t rc_off = task_table[t].rc_offset_in_bo;
+      uint32_t rc_amt = task_table[t].rc_amount + 4;
+      uint64_t *entries = (uint64_t *)((uint8_t *)m->weight_bo.map + rc_off);
+      for (unsigned e = 0; e < rc_amt; e++) {
+         uint32_t val = (entries[e] >> 16) & 0xFFFFFFFF;
+         if (val < 0xfe000000 || val == 0xffffffff) continue;
+         /* Check if this value is in any ORIGINAL BO range */
+         for (unsigned b = 0; b < hdr.bo_count; b++) {
+            uint32_t bd = (uint32_t)bo_table[b].orig_dma;
+            uint32_t be = bd + (uint32_t)bo_table[b].orig_size;
+            if (val >= bd && val < be) {
+               uint16_t reg = entries[e] & 0xFFFF;
+               if (unpatched < 10)
+                  fprintf(stderr, "rnpu: UNPATCHED task[%u][%u] reg=0x%04x val=0x%08x "
+                          "→ orig BO[%u]+0x%x\n",
+                          t, e, reg, val, b, val - bd);
+               unpatched++;
+            }
+         }
       }
    }
+   if (unpatched)
+      fprintf(stderr, "rnpu: WARNING: %u unpatched DMA references!\n", unpatched);
 
-   fprintf(stderr, "rnpu: loaded native cache: %u tasks, %u bytes, %u DMA patched\n",
-           hdr.task_count, hdr.wt_rc_size, patched);
+   fprintf(stderr, "rnpu: loaded native cache: %u tasks, %u bytes, %u DMA patched, "
+           "%u unpatched\n", hdr.task_count, hdr.wt_rc_size, patched, unpatched);
 
    free(wt_rc_data);
    free(bo_table);
@@ -1194,6 +1223,7 @@ static void build_execution_plan(struct rnpu_model *m)
       m->jobs = calloc(total_jobs, sizeof(struct drm_rocket_job));
       m->hw_tasks = calloc(total_tasks, sizeof(struct drm_rocket_task));
       m->hw_task_enable_masks = calloc(total_tasks, sizeof(uint32_t));
+      m->hw_task_op_indices = calloc(total_tasks, sizeof(uint32_t));
       m->in_handles = calloc(total_jobs * handles_per_job, sizeof(uint32_t));
       m->out_handles = calloc(total_jobs, sizeof(uint32_t));
    }
@@ -1215,6 +1245,8 @@ static void build_execution_plan(struct rnpu_model *m)
                m->hw_tasks[ti].regcmd_count = op->tasks[t].regcfg_amount;
                if (m->hw_task_enable_masks)
                   m->hw_task_enable_masks[ti] = op->tasks[t].enable_mask;
+               if (m->hw_task_op_indices)
+                  m->hw_task_op_indices[ti] = op->tasks[t].native_op_idx;
                ti++;
                merged_task_count++;
             }
@@ -1779,6 +1811,13 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
       uint8_t *dst = act + m->tensors[m->graph_input_tensor].offset;
       for (unsigned i = 0; i < total; i++)
          dst[i] = src[i] - 0x80;
+   } else if (m->native_input_bo.handle) {
+      /* Native cache mode: write raw input directly to separate input BO.
+       * RKNN's first conv uses ARGB_IN=10 mode — it reads raw uint8 NHWC
+       * with hardware CVT (no NPU-format conversion needed). */
+      size_t inp_sz = first->input_width * first->input_height * first->input_channels;
+      memcpy(m->native_input_bo.map, input, inp_sz);
+      rnpu_bo_fini(m->fd, &m->native_input_bo);
    } else {
       rnpu_convert_input(act + m->tensors[m->graph_input_tensor].offset,
                          input,
@@ -1856,6 +1895,7 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
          } else {
             /* Normal mode: submit all jobs in segment at once */
             rnpu_native_enable_masks = m->hw_task_enable_masks;
+            rnpu_native_op_indices = m->hw_task_op_indices;
             int ret = rnpu_submit(m->fd, &m->jobs[hw_job_idx], seg->job_count);
             if (ret) {
                fprintf(stderr, "rnpu: segment submit failed (%u jobs)\n", seg->job_count);

@@ -127,18 +127,21 @@ def main():
     task_bo_data = open(task_bo_file, "rb").read()
     TASK_SIZE = 40  # struct rknpu_task: 8*u32 + 1*u64
     enable_masks = []
+    op_indices = []
     for t in range(len(tasks)):
         off = t * TASK_SIZE
         if off + TASK_SIZE <= len(task_bo_data):
             fields = struct.unpack_from("<IIIIII II Q", task_bo_data, off)
             enable_masks.append(fields[2])  # enable_mask
+            op_indices.append(fields[1])    # op_idx
         else:
-            enable_masks.append(0x1d)  # default
+            enable_masks.append(0x1d)
+            op_indices.append(0)
 
     task_table = b""
     for i, (rc_addr, rc_amt) in enumerate(tasks):
         rc_off = rc_addr - wt_rc_dma
-        task_table += struct.pack("<III", rc_off, rc_amt, enable_masks[i])
+        task_table += struct.pack("<IIII", rc_off, rc_amt, enable_masks[i], op_indices[i])
 
     with open(out_path, "wb") as f:
         f.write(header)

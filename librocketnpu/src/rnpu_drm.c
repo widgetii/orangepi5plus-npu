@@ -171,6 +171,7 @@ struct rknpu_action { uint32_t flags; uint32_t value; };
 
 enum rnpu_driver_type rnpu_active_driver = RNPU_DRIVER_ROCKET;
 uint32_t *rnpu_native_enable_masks = NULL;
+uint32_t *rnpu_native_op_indices = NULL;
 
 /* ======================================================================
  * BO operations — dual-driver
@@ -393,7 +394,8 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
             &((struct drm_rocket_task *)(uintptr_t)job->tasks)[t];
          struct rknpu_task *tp = &task[t];
          memset(tp, 0, sizeof(*tp));
-         tp->op_idx = j;
+         tp->op_idx = (rnpu_native_op_indices && rnpu_native_op_indices[global_task_idx])
+                      ? rnpu_native_op_indices[global_task_idx] : j;
          uint32_t emask = (rnpu_native_enable_masks && rnpu_native_enable_masks[global_task_idx])
                           ? rnpu_native_enable_masks[global_task_idx] : 0xf;
          tp->enable_mask = emask;
