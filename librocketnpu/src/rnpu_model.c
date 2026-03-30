@@ -1826,8 +1826,15 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
             m->graph_output_tensors[i] = last_op_out;
          } else if (ti < m->tensor_count && m->tensors[ti].size > 0) {
             m->graph_output_tensors[i] = ti;
+            /* Clamp tensor offset to activation BO bounds to prevent segfault.
+             * RKNN's activation BO may be smaller than TFLite's layout. */
+            if (m->tensors[ti].offset + m->tensors[ti].size > m->activation_bo.size) {
+               m->tensors[ti].offset = 0;
+               fprintf(stderr, "rnpu: native output t%u: offset clamped to 0 "
+                       "(exceeds act BO %u)\n", ti, m->activation_bo.size);
+            }
          } else {
-            /* Fallback: find first 1×1×C tensor matching output channels */
+            /* Fallback: find first matching tensor */
             const struct rnpu_tfl_tensor *t = &m->tfl.tensors[ti];
             unsigned target_c = t->shape[t->shape_len - 1];
             for (unsigned j = 0; j < m->tensor_count; j++) {
@@ -1840,9 +1847,9 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
             }
          }
          unsigned oi = m->graph_output_tensors[i];
-         fprintf(stderr, "rnpu: native output tensor: t%u (%ux%ux%u)\n",
+         fprintf(stderr, "rnpu: native output tensor: t%u (%ux%ux%u) at +0x%x\n",
                  oi, m->tensors[oi].width, m->tensors[oi].height,
-                 m->tensors[oi].channels);
+                 m->tensors[oi].channels, m->tensors[oi].offset);
       }
    } else {
       for (unsigned i = 0; i < m->output_count; i++) {
