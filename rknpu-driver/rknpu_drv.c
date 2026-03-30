@@ -44,6 +44,8 @@
 #include "rknpu_gem.h"
 /* devfreq stripped for out-of-tree build */
 #include "rknpu_iommu.h"
+#include "rknpu_job.h"
+#include "rknpu_trace.h"
 
 #ifdef CONFIG_ROCKCHIP_RKNPU_DRM_GEM
 #include <drm/drm_device.h>
@@ -1642,11 +1644,13 @@ static struct platform_driver rknpu_driver = {
 
 static int rknpu_trace_init_driver(void)
 {
+	rknpu_trace_init();
 	return platform_driver_register(&rknpu_driver);
 }
 
 static void rknpu_trace_exit_driver(void)
 {
+	rknpu_trace_exit();
 	platform_driver_unregister(&rknpu_driver);
 }
 

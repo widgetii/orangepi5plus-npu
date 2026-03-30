@@ -17,12 +17,18 @@
 #include "rknpu_mem.h"
 #include "rknpu_iommu.h"
 #include "rknpu_job.h"
+#include "rknpu_trace.h"
 
 #define _REG_READ(base, offset) readl(base + (offset))
 #define _REG_WRITE(base, value, offset) writel(value, base + (offset))
 
 #define REG_READ(offset) _REG_READ(rknpu_core_base, offset)
-#define REG_WRITE(value, offset) _REG_WRITE(rknpu_core_base, value, offset)
+#define REG_WRITE(value, offset) do { \
+    uint32_t __v = (value), __o = (offset); \
+    _REG_WRITE(rknpu_core_base, __v, __o); \
+    if (rknpu_trace_enabled) \
+        trace_printk("W 0x%04x 0x%08x\n", __o, __v); \
+} while (0)
 
 static int rknpu_wait_core_index(int core_mask)
 {

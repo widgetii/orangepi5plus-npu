@@ -9,7 +9,7 @@ KDIR ?= /lib/modules/$(KVER)/build
 obj-m := rknpu_trace.o
 
 rknpu_trace-y := rknpu_drv.o rknpu_job.o rknpu_gem.o rknpu_fence.o \
-                 rknpu_iommu.o rknpu_mem.o rknpu_mm.o rknpu_reset.o
+                 rknpu_iommu.o rknpu_mem.o rknpu_mm.o rknpu_reset.o rknpu_tracing.o
 
 ccflags-y := -I$(src)/include \
              -DCONFIG_ROCKCHIP_RKNPU_DRM_GEM \
