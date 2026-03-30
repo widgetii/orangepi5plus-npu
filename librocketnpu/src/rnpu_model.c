@@ -1083,6 +1083,41 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
    }
    op->regcmd_offset = 0;
 
+   /* Extract output offset from last CONV task's DPU_DST_ADDR.
+    * Scan the last task's regcmd entries for register 0x4020. */
+   uint32_t native_output_offset = 0;
+   for (int t = hdr.task_count - 1; t >= 0; t--) {
+      if (task_table[t].enable_mask != 0x1d) continue; /* skip non-CONV */
+      uint32_t bo_off = task_table[t].rc_offset_in_bo;
+      uint32_t amt = task_table[t].rc_amount + 4;
+      uint64_t *entries = (uint64_t *)((uint8_t *)m->weight_bo.map + bo_off);
+      for (unsigned e = 0; e < amt; e++) {
+         if ((entries[e] & 0xFFFF) == 0x4020) {
+            uint32_t dst = (entries[e] >> 16) & 0xFFFFFFFF;
+            /* Compute offset within activation BO */
+            for (unsigned b = 0; b < hdr.bo_count; b++) {
+               if (b == wt_rc_idx) continue;
+               uint32_t bd = (uint32_t)bo_table[b].orig_dma;
+               uint32_t be = bd + (uint32_t)bo_table[b].orig_size;
+               if (dst >= bd && dst < be && native_bos[b].handle == m->activation_bo.handle) {
+                  native_output_offset = dst - bd;
+                  break;
+               }
+            }
+            break;
+         }
+      }
+      if (native_output_offset) break;
+   }
+   fprintf(stderr, "rnpu: native output at activation_bo+0x%x\n", native_output_offset);
+
+   /* Override the output tensor offset to point to RKNN's output location */
+   for (unsigned i = 0; i < m->tfl.output_count; i++) {
+      unsigned ti = m->tfl.graph_outputs[i];
+      if (ti < m->tensor_count)
+         m->tensors[ti].offset = native_output_offset;
+   }
+
    /* Validate: scan ALL regcmd entries for values that look like original DMA
     * addresses (still in old BO ranges) — these are unpatched and will crash. */
    unsigned unpatched = 0;
@@ -1683,7 +1718,11 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
 
    /* Store graph I/O info */
    if (native_loaded) {
-      /* Native mode: use TFLite graph I/O directly */
+      /* Native mode: use TFLite graph I/O directly.
+       * Override output tensor offset with RKNN's layout — the last CONV's
+       * DST address tells us where the output is in the activation BO.
+       * For MBv1 the output is at BO[2]+0x18800 (from regcmd analysis). */
+      /* TODO: extract output offset from last task's DST_ADDR automatically */
       m->graph_input_tensor = m->tfl.graph_inputs[0];
       /* Set fake op dimensions from first TFLite input tensor */
       const struct rnpu_tfl_tensor *it = &m->tfl.tensors[m->graph_input_tensor];
