@@ -1135,20 +1135,39 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
     * we set offset=0 and let rnpu_convert_output handle the NPU format. */
    fprintf(stderr, "rnpu: native output at activation_bo+0x0 (FC scatter base)\n");
 
-   /* For native mode: RKNN's HW pipeline already computes AVG_POOL and FC.
-    * The output tensor (pre-softmax, 1×1×1001) is at the native_output_offset.
-    * Override the graph output tensor to read from there directly.
-    * Skip SW ops entirely — classification works without softmax. */
+   /* For native mode: RKNN's HW pipeline computes everything through FC.
+    * Keep only SOFTMAX from the SW ops (drop AVG_POOL, RESHAPE which
+    * are already handled by HW). Set SOFTMAX input tensor offset to
+    * the FC output location (act+0x0). */
    if (m->op_count > 1) {
-      /* Drop all SW ops — native HW handles everything */
+      /* Find and keep only the SOFTMAX op */
+      int softmax_idx = -1;
       for (unsigned i = 1; i < m->op_count; i++) {
-         struct rnpu_operation *swop = &m->ops[i];
-         if (swop->type == RNPU_OP_CONCAT) {
-            free(swop->sw.concat.input_tensors);
-            free(swop->sw.concat.input_channels_arr);
+         if (m->ops[i].type == RNPU_OP_SOFTMAX) {
+            softmax_idx = i;
+            break;
          }
       }
-      m->op_count = 1;
+      if (softmax_idx > 0) {
+         /* Move SOFTMAX to position 1, drop everything else */
+         if (softmax_idx > 1)
+            m->ops[1] = m->ops[softmax_idx];
+         m->op_count = 2;
+         /* Set SOFTMAX input tensor offset to FC output (act+0x0) */
+         unsigned soft_in = m->ops[1].input_tensor;
+         m->tensors[soft_in].offset = 0;
+         /* Also fix output tensor to have the right width for 1D output */
+         op->output_tensor = soft_in;
+         op->output_width = m->ops[1].input_width;
+         op->output_height = m->ops[1].input_height;
+         op->output_channels = m->ops[1].input_channels;
+         fprintf(stderr, "rnpu: native: SOFTMAX on t%u (%ux%ux%u) at act+0x0\n",
+                 soft_in, m->ops[1].input_width, m->ops[1].input_height,
+                 m->ops[1].input_channels);
+      } else {
+         /* No SOFTMAX — just read FC output directly */
+         m->op_count = 1;
+      }
    }
 
    /* Validate: scan ALL regcmd entries for values that look like original DMA
@@ -1777,31 +1796,36 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
    m->output_count = m->tfl.output_count;
    m->graph_output_tensors = calloc(m->output_count, sizeof(unsigned));
    if (native_loaded) {
-      /* Native mode: find the FC/classification output tensor.
-       * Search for a 1×1×C tensor where C matches the model output. */
-      unsigned target_c = 0;
+      /* Native mode: if SOFTMAX is running as SW op, use its output tensor.
+       * Otherwise use the FC output directly from the HW pipeline. */
+      unsigned last_op_out = 0;
+      if (m->op_count > 1)
+         last_op_out = m->ops[m->op_count - 1].output_tensor;
+
       for (unsigned i = 0; i < m->tfl.output_count; i++) {
          unsigned ti = m->tfl.graph_outputs[i];
-         const struct rnpu_tfl_tensor *t = &m->tfl.tensors[ti];
-         target_c = t->shape[t->shape_len - 1];
-      }
-      /* Find the tensor with matching channel count and 1×1 spatial */
-      for (unsigned i = 0; i < m->tfl.output_count; i++) {
-         unsigned best = 0;
-         for (unsigned ti = 0; ti < m->tensor_count; ti++) {
-            if (m->tensors[ti].width == 1 && m->tensors[ti].height == 1 &&
-                m->tensors[ti].channels == target_c && m->tensors[ti].size > 0) {
-               best = ti;
-               break; /* take the first match (usually the BiasAdd/FC output) */
+         if (last_op_out && ti < m->tensor_count) {
+            /* Use SOFTMAX output tensor */
+            m->graph_output_tensors[i] = last_op_out;
+         } else if (ti < m->tensor_count && m->tensors[ti].size > 0) {
+            m->graph_output_tensors[i] = ti;
+         } else {
+            /* Fallback: find first 1×1×C tensor matching output channels */
+            const struct rnpu_tfl_tensor *t = &m->tfl.tensors[ti];
+            unsigned target_c = t->shape[t->shape_len - 1];
+            for (unsigned j = 0; j < m->tensor_count; j++) {
+               if (m->tensors[j].width == 1 && m->tensors[j].height == 1 &&
+                   m->tensors[j].channels == target_c && m->tensors[j].size > 0) {
+                  m->graph_output_tensors[i] = j;
+                  m->tensors[j].offset = 0;
+                  break;
+               }
             }
          }
-         m->graph_output_tensors[i] = best;
-         /* Override the tensor offset to the native HW output location.
-          * FC output starts at act+0x0 for per-channel scatter pattern. */
-         m->tensors[best].offset = 0;
-         fprintf(stderr, "rnpu: native output tensor: t%u (%ux%ux%u) at act+0x%x\n",
-                 best, m->tensors[best].width, m->tensors[best].height,
-                 m->tensors[best].channels, m->tensors[best].offset);
+         unsigned oi = m->graph_output_tensors[i];
+         fprintf(stderr, "rnpu: native output tensor: t%u (%ux%ux%u)\n",
+                 oi, m->tensors[oi].width, m->tensors[oi].height,
+                 m->tensors[oi].channels);
       }
    } else {
       for (unsigned i = 0; i < m->output_count; i++) {
