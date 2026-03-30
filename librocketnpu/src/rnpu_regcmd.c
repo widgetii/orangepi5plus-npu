@@ -1105,10 +1105,11 @@ static unsigned fill_brdma_per_channel_regcmd(const struct rnpu_model *model,
                                DPU_BS_OW_CFG_SIZE_E_1(1) |
                                DPU_BS_OW_CFG_SIZE_E_0(1));
    }
-   /* OW_OP: weight zero-point correction. RKNN uses 0 for BRDMA ops
-    * but our BRDMA path still needs it for correct output. */
+   /* BS_OW_OP: RKNN uses 0 for all BRDMA per-channel ops.
+    * When using RKNN BRDMA data (biases computed for OW_OP=0), set 0.
+    * Without RKNN data, keep OC-1 for backward compatibility. */
    EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(
-      op->fc_1x1 ? 0 : task->output_channels - 1));
+      (op->fc_1x1 || op->rknn_brdma_override) ? 0 : task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_0, DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
    EMIT(REG_DPU_WDMA_SIZE_1, DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
                               DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
