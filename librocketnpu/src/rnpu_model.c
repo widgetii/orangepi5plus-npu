@@ -1287,6 +1287,10 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
          }
          break;
       }
+      case TFLITE_OP_QUANTIZE:
+         lower_sw_op(m, top, op, RNPU_OP_QUANTIZE);
+         m->op_count++;
+         break;
       case TFLITE_OP_SHAPE:
       case TFLITE_OP_STRIDED_SLICE:
       case TFLITE_OP_PACK:
@@ -1439,6 +1443,7 @@ static const char *op_type_name(enum rnpu_op_type t, bool dw)
    case RNPU_OP_RESHAPE: return "RESHAPE";
    case RNPU_OP_SOFTMAX: return "SOFTMAX";
    case RNPU_OP_FULLY_CONNECTED: return "FC";
+   case RNPU_OP_QUANTIZE: return "QUANTIZE";
    default: return "?";
    }
 }

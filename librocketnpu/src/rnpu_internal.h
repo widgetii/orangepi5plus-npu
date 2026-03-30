@@ -122,6 +122,7 @@ enum rnpu_tfl_opcode {
    TFLITE_OP_SHAPE = 77,
    TFLITE_OP_PACK = 83,
    TFLITE_OP_RESIZE_NEAREST_NEIGHBOR = 97,
+   TFLITE_OP_QUANTIZE = 114,
 };
 
 struct rnpu_tfl_op {
@@ -172,6 +173,7 @@ enum rnpu_op_type {
    RNPU_OP_RESHAPE,
    RNPU_OP_SOFTMAX,
    RNPU_OP_FULLY_CONNECTED,
+   RNPU_OP_QUANTIZE,
 };
 
 struct rnpu_split_task {
