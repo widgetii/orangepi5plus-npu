@@ -242,6 +242,111 @@ int ioctl(int fd, unsigned long request, ...) {
                 submit_count, s->flags, s->task_number,
                 (unsigned long long)s->task_obj_addr, s->core_mask);
 
+        /* Mode DUMP_ALL: Dump every BO + task array + per-task regcmd to /tmp/rknn_dump/ */
+        if (getenv("DUMP_ALL_BOS")) {
+            system("mkdir -p /tmp/rknn_dump");
+
+            /* Dump BO table metadata */
+            char mpath[128];
+            snprintf(mpath, sizeof(mpath), "/tmp/rknn_dump/submit_%d.txt", submit_count);
+            FILE *mf = fopen(mpath, "w");
+            if (mf) {
+                fprintf(mf, "submit=%d flags=0x%x tasks=%u task_obj=0x%llx core_mask=0x%x\n",
+                        submit_count, s->flags, s->task_number,
+                        (unsigned long long)s->task_obj_addr, s->core_mask);
+                fprintf(mf, "bo_count=%d\n", bo_count);
+                for (int i = 0; i < bo_count; i++)
+                    fprintf(mf, "bo[%d] handle=%u dma=0x%llx obj=0x%llx size=%llu\n",
+                            i, bo_table[i].handle,
+                            (unsigned long long)bo_table[i].dma,
+                            (unsigned long long)bo_table[i].obj,
+                            (unsigned long long)bo_table[i].size);
+                fclose(mf);
+            }
+
+            /* Dump every BO's contents */
+            for (int i = 0; i < bo_count; i++) {
+                struct rknpu_mem_map bm = { .handle = bo_table[i].handle };
+                if (real_ioctl(fd, IOCTL_MEM_MAP, &bm) != 0) continue;
+                void *map = mmap(NULL, bo_table[i].size, PROT_READ, MAP_SHARED, fd, bm.offset);
+                if (!map || map == MAP_FAILED) continue;
+
+                snprintf(mpath, sizeof(mpath), "/tmp/rknn_dump/sub%d_bo_%03d_%lluB.bin",
+                         submit_count, i, (unsigned long long)bo_table[i].size);
+                FILE *bf = fopen(mpath, "wb");
+                if (bf) {
+                    fwrite(map, 1, bo_table[i].size, bf);
+                    fclose(bf);
+                }
+                munmap(map, bo_table[i].size);
+            }
+
+            /* Dump task array */
+            uint64_t task_obj = s->task_obj_addr;
+            uint32_t task_handle = 0;
+            uint64_t task_bo_size = 0;
+            for (int i = 0; i < bo_count; i++) {
+                if (bo_table[i].obj == task_obj) {
+                    task_handle = bo_table[i].handle;
+                    task_bo_size = bo_table[i].size;
+                    break;
+                }
+            }
+            if (task_handle) {
+                struct rknpu_mem_map tm = { .handle = task_handle };
+                void *task_map = NULL;
+                if (real_ioctl(fd, IOCTL_MEM_MAP, &tm) == 0)
+                    task_map = mmap(NULL, task_bo_size, PROT_READ, MAP_SHARED, fd, tm.offset);
+                if (task_map && task_map != MAP_FAILED) {
+                    struct rknpu_task *tasks = (struct rknpu_task *)task_map;
+                    snprintf(mpath, sizeof(mpath), "/tmp/rknn_dump/sub%d_tasks.txt", submit_count);
+                    FILE *tf = fopen(mpath, "w");
+                    if (tf) {
+                        for (uint32_t t = 0; t < s->task_number; t++) {
+                            fprintf(tf, "task[%u] regcmd_addr=0x%llx regcfg_amount=%u "
+                                    "flags=0x%x op_idx=%u\n",
+                                    t, (unsigned long long)tasks[t].regcmd_addr,
+                                    tasks[t].regcfg_amount,
+                                    tasks[t].flags, tasks[t].op_idx);
+
+                            /* Find regcmd BO and dump decoded registers */
+                            uint64_t rc_addr = tasks[t].regcmd_addr;
+                            for (int bi = 0; bi < bo_count; bi++) {
+                                if (rc_addr >= bo_table[bi].dma &&
+                                    rc_addr < bo_table[bi].dma + bo_table[bi].size) {
+                                    struct rknpu_mem_map rm = { .handle = bo_table[bi].handle };
+                                    void *rc_map = NULL;
+                                    if (real_ioctl(fd, IOCTL_MEM_MAP, &rm) == 0)
+                                        rc_map = mmap(NULL, bo_table[bi].size, PROT_READ,
+                                                      MAP_SHARED, fd, rm.offset);
+                                    if (rc_map && rc_map != MAP_FAILED) {
+                                        uint64_t off = rc_addr - bo_table[bi].dma;
+                                        uint64_t *entries = (uint64_t *)((uint8_t *)rc_map + off);
+                                        unsigned total = tasks[t].regcfg_amount + 4;
+                                        for (unsigned e = 0; e < total; e++) {
+                                            uint16_t reg = entries[e] & 0xFFFF;
+                                            uint32_t val = (entries[e] >> 16) & 0xFFFFFFFF;
+                                            uint16_t tgt = (entries[e] >> 48) & 0xFFFF;
+                                            fprintf(tf, "  [%3u] 0x%04x 0x%04x 0x%08x\n",
+                                                    e, tgt, reg, val);
+                                        }
+                                        munmap(rc_map, bo_table[bi].size);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        fclose(tf);
+                    }
+                    munmap(task_map, task_bo_size);
+                }
+            }
+
+            fprintf(stderr, "DUMP_ALL: submit %d: %d BOs, %u tasks → /tmp/rknn_dump/\n",
+                    submit_count, bo_count, s->task_number);
+            return real_ioctl(fd, request, arg);
+        }
+
         /* Mode BRDMA: Dump BRDMA data (bias+scale) from each task's BS_BASE_ADDR */
         if (submit_count == 1 && getenv("DUMP_BRDMA")) {
             uint64_t task_obj = s->task_obj_addr;
