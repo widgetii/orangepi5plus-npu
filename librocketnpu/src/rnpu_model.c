@@ -1102,8 +1102,21 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
       }
    }
 
-   /* Flush combined BO (weight_bo contains both weights and regcmds).
-    * Don't flush regcmd_bo separately — it shares the same DMA handle. */
+   /* Patch task BO regcmd_addr fields (point into weight+regcmd BO) */
+   if (m->native_task_bo_data && patched > 0) {
+      struct {
+         uint32_t f[8];
+         uint64_t regcmd_addr;
+      } __attribute__((packed)) *tasks = (void *)m->native_task_bo_data;
+      uint32_t wt_orig = (uint32_t)bo_table[hdr.wt_rc_bo_idx].orig_dma;
+      uint32_t wt_new = (uint32_t)m->weight_bo.dma_addr;
+      for (unsigned t = 0; t < hdr.task_count; t++) {
+         uint32_t addr = (uint32_t)tasks[t].regcmd_addr;
+         if (addr >= wt_orig && addr < wt_orig + hdr.wt_rc_size)
+            tasks[t].regcmd_addr = (uint64_t)(wt_new + (addr - wt_orig));
+      }
+   }
+
    /* Flush combined weight+regcmd BO to device */
    rnpu_bo_fini(m->fd, &m->weight_bo);
 
@@ -1234,36 +1247,48 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
       }
    }
 
-   /* Validate: scan ALL regcmd entries for values that look like original DMA
-    * addresses (still in old BO ranges) — these are unpatched and will crash. */
-   unsigned unpatched = 0;
-   for (unsigned t = 0; t < hdr.task_count; t++) {
-      uint32_t rc_off = task_table[t].rc_offset_in_bo;
-      uint32_t rc_amt = task_table[t].rc_amount + 4;
-      uint64_t *entries = (uint64_t *)((uint8_t *)m->weight_bo.map + rc_off);
-      for (unsigned e = 0; e < rc_amt; e++) {
-         uint32_t val = (entries[e] >> 16) & 0xFFFFFFFF;
-         if (val < 0xfe000000 || val == 0xffffffff) continue;
-         /* Check if this value is in any ORIGINAL BO range */
-         for (unsigned b = 0; b < hdr.bo_count; b++) {
-            uint32_t bd = (uint32_t)bo_table[b].orig_dma;
-            uint32_t be = bd + (uint32_t)bo_table[b].orig_size;
-            if (val >= bd && val < be) {
-               uint16_t reg = entries[e] & 0xFFFF;
-               if (unpatched < 10)
-                  fprintf(stderr, "rnpu: UNPATCHED task[%u][%u] reg=0x%04x val=0x%08x "
-                          "→ orig BO[%u]+0x%x\n",
-                          t, e, reg, val, b, val - bd);
-               unpatched++;
+   /* Validate: check DMA registers for stale original addresses.
+    * Only flag registers in is_native_dma_reg that reference original BO ranges
+    * when orig_dma != new_dma (addresses changed). */
+   unsigned stale_dma = 0;
+   bool addrs_match = true;
+   for (unsigned b = 0; b < hdr.bo_count; b++) {
+      uint32_t new_dma = (b == (unsigned)hdr.wt_rc_bo_idx)
+         ? (uint32_t)m->weight_bo.dma_addr
+         : (native_bos[b].handle ? (uint32_t)native_bos[b].dma_addr : 0);
+      if (new_dma && new_dma != (uint32_t)bo_table[b].orig_dma)
+         addrs_match = false;
+   }
+   if (!addrs_match) {
+      for (unsigned t = 0; t < hdr.task_count; t++) {
+         uint32_t rc_off = task_table[t].rc_offset_in_bo;
+         uint32_t rc_amt = task_table[t].rc_amount + 4;
+         uint64_t *entries = (uint64_t *)((uint8_t *)m->weight_bo.map + rc_off);
+         for (unsigned e = 0; e < rc_amt; e++) {
+            uint16_t reg = entries[e] & 0xFFFF;
+            if (!is_native_dma_reg(reg)) continue;
+            uint32_t val = (entries[e] >> 16) & 0xFFFFFFFF;
+            for (unsigned b = 0; b < hdr.bo_count; b++) {
+               uint32_t bd = (uint32_t)bo_table[b].orig_dma;
+               uint32_t be = bd + (uint32_t)bo_table[b].orig_size;
+               if (val >= bd && val < be) {
+                  if (stale_dma < 5)
+                     fprintf(stderr, "rnpu: STALE DMA task[%u][%u] reg=0x%04x "
+                             "val=0x%08x → orig BO[%u]+0x%x\n",
+                             t, e, reg, val, b, val - bd);
+                  stale_dma++;
+               }
             }
          }
       }
+      if (stale_dma)
+         fprintf(stderr, "rnpu: ERROR: %u DMA registers still reference original "
+                 "addresses after patching!\n", stale_dma);
    }
-   if (unpatched)
-      fprintf(stderr, "rnpu: WARNING: %u unpatched DMA references!\n", unpatched);
 
-   fprintf(stderr, "rnpu: loaded native cache: %u tasks, %u bytes, %u DMA patched, "
-           "%u unpatched\n", hdr.task_count, hdr.wt_rc_size, patched, unpatched);
+   fprintf(stderr, "rnpu: loaded native cache: %u tasks, %u bytes, %u DMA patched%s\n",
+           hdr.task_count, hdr.wt_rc_size, patched,
+           addrs_match ? " (addresses match, no patching needed)" : "");
 
    free(wt_rc_data);
    free(bo_table);
@@ -2032,28 +2057,25 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
                          first->input_channels, first->input_zero_point);
    }
 
-   /* Flush input to NPU */
-   rnpu_bo_fini(m->fd, &m->activation_bo);
+   /* Flush input to NPU. Skip activation BO flush in native mode —
+    * the NPU reads from the separate native_input_bo (already flushed above). */
+   if (!m->native_input_bo.handle)
+      rnpu_bo_fini(m->fd, &m->activation_bo);
 
-   /* Debug: per-op output tracing and tensor dump */
-   bool trace_ops = getenv("RNPU_TRACE_OPS") != NULL;
-   const char *dump_dir = getenv("RNPU_DUMP_OPS");
-   if (dump_dir) trace_ops = true;
-
-   /* RNPU_DEBUG: structured per-op diagnostics for board vs QEMU comparison.
-    * Level 1: per-op fingerprint (CRC + first bytes)
-    * Level 2: + raw NPU-format bytes
-    * Level 3: + regcmd register values, weight/bias checksums */
-   int debug_level = 0;
-   {
+   /* Debug flags — cached after first invoke to avoid per-invoke getenv */
+   static int trace_ops_cached = -1, debug_level_cached = -1, debug_per_op_cached = -1;
+   if (trace_ops_cached < 0) {
+      const char *dump_dir = getenv("RNPU_DUMP_OPS");
+      trace_ops_cached = getenv("RNPU_TRACE_OPS") != NULL || dump_dir != NULL;
       const char *dbg = getenv("RNPU_DEBUG");
-      if (dbg) debug_level = atoi(dbg);
-      if (debug_level < 0) debug_level = 0;
+      debug_level_cached = dbg ? atoi(dbg) : 0;
+      if (debug_level_cached < 0) debug_level_cached = 0;
+      debug_per_op_cached = getenv("RNPU_DEBUG_PER_OP") != NULL;
    }
-
-   /* RNPU_DEBUG_PER_OP: submit one job at a time and read output CRC
-    * immediately, avoiding activation BO reuse corrupting earlier tensors. */
-   bool debug_per_op = getenv("RNPU_DEBUG_PER_OP") != NULL;
+   bool trace_ops = trace_ops_cached;
+   const char *dump_dir = trace_ops ? getenv("RNPU_DUMP_OPS") : NULL;
+   int debug_level = debug_level_cached;
+   bool debug_per_op = debug_per_op_cached;
 
    /* Execute segments — one job per CONV operation */
    unsigned hw_job_idx = 0;
@@ -2112,7 +2134,9 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
                fprintf(stderr, "rnpu: segment submit failed (%u jobs)\n", seg->job_count);
                return ret;
             }
-            rnpu_bo_prep(m->fd, &m->activation_bo);
+            /* Skip activation BO sync if outputs are in separate native BOs */
+            if (!m->native_output_bo_count)
+               rnpu_bo_prep(m->fd, &m->activation_bo);
          }
 
          /* Apply per-axis corrections (skip for BRDMA per-channel ops —
