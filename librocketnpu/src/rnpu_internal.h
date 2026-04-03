@@ -349,6 +349,8 @@ struct rnpu_model {
    struct rnpu_bo native_input_bo;  /* Native cache: separate input BO */
    struct rnpu_bo native_output_bos[8];  /* Native cache: per-output BOs */
    unsigned native_output_bo_count;
+   unsigned native_output_w_pad[8];     /* NC1HWC2 padded width per output */
+   unsigned native_output_h_pad[8];     /* NC1HWC2 padded height per output */
 
    /* Native cache submit segments (RKNN's exact submit pattern) */
    struct {
