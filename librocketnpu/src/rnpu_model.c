@@ -1029,9 +1029,30 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
          if (used) continue;
          if (bo_table[b].orig_size >= out_bytes &&
              bo_table[b].orig_size <= out_bytes * 2) {
-            m->native_output_bos[m->native_output_bo_count++] = native_bos[b];
-            fprintf(stderr, "rnpu: native output %u → BO[%u] (%u bytes)\n",
-                    i, b, (unsigned)bo_table[b].orig_size);
+            unsigned oi = m->native_output_bo_count++;
+            m->native_output_bos[oi] = native_bos[b];
+            /* Compute NC1HWC2 padded dims (C2=8 for int8) */
+            unsigned out_c = t->shape[t->shape_len - 1];
+            unsigned out_h = t->shape_len >= 4 ? t->shape[1] : 1;
+            unsigned out_w = t->shape_len >= 4 ? t->shape[2] : 1;
+            unsigned c_pad = ((out_c + 7) / 8) * 8;
+            unsigned total_px = (unsigned)bo_table[b].orig_size / c_pad;
+            /* Find smallest W_pad >= W that evenly divides total_px
+             * and gives H_pad >= H. Try multiples of 8, 16, 32. */
+            unsigned wp = out_w, hp = 0;
+            for (unsigned align = 8; align <= 64; align *= 2) {
+               unsigned try_wp = ((out_w + align - 1) / align) * align;
+               if (try_wp > 0 && total_px % try_wp == 0) {
+                  unsigned try_hp = total_px / try_wp;
+                  if (try_hp >= out_h) { wp = try_wp; hp = try_hp; break; }
+               }
+            }
+            if (hp == 0) { wp = out_w; hp = total_px / out_w; }
+            m->native_output_w_pad[oi] = wp;
+            m->native_output_h_pad[oi] = hp;
+            fprintf(stderr, "rnpu: native output %u → BO[%u] (%u bytes, %ux%ux%u pad %ux%u)\n",
+                    i, b, (unsigned)bo_table[b].orig_size,
+                    out_w, out_h, out_c, wp, hp);
             break;
          }
       }
@@ -2253,9 +2274,10 @@ int rnpu_get_output(rnpu_model_t *m, int idx, void *out, size_t max_size)
    if ((unsigned)idx < m->native_output_bo_count && m->native_output_bos[idx].handle) {
       rnpu_bo_prep(m->fd, &m->native_output_bos[idx]);
       uint8_t *data = (uint8_t *)m->native_output_bos[idx].map;
-      /* REFORMAT output is already linear NHWC int8 — just copy + convert to uint8 */
-      for (unsigned i = 0; i < nhwc_size; i++)
-         ((uint8_t *)out)[i] = (uint8_t)((int8_t)data[i] + 128);
+      /* RKNN output BOs are in NC1HWC2 tiled format */
+      rnpu_convert_nc1hwc2_8(out, data, t->width, t->height, t->channels,
+                              m->native_output_w_pad[idx], m->native_output_h_pad[idx],
+                              !t->int8);
       return nhwc_size;
    }
 
