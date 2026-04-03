@@ -23,10 +23,12 @@ struct rnpu_bo {
    uint64_t obj_addr;   /* RKNPU only — kernel object address */
    void *map;
    uint32_t size;
+   uint8_t uncached;    /* 1 = non-cacheable DMA, skip prep/fini */
 };
 
 /* BO lifecycle */
 int rnpu_bo_create(int fd, uint32_t size, struct rnpu_bo *bo);
+int rnpu_bo_create_uncached(int fd, uint32_t size, struct rnpu_bo *bo);
 int rnpu_bo_prep(int fd, struct rnpu_bo *bo);
 int rnpu_bo_fini(int fd, struct rnpu_bo *bo);
 void rnpu_bo_destroy(int fd, struct rnpu_bo *bo);

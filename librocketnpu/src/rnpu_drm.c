@@ -233,8 +233,48 @@ int rnpu_bo_create(int fd, uint32_t size, struct rnpu_bo *bo)
    return 0;
 }
 
+int rnpu_bo_create_uncached(int fd, uint32_t size, struct rnpu_bo *bo)
+{
+   if (rnpu_active_driver == RNPU_DRIVER_ROCKET)
+      return rnpu_bo_create(fd, size, bo);  /* Rocket has no uncached flag */
+
+   memset(bo, 0, sizeof(*bo));
+   bo->size = size;
+
+   struct rknpu_mem_create mc = {
+      .size = size,
+      .flags = RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT,
+      /* No RKNPU_MEM_CACHEABLE → uncached DMA mapping */
+      .iommu_domain_id = 0,
+   };
+   if (ioctl(fd, DRM_IOCTL_RKNPU_MEM_CREATE, &mc)) {
+      fprintf(stderr, "rnpu: RKNPU uncached MEM_CREATE failed: %s (size=%u)\n",
+              strerror(errno), size);
+      return rnpu_bo_create(fd, size, bo);  /* fallback to cached */
+   }
+   bo->handle = mc.handle;
+   bo->dma_addr = mc.dma_addr;
+   bo->obj_addr = mc.obj_addr;
+   bo->uncached = 1;
+
+   struct rknpu_mem_map mm = { .handle = mc.handle };
+   if (ioctl(fd, DRM_IOCTL_RKNPU_MEM_MAP, &mm)) {
+      struct rknpu_mem_destroy md = { .handle = mc.handle, .obj_addr = mc.obj_addr };
+      ioctl(fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &md);
+      return rnpu_bo_create(fd, size, bo);  /* fallback */
+   }
+   bo->map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                  fd, mm.offset);
+   if (bo->map == MAP_FAILED) {
+      rnpu_bo_destroy(fd, bo);
+      return rnpu_bo_create(fd, size, bo);  /* fallback */
+   }
+   return 0;
+}
+
 int rnpu_bo_prep(int fd, struct rnpu_bo *bo)
 {
+   if (bo->uncached) return 0;  /* uncached DMA — no cache invalidate needed */
    if (rnpu_active_driver == RNPU_DRIVER_ROCKET) {
       struct timespec ts;
       clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -260,6 +300,7 @@ int rnpu_bo_prep(int fd, struct rnpu_bo *bo)
 
 int rnpu_bo_fini(int fd, struct rnpu_bo *bo)
 {
+   if (bo->uncached) return 0;  /* uncached DMA — no cache flush needed */
    if (rnpu_active_driver == RNPU_DRIVER_ROCKET) {
       struct drm_rocket_fini_bo req = { .handle = bo->handle };
       return ioctl(fd, DRM_IOCTL_ROCKET_FINI_BO, &req);
@@ -395,53 +436,69 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
       struct rknpu_task *task = (struct rknpu_task *)task_bo_cache.map;
       if (rnpu_native_raw_task_bo && rnpu_native_raw_task_bo_size >= ntasks * sizeof(struct rknpu_task)) {
          /* Native cache: replay RKNN's exact submit segment pattern.
-          * Copy all tasks into task BO, then submit each segment. */
+          * Task data is static — only copy+sync on first invoke. */
          struct rknpu_task *raw = (struct rknpu_task *)rnpu_native_raw_task_bo;
-
-         memcpy(task, raw, ntasks * sizeof(struct rknpu_task));
-         struct rknpu_mem_sync tms = {
-            .flags = 1, .obj_addr = task_bo_cache.obj_addr,
-            .size = ntasks * sizeof(struct rknpu_task)
-         };
-         ioctl(fd, DRM_IOCTL_RKNPU_MEM_SYNC, &tms);
+         static int task_bo_initialized = 0;
+         if (!task_bo_initialized) {
+            memcpy(task, raw, ntasks * sizeof(struct rknpu_task));
+            struct rknpu_mem_sync tms = {
+               .flags = 1, .obj_addr = task_bo_cache.obj_addr,
+               .size = ntasks * sizeof(struct rknpu_task)
+            };
+            ioctl(fd, DRM_IOCTL_RKNPU_MEM_SYNC, &tms);
+            task_bo_initialized = 1;
+         }
 
          if (rnpu_native_segments && rnpu_native_segment_count > 0) {
-            /* Replay each segment from the captured submit pattern */
-            for (unsigned si = 0; si < rnpu_native_segment_count; si++) {
+            /* Merge consecutive segments with SAME flags to reduce ioctls.
+             * Segments with different flags (e.g., PINGPONG vs non-PINGPONG)
+             * cannot be merged — hardware requires separate submissions. */
+            unsigned si = 0;
+            while (si < rnpu_native_segment_count) {
                struct rnpu_native_segment *seg = &rnpu_native_segments[si];
 
                if (!(seg->flags & RKNPU_JOB_PC)) {
-                  /* SW segment — skip (handled by caller's SW ops) */
+                  si++;
                   continue;
+               }
+
+               /* Merge consecutive segments with identical flags */
+               uint32_t sc_start = seg->sc_start;
+               uint32_t sc_count = seg->sc_count;
+               uint32_t task_number = seg->task_number;
+               unsigned last = si;
+
+               for (unsigned sj = si + 1; sj < rnpu_native_segment_count; sj++) {
+                  struct rnpu_native_segment *next = &rnpu_native_segments[sj];
+                  if (next->flags != seg->flags) break;
+                  if (next->sc_start != sc_start + sc_count) break;
+                  sc_count += next->sc_count;
+                  task_number = next->task_number;
+                  last = sj;
                }
 
                struct rknpu_submit sub = {
                   .flags = seg->flags | RKNPU_JOB_BLOCK,
                   .timeout = 6000,
-                  .task_start = seg->sc_start,
-                  .task_number = seg->task_number,
+                  .task_start = sc_start,
+                  .task_number = task_number,
                   .task_obj_addr = task_bo_cache.obj_addr,
                   .core_mask = 0x1,
                   .fence_fd = -1,
                   .subcore_task = {
-                     {seg->sc_start, seg->sc_count},
-                     {seg->sc_start, seg->sc_count},
-                     {seg->sc_start, seg->sc_count},
-                     {seg->sc_start, seg->sc_count},
-                     {seg->sc_start, seg->sc_count},
+                     {sc_start, sc_count}, {sc_start, sc_count},
+                     {sc_start, sc_count}, {sc_start, sc_count},
+                     {sc_start, sc_count},
                   },
                };
-               fprintf(stderr, "rnpu: submitting segment %u/%u: sc={%u,%u} flags=0x%x tn=%u\n",
-                       si + 1, rnpu_native_segment_count,
-                       seg->sc_start, seg->sc_count, sub.flags, sub.task_number);
                int sret = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub);
                if (sret) {
-                  fprintf(stderr, "rnpu: native segment %u/%u failed: %s "
+                  fprintf(stderr, "rnpu: native submit failed: %s "
                           "(sc={%u,%u} flags=0x%x)\n",
-                          si + 1, rnpu_native_segment_count,
-                          strerror(errno), seg->sc_start, seg->sc_count, seg->flags);
+                          strerror(errno), sc_start, sc_count, seg->flags);
                   return sret;
                }
+               si = last + 1;
             }
          } else {
             /* Fallback: single submit with all tasks (MBv1 style) */
