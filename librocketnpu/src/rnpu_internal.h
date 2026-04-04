@@ -362,6 +362,7 @@ struct rnpu_model {
    } *native_segments;
    unsigned native_segment_count;
    uint32_t native_output_offset;  /* activation BO offset of the last CONV output */
+   bool activation_bo_zeroed;      /* true after first invoke zeroes activation BO */
 
    /* Tensors */
    struct rnpu_npu_tensor *tensors;

@@ -2449,10 +2449,28 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
       for (unsigned i = 0; i < total; i++)
          dst[i] = src[i] - 0x80;
    } else if (m->native_input_bo.handle) {
-      /* Native cache mode: write raw input directly to separate input BO.
-       * RKNN's first conv uses ARGB_IN=10 mode — it reads raw uint8 NHWC
-       * with hardware CVT (no NPU-format conversion needed). */
-      size_t inp_sz = first->input_width * first->input_height * first->input_channels;
+      unsigned w = first->input_width, h = first->input_height, c = first->input_channels;
+      size_t inp_sz = w * h * c;
+
+      /* Zero activation BO on first invoke to clear stale data.
+       * CONV reads padding/border values from activation BO which must be 0. */
+      if (!m->activation_bo_zeroed && m->activation_bo.map) {
+         memset(m->activation_bo.map, 0, m->activation_bo.size);
+         rnpu_bo_fini(m->fd, &m->activation_bo);
+         m->activation_bo_zeroed = true;
+      }
+
+      /* Check if CONV expects raw uint8 NHWC (ARGB_IN mode) or pre-processed
+       * NC1HWC2 int8 input. If input BO is larger than raw NHWC, RKNN's
+       * rknn_inputs_set converted the input to NC1HWC2 int8 format.
+       * MBv1 uses ARGB_IN=10 → raw uint8 memcpy.
+       * Other models: RKNN preprocesses uint8→int8 + NHWC→NC1HWC2. */
+      /* Write input to native input BO. Always use raw memcpy — the CONV task's
+       * CNA_DATA_FORMAT register determines how the NPU reads the input
+       * (ARGB_IN mode for raw uint8, or pre-tiled for NC1HWC2).
+       * The input BO from the cache was captured AFTER rknn_inputs_set
+       * processed the data, so the same raw format works. */
+      memset(m->native_input_bo.map, 0, m->native_input_bo.size);
       memcpy(m->native_input_bo.map, input, inp_sz);
       rnpu_bo_fini(m->fd, &m->native_input_bo);
    } else {
