@@ -12,6 +12,8 @@
  * SPDX-License-Identifier: MIT
  */
 #include "openrknn.h"
+#include <stdlib.h>
+#include <stdio.h>
 
 /* Patch regcmd DMA addresses: add BO bases to 0-based offsets.
  * The regcmd in .rknn has offsets relative to each BO's start.
@@ -92,6 +94,37 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
 
     orknn_log(1, "run: patched %u/%u regcmd entries", patched, rc_entries);
 
+    /* Dump patched regcmd for debugging (ORKNN_DUMP_REGCMD=/path) */
+    const char *dump_path = getenv("ORKNN_DUMP_REGCMD");
+    if (dump_path) {
+        FILE *df = fopen(dump_path, "w");
+        if (df) {
+            /* Dump first task's regcmd entries */
+            struct {
+                uint32_t f[8];
+                uint64_t regcmd_addr;
+            } __attribute__((packed)) *tasks = ctx->task_bo.map;
+
+            for (uint32_t t = 0; t < ctx->model.task_count && t < 5; t++) {
+                uint32_t amt = tasks[t].f[6]; /* regcfg_amount */
+                uint64_t addr = tasks[t].regcmd_addr;
+                uint32_t bo_off = (uint32_t)(addr - ctx->weight_bo.dma_addr);
+                uint64_t *entries = (uint64_t *)((uint8_t *)ctx->weight_bo.map + bo_off);
+                fprintf(df, "=== TASK[%u] addr=0x%lx bo_off=%u amt=%u ===\n",
+                        t, (unsigned long)addr, bo_off, amt);
+                for (uint32_t e = 0; e < amt + 4; e++) {
+                    uint16_t reg = entries[e] & 0xFFFF;
+                    uint32_t val = (entries[e] >> 16) & 0xFFFFFFFF;
+                    uint16_t tgt = (entries[e] >> 48) & 0xFFFF;
+                    fprintf(df, "  [%3u] tgt=0x%04x reg=0x%04x val=0x%08x\n",
+                            e, tgt, reg, val);
+                }
+            }
+            fclose(df);
+            orknn_log(1, "run: dumped regcmd to %s", dump_path);
+        }
+    }
+
     /* Sync patched weight BO to device */
     orknn_bo_sync_to_device(ctx->npu_fd, &ctx->weight_bo);
 }
@@ -106,6 +139,12 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
         orknn_log(1, "run: first run, patching DMA addresses...");
         patch_regcmd_addresses(ctx);
         ctx->hw_elapse_time = 1; /* mark as patched */
+    }
+
+    /* ORKNN_NO_SUBMIT: skip actual NPU submit (for debugging regcmd) */
+    if (getenv("ORKNN_NO_SUBMIT")) {
+        orknn_log(1, "run: ORKNN_NO_SUBMIT set, skipping NPU submit");
+        return RKNN_SUCC;
     }
 
     orknn_log(2, "run: submitting %u segments...", m->segment_count);
