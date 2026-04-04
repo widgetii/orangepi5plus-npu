@@ -373,6 +373,7 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
    static struct {
       uint32_t handle;
       uint64_t obj_addr;
+      uint64_t dma_addr;
       void *map;
       uint32_t size;
       int fd;
@@ -422,6 +423,7 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
       }
       task_bo_cache.handle = tmc.handle;
       task_bo_cache.obj_addr = tmc.obj_addr;
+      task_bo_cache.dma_addr = tmc.dma_addr;
       task_bo_cache.map = tmap;
       task_bo_cache.size = needed_size;
       task_bo_cache.fd = fd;
@@ -483,6 +485,7 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
                   .task_start = sc_start,
                   .task_number = task_number,
                   .task_obj_addr = task_bo_cache.obj_addr,
+                  /* task_base_addr left as 0 — kernel computes from task_obj_addr */
                   .core_mask = 0x1,
                   .fence_fd = -1,
                   .subcore_task = {
@@ -512,6 +515,7 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
                .timeout = 6000,
                .task_number = ntasks,
                .task_obj_addr = task_bo_cache.obj_addr,
+               /* task_base_addr left as 0 — kernel computes from task_obj_addr */
                .core_mask = 0x1,
                .fence_fd = -1,
                .subcore_task = {
@@ -562,6 +566,7 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
          .timeout = 6000,
          .task_number = ntasks,
          .task_obj_addr = task_bo_cache.obj_addr,
+         .task_base_addr = task_bo_cache.dma_addr,
          .core_mask = 0x0,
          .fence_fd = -1,
          .subcore_task = { {0, ntasks}, {0, ntasks}, {0, ntasks}, {0, ntasks}, {0, ntasks} },

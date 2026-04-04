@@ -227,6 +227,9 @@ int ioctl(int fd, unsigned long request, ...) {
             bo_table[bo_count].handle = mc->handle;
             bo_table[bo_count].dma = mc->dma_addr;
             bo_table[bo_count].size = mc->size;
+            fprintf(stderr, "TRACE: MEM_CREATE[%d] handle=%u dma=0x%llx size=%llu flags=0x%x\n",
+                    bo_count, mc->handle, (unsigned long long)mc->dma_addr,
+                    (unsigned long long)mc->size, mc->flags);
             bo_count++;
             if (drm_fd < 0) drm_fd = fd;
         }
