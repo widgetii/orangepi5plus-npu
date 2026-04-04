@@ -627,14 +627,12 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
     for (unsigned i = 0; i < n_blobs; i++)
         memcpy(bo1_data + blob_offsets[i], blobs[i].data, blobs[i].len);
 
-    /* Find task BO and regcmd within type=6 blobs */
+    /* Find task BO within type=6 blobs (divisible by 40, valid enable_mask) */
     uint32_t rc_offset = 0, rc_size = 0;
     uint32_t tb_offset = 0, tb_size = 0;
 
     for (unsigned i = 0; i < n_blobs; i++) {
         if (blobs[i].type != 6) continue;
-
-        /* Task BO: divisible by 40, valid enable_mask in first entry */
         if (blobs[i].len >= 40 && blobs[i].len % 40 == 0) {
             uint32_t em = orknn_fb_u32(bo1_data, blob_offsets[i] + 8);
             if (em == 0x1d || em == 0x18 || em == 0x60 || em == 0x0f) {
@@ -642,10 +640,39 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
                 tb_size = blobs[i].len;
             }
         }
-        /* Regcmd: largest type=6 blob (excluding task BO) */
-        if (blobs[i].len > rc_size && blob_offsets[i] != tb_offset) {
-            rc_offset = blob_offsets[i];
-            rc_size = blobs[i].len;
+    }
+
+    /* Find regcmd blob: use task BO's max regcmd_addr to identify which blob
+     * contains the regcmd data. Tasks store offsets into the regcmd blob. */
+    if (tb_size >= 40) {
+        /* Find max regcmd_addr from tasks to determine regcmd size needed */
+        uint32_t max_rc_end = 0;
+        uint32_t total_tasks = tb_size / 40;
+        for (uint32_t t = 0; t < total_tasks; t++) {
+            uint64_t rc_addr = orknn_fb_u64(bo1_data, tb_offset + t * 40 + 32);
+            uint32_t rc_amt = orknn_fb_u32(bo1_data, tb_offset + t * 40 + 24);
+            uint32_t rc_end = (uint32_t)rc_addr + (rc_amt + 4) * 8;
+            if (rc_end > max_rc_end) max_rc_end = rc_end;
+        }
+        orknn_log(2, "model: tasks need regcmd up to offset %u", max_rc_end);
+
+        /* Find the smallest type=6 blob that covers the regcmd range.
+         * The regcmd blob is distinguishable: its first 8 bytes decode as
+         * a valid regcmd entry (register addr < 0x8000, target < 0x10). */
+        uint32_t best_size = UINT32_MAX;
+        for (unsigned i = 0; i < n_blobs; i++) {
+            if (blobs[i].type != 6) continue;
+            if (blob_offsets[i] == tb_offset) continue;
+            if (blobs[i].len < max_rc_end) continue;
+            /* Verify first entry looks like regcmd: reg addr in low 16 bits
+             * should be a valid NPU register (0x0000-0x7FFF range) */
+            uint64_t first = orknn_fb_u64(bo1_data, blob_offsets[i]);
+            uint16_t reg = first & 0xFFFF;
+            if (reg < 0x8000 && blobs[i].len < best_size) {
+                rc_offset = blob_offsets[i];
+                rc_size = blobs[i].len;
+                best_size = blobs[i].len;
+            }
         }
     }
 
@@ -941,6 +968,20 @@ int orknn_own_init(struct orknn_context *ctx, void *model_buf, uint32_t size,
     /* Extract tensor metadata from FlatBuffer (scale, zp, format, native shape).
      * This overrides/augments the JSON-derived values with authoritative FB data. */
     extract_fb_tensors(fb, fb_size, m);
+
+    /* Open RKNPU device and allocate DMA buffer objects */
+    if (ctx->own_flags & (ORKNN_OWN_RUN | ORKNN_OWN_INPUTS_SET)) {
+        ctx->npu_fd = orknn_drm_open();
+        if (ctx->npu_fd < 0) {
+            orknn_log(0, "model: failed to open RKNPU device");
+            return RKNN_ERR_DEVICE_UNAVAILABLE;
+        }
+        ret = orknn_alloc_model_bos(ctx);
+        if (ret != 0) {
+            orknn_log(0, "model: failed to allocate DMA buffers");
+            return RKNN_ERR_MALLOC_FAIL;
+        }
+    }
 
     /* Also init via proxy for cross-validation if available */
     struct orknn_proxy *proxy = orknn_proxy_get();

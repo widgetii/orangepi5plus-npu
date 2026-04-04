@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /* ======================================================================
  * Parse ORKNN_OWN env var to determine which functions we implement
@@ -121,6 +122,22 @@ int rknn_destroy(rknn_context context)
             ret = proxy->rknn_destroy(ctx->real_ctx);
     }
 
+    /* Free DMA buffer objects */
+    if (ctx->npu_fd >= 0) {
+        orknn_bo_destroy(ctx->npu_fd, &ctx->weight_bo);
+        orknn_bo_destroy(ctx->npu_fd, &ctx->task_bo);
+        orknn_bo_destroy(ctx->npu_fd, &ctx->activation_bo);
+        if (ctx->input_bos) {
+            for (uint32_t i = 0; i < ctx->model.n_inputs; i++)
+                orknn_bo_destroy(ctx->npu_fd, &ctx->input_bos[i]);
+        }
+        if (ctx->output_bos) {
+            for (uint32_t i = 0; i < ctx->model.n_outputs; i++)
+                orknn_bo_destroy(ctx->npu_fd, &ctx->output_bos[i]);
+        }
+        close(ctx->npu_fd);
+    }
+
     /* Free model data.
      * Note: regcmd_data points inside wt_data, don't free it separately. */
     free(ctx->model.file_data);
@@ -129,7 +146,6 @@ int rknn_destroy(rknn_context context)
     free(ctx->model.inputs);
     free(ctx->model.outputs);
     free(ctx->model.wt_data);
-    /* regcmd_data is wt_data + offset, not a separate alloc */
     free(ctx->model.task_data);
     free(ctx->model.segments);
     free(ctx->input_bos);

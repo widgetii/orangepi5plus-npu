@@ -196,6 +196,18 @@ const uint8_t *orknn_fb_bytes(const uint8_t *b, uint32_t fpos, uint32_t *len);
 uint8_t  orknn_fb_byte(const uint8_t *b, uint32_t fpos);
 
 /* ======================================================================
+ * DRM interface (openrknn_drm.c)
+ * ====================================================================== */
+
+int  orknn_drm_open(void);
+int  orknn_bo_create(int fd, uint32_t size, struct orknn_bo *bo);
+void orknn_bo_destroy(int fd, struct orknn_bo *bo);
+int  orknn_bo_sync_to_device(int fd, struct orknn_bo *bo);
+int  orknn_bo_sync_from_device(int fd, struct orknn_bo *bo);
+int  orknn_npu_submit(int fd, struct orknn_bo *task_bo,
+                      struct orknn_segment *seg);
+
+/* ======================================================================
  * Own implementations (phases 2-6)
  * ====================================================================== */
 
@@ -208,6 +220,9 @@ int orknn_own_query(struct orknn_context *ctx, rknn_query_cmd cmd,
 /* Phase 3: memory */
 rknn_tensor_mem *orknn_own_create_mem(struct orknn_context *ctx, uint32_t size);
 int orknn_own_destroy_mem(struct orknn_context *ctx, rknn_tensor_mem *mem);
+
+/* Phase 3: allocate all model BOs during init */
+int orknn_alloc_model_bos(struct orknn_context *ctx);
 
 /* Phase 4: input */
 int orknn_own_inputs_set(struct orknn_context *ctx, uint32_t n_inputs,
