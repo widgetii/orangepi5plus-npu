@@ -2552,6 +2552,8 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
             rnpu_native_raw_task_bo_size = m->native_task_bo_size;
             rnpu_native_segments = (struct rnpu_native_segment *)m->native_segments;
             rnpu_native_segment_count = m->native_segment_count;
+            rnpu_native_wt_obj_addr = m->weight_bo.obj_addr;
+            rnpu_native_wt_size = m->weight_bo.size;
             int ret = rnpu_submit(m->fd, &m->jobs[hw_job_idx], seg->job_count);
             if (ret) {
                fprintf(stderr, "rnpu: segment submit failed (%u jobs)\n", seg->job_count);

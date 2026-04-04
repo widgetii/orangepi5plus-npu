@@ -176,6 +176,8 @@ uint8_t *rnpu_native_raw_task_bo = NULL;
 uint32_t rnpu_native_raw_task_bo_size = 0;
 struct rnpu_native_segment *rnpu_native_segments = NULL;
 unsigned rnpu_native_segment_count = 0;
+uint64_t rnpu_native_wt_obj_addr = 0;
+uint32_t rnpu_native_wt_size = 0;
 
 /* ======================================================================
  * BO operations — dual-driver
@@ -450,6 +452,9 @@ int rnpu_submit(int fd, struct drm_rocket_job *jobs, uint32_t job_count)
             ioctl(fd, DRM_IOCTL_RKNPU_MEM_SYNC, &tms);
             task_bo_initialized = 1;
          }
+
+         /* Weight+regcmd BO was flushed at load time (rnpu_bo_fini).
+          * Do NOT re-flush here — double MEM_SYNC causes non-determinism. */
 
          if (rnpu_native_segments && rnpu_native_segment_count > 0) {
             /* Merge consecutive segments with SAME flags to reduce ioctls.
