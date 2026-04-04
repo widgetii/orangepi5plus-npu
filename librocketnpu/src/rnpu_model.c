@@ -2452,13 +2452,8 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
       unsigned w = first->input_width, h = first->input_height, c = first->input_channels;
       size_t inp_sz = w * h * c;
 
-      /* Zero activation BO on first invoke to clear stale data.
-       * CONV reads padding/border values from activation BO which must be 0. */
-      if (!m->activation_bo_zeroed && m->activation_bo.map) {
-         memset(m->activation_bo.map, 0, m->activation_bo.size);
-         rnpu_bo_fini(m->fd, &m->activation_bo);
-         m->activation_bo_zeroed = true;
-      }
+      /* Note: activation BO is NOT zeroed — RKNN doesn't zero it either.
+       * Stale data only affects the first invoke's border padding. */
 
       /* Check if CONV expects raw uint8 NHWC (ARGB_IN mode) or pre-processed
        * NC1HWC2 int8 input. If input BO is larger than raw NHWC, RKNN's
