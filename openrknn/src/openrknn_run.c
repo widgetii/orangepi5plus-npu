@@ -48,11 +48,14 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         uint32_t val = (rc[i] >> 16) & 0xFFFFFFFF;
         uint32_t new_val = val;
 
+        /* Only patch values that look like valid BO offsets.
+         * Values > 16MB or values with high bits set are scalars, not offsets.
+         * This avoids corrupting quantization params like OUT_CVT_OFFSET. */
+        if (val > 0x01000000 && reg != 0x0010 && reg != 0x6070 && reg != 0x701c)
+            continue;
+
         switch (reg) {
-        /* Activation/input/output addresses → activation BO base.
-         * The activation BO is a single large buffer that holds input,
-         * intermediate, and output tensors. All SRC/DST offsets are
-         * relative to this BO. */
+        /* Activation addresses → activation BO base */
         case 0x1070: /* CNA_SRC_BASE */
         case 0x4020: /* DPU_DST_BASE */
         case 0x4110: /* WDMA_BASE */
@@ -67,12 +70,11 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
             new_val = wt_base + val;
             break;
 
-        /* PC chain pointers → weight BO (regcmd is within weight BO) */
+        /* PC chain pointers → regcmd within weight BO */
         case 0x0010: /* PC_BASE_ADDRESS */
         case 0x6070: /* PC related */
         case 0x701c: /* PC related */
-            /* These point to regcmd entries within the weight BO.
-             * Add the regcmd section offset + weight BO DMA base. */
+            if (val == 0) continue; /* PC_BASE=0 means end of chain */
             new_val = wt_base + rc_off + val;
             break;
 
@@ -100,11 +102,13 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
     struct orknn_model *m = &ctx->model;
 
     /* Patch DMA addresses on first run */
-    static int patched = 0;
-    if (!patched) {
+    if (!ctx->hw_elapse_time) { /* use as patched flag */
+        orknn_log(1, "run: first run, patching DMA addresses...");
         patch_regcmd_addresses(ctx);
-        patched = 1;
+        ctx->hw_elapse_time = 1; /* mark as patched */
     }
+
+    orknn_log(2, "run: submitting %u segments...", m->segment_count);
 
     /* Submit each segment to the NPU */
     for (uint32_t i = 0; i < m->segment_count; i++) {

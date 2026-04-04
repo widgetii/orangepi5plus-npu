@@ -58,10 +58,20 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
     orknn_log(1, "memory: activation BO: %u bytes, dma=0x%lx",
               act_size, (unsigned long)ctx->activation_bo.dma_addr);
 
-    /* Input BOs */
+    /* Input BOs — need NC1HWC2 padded size, not just native_size.
+     * For a 4D NHWC [N,H,W,C] tensor: NC1HWC2 = N*ceil(C/16)*H*W*16. */
     ctx->input_bos = calloc(m->n_inputs, sizeof(struct orknn_bo));
     for (uint32_t i = 0; i < m->n_inputs; i++) {
-        uint32_t in_size = ALIGN_UP(m->inputs[i].native_size, 4096);
+        uint32_t in_size = m->inputs[i].native_size;
+        /* Ensure size covers NC1HWC2 with c2=16 padding */
+        if (m->inputs[i].n_dims == 4) {
+            uint32_t N = m->inputs[i].dims[0], H = m->inputs[i].dims[1];
+            uint32_t W = m->inputs[i].dims[2], C = m->inputs[i].dims[3];
+            uint32_t c2 = 16;
+            uint32_t nc1hwc2_size = N * ((C + c2 - 1) / c2) * H * W * c2;
+            if (nc1hwc2_size > in_size) in_size = nc1hwc2_size;
+        }
+        in_size = ALIGN_UP(in_size, 4096);
         if (in_size < 4096) in_size = 4096;
         if (orknn_bo_create(fd, in_size, &ctx->input_bos[i])) {
             orknn_log(0, "memory: failed to allocate input BO[%u] (%u bytes)", i, in_size);
