@@ -334,6 +334,224 @@ static void parse_tensor_json(const char *obj, struct orknn_tensor_info *ti)
 }
 
 /* ======================================================================
+ * FlatBuffer tensor metadata extraction
+ *
+ * Subgraph field 0 = tensor descriptor vector (N entries)
+ * Subgraph field 2 = input tensor index vector
+ * Subgraph field 3 = output tensor index vector
+ *
+ * Per-tensor fields (from IDA RE):
+ *   f[0]: packed byte (dtype at byte 0, flags)
+ *   f[2]: layout byte (1=NHWC, 2=NCHW, 64=NC1HWC2)
+ *   f[3]: native shape vector (5D for NC1HWC2)
+ *   f[4]: user shape vector (NCHW order)
+ *   f[5]: name string
+ *   f[6]: qnt_method string ("layer", "channel")
+ *   f[7]: dtype string ("int8", "uint8", "float16")
+ *   f[10]: scale vector (float[])
+ *   f[11]: zero_point vector (int32[] stored as float bits)
+ *   f[12]: allocation size (uint32)
+ *   f[13]: native layout code (64 = NC1HWC2)
+ * ====================================================================== */
+
+/* Layout byte to rknn_tensor_format */
+static rknn_tensor_format layout_to_fmt(uint8_t layout)
+{
+    switch (layout) {
+    case 1:  return RKNN_TENSOR_NHWC;
+    case 2:  return RKNN_TENSOR_NCHW;
+    case 64: return RKNN_TENSOR_NC1HWC2;
+    default: return RKNN_TENSOR_UNDEFINED;
+    }
+}
+
+/* Read a float from a FlatBuffer int32 vector entry.
+ * The zp field stores int32 values in a vector that fb_bytes reads as raw. */
+static int32_t fb_int32_vec_at(const uint8_t *fb, uint32_t fpos, uint32_t idx)
+{
+    uint32_t vec = orknn_fb_follow(fb, fpos);
+    uint32_t count = orknn_fb_u32(fb, vec);
+    if (idx >= count) return 0;
+    return orknn_fb_i32(fb, vec + 4 + idx * 4);
+}
+
+static float fb_float_vec_at(const uint8_t *fb, uint32_t fpos, uint32_t idx)
+{
+    uint32_t vec = orknn_fb_follow(fb, fpos);
+    uint32_t count = orknn_fb_u32(fb, vec);
+    if (idx >= count) return 0.0f;
+    uint32_t bits = orknn_fb_u32(fb, vec + 4 + idx * 4);
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+static void extract_fb_tensor_info(const uint8_t *fb, uint32_t tensor_table_fpos,
+                                   uint32_t tensor_idx,
+                                   struct orknn_tensor_info *ti)
+{
+    uint32_t t = orknn_fb_vec_at(fb, tensor_table_fpos, tensor_idx);
+    if (!t) return;
+
+    /* f[5]: name */
+    uint32_t f5 = orknn_fb_field(fb, t, 5);
+    if (f5) orknn_fb_string(fb, f5, ti->name, sizeof(ti->name));
+
+    /* f[7]: dtype string */
+    uint32_t f7 = orknn_fb_field(fb, t, 7);
+    if (f7) {
+        char dtype_str[32];
+        orknn_fb_string(fb, f7, dtype_str, sizeof(dtype_str));
+        ti->type = dtype_from_string(dtype_str);
+    }
+
+    /* f[6]: qnt_method */
+    uint32_t f6 = orknn_fb_field(fb, t, 6);
+    if (f6) {
+        char qnt_str[32];
+        orknn_fb_string(fb, f6, qnt_str, sizeof(qnt_str));
+        if (strstr(qnt_str, "layer") || strstr(qnt_str, "channel"))
+            ti->qnt_type = RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC;
+        else if (strstr(qnt_str, "dfp"))
+            ti->qnt_type = RKNN_TENSOR_QNT_DFP;
+        else
+            ti->qnt_type = RKNN_TENSOR_QNT_NONE;
+    }
+
+    /* f[10]: scale */
+    uint32_t f10 = orknn_fb_field(fb, t, 10);
+    if (f10) ti->scale = fb_float_vec_at(fb, f10, 0);
+
+    /* f[11]: zero_point (stored as int32 in a vector) */
+    uint32_t f11 = orknn_fb_field(fb, t, 11);
+    if (f11) ti->zp = fb_int32_vec_at(fb, f11, 0);
+
+    /* f[2]: layout byte → format.
+     * For non-4D tensors, the proxy returns UNDEFINED regardless of layout byte. */
+    uint32_t f2 = orknn_fb_field(fb, t, 2);
+    if (f2) {
+        if (ti->n_dims >= 4)
+            ti->fmt = layout_to_fmt(fb[f2]);
+        else
+            ti->fmt = RKNN_TENSOR_UNDEFINED;
+    }
+
+    /* f[4]: user shape.
+     * For NHWC tensors (layout=1): FB stores NCHW [N,C,H,W] → reorder to [N,H,W,C]
+     * For NCHW tensors (layout=2): FB stores NHWC-order [N,H,W,C] already
+     * For other/non-4D: copy as-is */
+    uint32_t f4 = orknn_fb_field(fb, t, 4);
+    if (f4) {
+        uint32_t vec = orknn_fb_follow(fb, f4);
+        uint32_t nd = orknn_fb_u32(fb, vec);
+        ti->n_dims = nd;
+        int raw[RKNN_MAX_DIMS];
+        for (uint32_t i = 0; i < nd && i < RKNN_MAX_DIMS; i++)
+            raw[i] = orknn_fb_i32(fb, vec + 4 + i * 4);
+
+        uint8_t layout = 0;
+        uint32_t f2_pos = orknn_fb_field(fb, t, 2);
+        if (f2_pos) layout = fb[f2_pos];
+
+        if (nd == 4 && layout == 1) {
+            /* NHWC tensor: FB has [N,C,H,W] → reorder to [N,H,W,C] */
+            ti->dims[0] = raw[0];
+            ti->dims[1] = raw[2];
+            ti->dims[2] = raw[3];
+            ti->dims[3] = raw[1];
+        } else {
+            /* NCHW or non-4D: FB already in display order */
+            for (uint32_t i = 0; i < nd; i++)
+                ti->dims[i] = (uint32_t)raw[i];
+        }
+
+        ti->n_elems = 1;
+        for (uint32_t i = 0; i < nd; i++)
+            ti->n_elems *= ti->dims[i];
+        ti->size = ti->n_elems * dtype_size(ti->type);
+    }
+
+    /* f[3]: native shape (NC1HWC2 for 5D) */
+    uint32_t f3 = orknn_fb_field(fb, t, 3);
+    if (f3) {
+        uint32_t vec = orknn_fb_follow(fb, f3);
+        uint32_t nd = orknn_fb_u32(fb, vec);
+        ti->native_n_dims = nd;
+        for (uint32_t i = 0; i < nd && i < RKNN_MAX_DIMS; i++)
+            ti->native_dims[i] = orknn_fb_u32(fb, vec + 4 + i * 4);
+    }
+
+    /* f[12]: native allocation size */
+    uint32_t f12 = orknn_fb_field(fb, t, 12);
+    if (f12) ti->native_size = orknn_fb_u32(fb, f12);
+
+    /* w_stride: set for NHWC 4D tensors only. */
+    if (ti->n_dims == 4 && ti->fmt == RKNN_TENSOR_NHWC)
+        ti->w_stride = ti->dims[2]; /* W */
+    else
+        ti->w_stride = 0;
+
+    /* size_with_stride: native allocation size for 4D, element size for others */
+    ti->size_with_stride = (ti->n_dims >= 4) ? ti->native_size : ti->size;
+}
+
+/* Extract tensor metadata from FlatBuffer subgraph for input/output tensors */
+static void extract_fb_tensors(const uint8_t *fb, uint32_t fb_size,
+                               struct orknn_model *m)
+{
+    uint32_t root = orknn_fb_u32(fb, 0);
+
+    /* Field 2 = subgraphs vector */
+    uint32_t f2_root = orknn_fb_field(fb, root, 2);
+    if (!f2_root) return;
+
+    uint32_t sg = orknn_fb_vec_at(fb, f2_root, 0);
+    if (!sg) return;
+
+    /* Subgraph field 0 = tensor descriptors */
+    uint32_t tensors_fpos = orknn_fb_field(fb, sg, 0);
+    if (!tensors_fpos) return;
+
+    /* Subgraph field 2 = input indices, field 3 = output indices */
+    uint32_t inputs_fpos = orknn_fb_field(fb, sg, 2);
+    uint32_t outputs_fpos = orknn_fb_field(fb, sg, 3);
+
+    if (inputs_fpos) {
+        uint32_t vec = orknn_fb_follow(fb, inputs_fpos);
+        uint32_t n_in = orknn_fb_u32(fb, vec);
+        for (uint32_t i = 0; i < n_in && i < m->n_inputs; i++) {
+            uint32_t tidx = orknn_fb_u32(fb, vec + 4 + i * 4);
+            extract_fb_tensor_info(fb, tensors_fpos, tidx, &m->inputs[i]);
+            orknn_log(2, "model: FB input[%u] (tensor %u): scale=%.6f zp=%d "
+                      "fmt=%d dims=%ux%ux%ux%u native_size=%u",
+                      i, tidx, m->inputs[i].scale, m->inputs[i].zp,
+                      m->inputs[i].fmt,
+                      m->inputs[i].dims[0], m->inputs[i].dims[1],
+                      m->inputs[i].dims[2], m->inputs[i].dims[3],
+                      m->inputs[i].native_size);
+        }
+    }
+
+    if (outputs_fpos) {
+        uint32_t vec = orknn_fb_follow(fb, outputs_fpos);
+        uint32_t n_out = orknn_fb_u32(fb, vec);
+        for (uint32_t i = 0; i < n_out && i < m->n_outputs; i++) {
+            uint32_t tidx = orknn_fb_u32(fb, vec + 4 + i * 4);
+            extract_fb_tensor_info(fb, tensors_fpos, tidx, &m->outputs[i]);
+            orknn_log(2, "model: FB output[%u] (tensor %u): scale=%.6f zp=%d "
+                      "fmt=%d dims=%ux%ux%ux%u native_size=%u",
+                      i, tidx, m->outputs[i].scale, m->outputs[i].zp,
+                      m->outputs[i].fmt,
+                      m->outputs[i].dims[0], m->outputs[i].dims[1],
+                      m->outputs[i].dims[2], m->outputs[i].dims[3],
+                      m->outputs[i].native_size);
+        }
+    }
+
+    (void)fb_size;
+}
+
+/* ======================================================================
  * Weight/task extraction from FlatBuffer
  * ====================================================================== */
 
@@ -720,6 +938,10 @@ int orknn_own_init(struct orknn_context *ctx, void *model_buf, uint32_t size,
         return RKNN_ERR_MODEL_INVALID;
     }
 
+    /* Extract tensor metadata from FlatBuffer (scale, zp, format, native shape).
+     * This overrides/augments the JSON-derived values with authoritative FB data. */
+    extract_fb_tensors(fb, fb_size, m);
+
     /* Also init via proxy for cross-validation if available */
     struct orknn_proxy *proxy = orknn_proxy_get();
     if (proxy) {
@@ -730,35 +952,6 @@ int orknn_own_init(struct orknn_context *ctx, void *model_buf, uint32_t size,
         } else {
             orknn_log(1, "model: proxy init OK (real_ctx=0x%lx)",
                       (unsigned long)ctx->real_ctx);
-
-            /* Extract quantization params (scale/zp) from proxy.
-             * These aren't in the JSON config — they come from FlatBuffer
-             * quantization tables. Until we implement FB quant extraction,
-             * pull them from the real library. */
-            for (uint32_t i = 0; i < m->n_inputs; i++) {
-                rknn_tensor_attr attr;
-                memset(&attr, 0, sizeof(attr));
-                attr.index = i;
-                if (proxy->rknn_query(ctx->real_ctx, RKNN_QUERY_INPUT_ATTR,
-                                      &attr, sizeof(attr)) == RKNN_SUCC) {
-                    m->inputs[i].scale = attr.scale;
-                    m->inputs[i].zp = attr.zp;
-                    orknn_log(2, "model: input[%u] scale=%.6f zp=%d (from proxy)",
-                              i, attr.scale, attr.zp);
-                }
-            }
-            for (uint32_t i = 0; i < m->n_outputs; i++) {
-                rknn_tensor_attr attr;
-                memset(&attr, 0, sizeof(attr));
-                attr.index = i;
-                if (proxy->rknn_query(ctx->real_ctx, RKNN_QUERY_OUTPUT_ATTR,
-                                      &attr, sizeof(attr)) == RKNN_SUCC) {
-                    m->outputs[i].scale = attr.scale;
-                    m->outputs[i].zp = attr.zp;
-                    orknn_log(2, "model: output[%u] scale=%.6f zp=%d (from proxy)",
-                              i, attr.scale, attr.zp);
-                }
-            }
         }
     }
 
