@@ -2185,40 +2185,42 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
       }
    }
 
-   /* Try native .rknn path first (RKNPU only) — before allocating TFLite tensors */
+   /* Try native cache/direct .rknn (RKNPU only) — before allocating TFLite tensors.
+    * Priority: .rknn_cache first (proven working), then .rknn direct (experimental). */
    bool native_loaded = false;
    if (rnpu_active_driver == RNPU_DRIVER_RKNPU) {
       size_t plen = strlen(tflite_path);
 
-      /* Try direct .rknn loading (no intercept needed) */
-      char *rknn_path = malloc(plen + 16);
-      strcpy(rknn_path, tflite_path);
-      char *ext2 = strrchr(rknn_path, '.');
-      if (ext2) strcpy(ext2, ".rknn");
-      else strcat(rknn_path, ".rknn");
-
-      if (access(rknn_path, R_OK) == 0) {
-         if (load_rknn_direct(m, rknn_path) == 0) {
-            native_loaded = true;
-            build_execution_plan(m);
-         }
-      }
-      free(rknn_path);
-
-      /* Fall back to .rknn_cache (legacy intercept-based) */
+      /* Try .rknn_cache first (legacy intercept-based, most reliable) */
       char *cache_path = malloc(plen + 16);
       strcpy(cache_path, tflite_path);
       char *ext = strrchr(cache_path, '.');
       if (ext) strcpy(ext, ".rknn_cache");
       else strcat(cache_path, ".rknn_cache");
 
-      if (!native_loaded && access(cache_path, R_OK) == 0) {
+      if (access(cache_path, R_OK) == 0) {
          if (load_native_cache(m, cache_path) == 0) {
             native_loaded = true;
             build_execution_plan(m);
          }
       }
       free(cache_path);
+
+      /* Fall back to direct .rknn loading (experimental) */
+      if (!native_loaded) {
+         char *rknn_path = malloc(plen + 16);
+         strcpy(rknn_path, tflite_path);
+         char *ext2 = strrchr(rknn_path, '.');
+         if (ext2) strcpy(ext2, ".rknn");
+         else strcat(rknn_path, ".rknn");
+         if (access(rknn_path, R_OK) == 0) {
+            if (load_rknn_direct(m, rknn_path) == 0) {
+               native_loaded = true;
+               build_execution_plan(m);
+            }
+         }
+         free(rknn_path);
+      }
    }
 
    if (!native_loaded) {
