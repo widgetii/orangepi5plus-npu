@@ -121,14 +121,15 @@ int rknn_destroy(rknn_context context)
             ret = proxy->rknn_destroy(ctx->real_ctx);
     }
 
-    /* Free model data */
+    /* Free model data.
+     * Note: regcmd_data points inside wt_data, don't free it separately. */
     free(ctx->model.file_data);
     free(ctx->model.model_name);
     free(ctx->model.target_platform);
     free(ctx->model.inputs);
     free(ctx->model.outputs);
     free(ctx->model.wt_data);
-    free(ctx->model.regcmd_data);
+    /* regcmd_data is wt_data + offset, not a separate alloc */
     free(ctx->model.task_data);
     free(ctx->model.segments);
     free(ctx->input_bos);

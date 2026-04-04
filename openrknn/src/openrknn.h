@@ -179,7 +179,24 @@ void orknn_log(int level, const char *fmt, ...)
 extern int g_orknn_log_level;
 
 /* ======================================================================
- * Own implementation stubs (phases 2-6, to be filled in later)
+ * FlatBuffer reader (openrknn_flatbuf.c)
+ * ====================================================================== */
+
+uint16_t orknn_fb_u16(const uint8_t *b, uint32_t p);
+uint32_t orknn_fb_u32(const uint8_t *b, uint32_t p);
+uint64_t orknn_fb_u64(const uint8_t *b, uint32_t p);
+int32_t  orknn_fb_i32(const uint8_t *b, uint32_t p);
+uint32_t orknn_fb_follow(const uint8_t *b, uint32_t p);
+uint32_t orknn_fb_field(const uint8_t *b, uint32_t table, int field);
+uint32_t orknn_fb_string(const uint8_t *b, uint32_t fpos,
+                         char *out_str, uint32_t max_len);
+uint32_t orknn_fb_vec_len(const uint8_t *b, uint32_t fpos);
+uint32_t orknn_fb_vec_at(const uint8_t *b, uint32_t fpos, uint32_t index);
+const uint8_t *orknn_fb_bytes(const uint8_t *b, uint32_t fpos, uint32_t *len);
+uint8_t  orknn_fb_byte(const uint8_t *b, uint32_t fpos);
+
+/* ======================================================================
+ * Own implementations (phases 2-6)
  * ====================================================================== */
 
 /* Phase 2: model parsing */
