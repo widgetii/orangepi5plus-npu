@@ -45,6 +45,10 @@ int rnpu_output_count(rnpu_model_t *m);
 int rnpu_get_tensor(rnpu_model_t *m, int tensor_idx, void *out, size_t max_size,
                     int *w, int *h, int *c);
 
+/* Dump raw output BO bytes (no deinterleave/conversion).
+ * Returns bytes written, -1 on error. */
+int rnpu_get_output_raw(rnpu_model_t *m, int idx, void *out, size_t max_size);
+
 /* Free all resources. */
 void rnpu_model_free(rnpu_model_t *m);
 

@@ -1032,28 +1032,31 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
              bo_table[b].orig_size <= out_bytes * 2) {
             unsigned oi = m->native_output_bo_count++;
             m->native_output_bos[oi] = native_bos[b];
-            /* Compute NC1HWC2 padded dims (C2=8 for int8) */
+            /* Compute NC1HWC2 padded dims. c2=8 is standard for int8. */
             unsigned out_c = t->shape[t->shape_len - 1];
             unsigned out_h = t->shape_len >= 4 ? t->shape[1] : 1;
             unsigned out_w = t->shape_len >= 4 ? t->shape[2] : 1;
-            unsigned c_pad = ((out_c + 7) / 8) * 8;
-            unsigned total_px = (unsigned)bo_table[b].orig_size / c_pad;
-            /* Find smallest W_pad >= W that evenly divides total_px
-             * and gives H_pad >= H. Try multiples of 8, 16, 32. */
-            unsigned wp = out_w, hp = 0;
-            for (unsigned align = 8; align <= 64; align *= 2) {
-               unsigned try_wp = ((out_w + align - 1) / align) * align;
-               if (try_wp > 0 && total_px % try_wp == 0) {
-                  unsigned try_hp = total_px / try_wp;
-                  if (try_hp >= out_h) { wp = try_wp; hp = try_hp; break; }
+            unsigned bo_sz = (unsigned)bo_table[b].orig_size;
+            unsigned actual_c2 = 8, wp = out_w, hp = out_h;
+            for (unsigned try_c2 = 8; try_c2 <= 16; try_c2 *= 2) {
+               unsigned c1 = DIV_ROUND_UP(out_c, try_c2);
+               unsigned spatial = bo_sz / (c1 * try_c2);
+               if (spatial < out_h * out_w) continue;
+               actual_c2 = try_c2;
+               for (unsigned align = 1; align <= 64; align *= 2) {
+                  unsigned try_wp = ((out_w + align - 1) / align) * align;
+                  if (try_wp > 0 && spatial % try_wp == 0) {
+                     unsigned try_hp = spatial / try_wp;
+                     if (try_hp >= out_h) { wp = try_wp; hp = try_hp; break; }
+                  }
                }
+               break;
             }
-            if (hp == 0) { wp = out_w; hp = total_px / out_w; }
             m->native_output_w_pad[oi] = wp;
             m->native_output_h_pad[oi] = hp;
-            fprintf(stderr, "rnpu: native output %u → BO[%u] (%u bytes, %ux%ux%u pad %ux%u)\n",
-                    i, b, (unsigned)bo_table[b].orig_size,
-                    out_w, out_h, out_c, wp, hp);
+            m->native_output_c2[oi] = actual_c2;
+            fprintf(stderr, "rnpu: native output %u → BO[%u] (%u bytes, %ux%ux%u pad %ux%u c2=%u)\n",
+                    i, b, bo_sz, out_w, out_h, out_c, wp, hp, actual_c2);
             break;
          }
       }
@@ -1316,6 +1319,15 @@ static int load_rknn_direct(struct rnpu_model *m, const char *rknn_path)
    rnpu_bo_create(m->fd, p.bos[2].size, &m->activation_bo);
    rnpu_bo_create(m->fd, p.bos[3].size, &m->native_input_bo);
 
+   /* Override input_size from TFLite (parser's extraction is unreliable) */
+   {
+      const struct rnpu_tfl_tensor *it = &m->tfl.tensors[m->tfl.graph_inputs[0]];
+      uint32_t tfl_input_size = 1;
+      for (int d = 0; d < it->shape_len; d++) tfl_input_size *= it->shape[d];
+      if (tfl_input_size > 0 && tfl_input_size < 0x1000000)
+         p.input_size = tfl_input_size;
+   }
+
    /* Copy template data into weight+regcmd BO */
    memcpy(m->weight_bo.map, p.wt_rc_data, p.wt_rc_size);
 
@@ -1469,6 +1481,7 @@ static int load_rknn_direct(struct rnpu_model *m, const char *rknn_path)
    }
    fprintf(stderr, "rnpu: act offsets: conv_out=0x%x reformat=0x%x input_size=%u\n",
            act_conv_out, act_reformat, p.input_size);
+   m->native_output_offset = act_conv_out;
 
    for (unsigned t = 0; t < p.task_count; t++) {
       uint32_t rc_off = p.tasks[t].rc_offset;
@@ -1604,6 +1617,12 @@ static int load_rknn_direct(struct rnpu_model *m, const char *rknn_path)
    for (unsigned t = 0; t < p.task_count; t++)
       te[t].regcmd_addr += wt_dma;
 
+
+   /* Dump patched BO[1] for debug comparison */
+   {
+      FILE *df = fopen("/tmp/direct_bo1.bin", "wb");
+      if (df) { fwrite(bo1, 1, p.bos[1].size, df); fclose(df); }
+   }
 
    /* Flush weight+regcmd to device */
    rnpu_bo_fini(m->fd, &m->weight_bo);
@@ -2280,9 +2299,11 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
             m->graph_output_tensors[i] = last_op_out;
          } else if (ti < m->tensor_count && m->tensors[ti].size > 0) {
             m->graph_output_tensors[i] = ti;
-            /* Clamp tensor offset to activation BO bounds to prevent segfault.
-             * RKNN's activation BO may be smaller than TFLite's layout. */
-            if (m->tensors[ti].offset + m->tensors[ti].size > m->activation_bo.size) {
+            /* Use native_output_offset if set (from .rknn direct loader).
+             * Otherwise clamp to activation BO bounds. */
+            if (m->native_output_offset > 0) {
+               m->tensors[ti].offset = m->native_output_offset;
+            } else if (m->tensors[ti].offset + m->tensors[ti].size > m->activation_bo.size) {
                m->tensors[ti].offset = 0;
                fprintf(stderr, "rnpu: native output t%u: offset clamped to 0 "
                        "(exceeds act BO %u)\n", ti, m->activation_bo.size);
@@ -2443,6 +2464,11 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
     * the NPU reads from the separate native_input_bo (already flushed above). */
    if (!m->native_input_bo.handle)
       rnpu_bo_fini(m->fd, &m->activation_bo);
+
+   /* Flush output BOs to ensure clean cache before NPU writes */
+   for (unsigned i = 0; i < m->native_output_bo_count; i++)
+      if (m->native_output_bos[i].handle)
+         rnpu_bo_fini(m->fd, &m->native_output_bos[i]);
 
    /* Debug flags — cached after first invoke to avoid per-invoke getenv */
    static int trace_ops_cached = -1, debug_level_cached = -1, debug_per_op_cached = -1;
@@ -2667,6 +2693,26 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
    return 0;
 }
 
+int rnpu_get_output_raw(rnpu_model_t *m, int idx, void *out, size_t max_size)
+{
+   if (idx < 0 || idx >= (int)m->output_count) return -1;
+   if ((unsigned)idx < m->native_output_bo_count && m->native_output_bos[idx].handle) {
+      rnpu_bo_prep(m->fd, &m->native_output_bos[idx]);
+      size_t sz = m->native_output_bos[idx].size;
+      if (sz > max_size) sz = max_size;
+      memcpy(out, m->native_output_bos[idx].map, sz);
+      return sz;
+   }
+   /* Fallback: read from activation BO at tensor offset */
+   unsigned ti = m->graph_output_tensors[idx];
+   struct rnpu_npu_tensor *t = &m->tensors[ti];
+   size_t sz = t->size;
+   if (sz > max_size) sz = max_size;
+   rnpu_bo_prep(m->fd, &m->activation_bo);
+   memcpy(out, (uint8_t *)m->activation_bo.map + t->offset, sz);
+   return sz;
+}
+
 int rnpu_get_output(rnpu_model_t *m, int idx, void *out, size_t max_size)
 {
    if (idx < 0 || idx >= (int)m->output_count) return -1;
@@ -2681,9 +2727,9 @@ int rnpu_get_output(rnpu_model_t *m, int idx, void *out, size_t max_size)
       rnpu_bo_prep(m->fd, &m->native_output_bos[idx]);
       uint8_t *data = (uint8_t *)m->native_output_bos[idx].map;
       /* RKNN output BOs are in NC1HWC2 tiled format */
-      rnpu_convert_nc1hwc2_8(out, data, t->width, t->height, t->channels,
-                              m->native_output_w_pad[idx], m->native_output_h_pad[idx],
-                              !t->int8);
+      rnpu_convert_nc1hwc2(out, data, t->width, t->height, t->channels,
+                           m->native_output_w_pad[idx], m->native_output_h_pad[idx],
+                           m->native_output_c2[idx], !t->int8);
       return nhwc_size;
    }
 
