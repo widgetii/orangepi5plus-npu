@@ -698,24 +698,37 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
      * RKNN submit uses task_number = total tasks in BO, sc_count = tasks
      * per pipeline stage (first CONV→REFORMAT cycle). */
 
-    /* Find sc_count: first complete pipeline cycle.
-     * Pattern: CONV(0x1d) [→ REFORMAT(0x18)...] → next CONV or 0x60 */
-    uint32_t sc_count = 0;
+    /* Find sc_count: first complete pipeline stage.
+     * The pipeline ends just before the first task whose op_idx repeats
+     * a previous task's op_idx (indicating the next core's execution).
+     * Also ends after an em=0x60 task. */
+    uint32_t sc_count = total_tasks;
     {
-        int past_first_conv = 0;
+        uint32_t seen_conv_ops[16];
+        int n_seen = 0;
         for (uint32_t t = 0; t < total_tasks; t++) {
+            uint32_t op = orknn_fb_u32(bo1_data, tb_offset + t * 40 + 4);
             uint32_t em = orknn_fb_u32(bo1_data, tb_offset + t * 40 + 8);
-            if (em == 0x1d && past_first_conv) {
-                sc_count = t; /* next CONV starts a new cycle */
-                break;
+            /* Only track CONV task op_ids (em=0x1d) for repeat detection.
+             * REFORMAT (em=0x18) tasks can share op_idx within one stage. */
+            orknn_log(3, "model: sc scan t=%u op=%u em=0x%x n_seen=%d", t, op, em, n_seen);
+            if (em == 0x1d) {
+                for (int k = 0; k < n_seen; k++) {
+                    if (seen_conv_ops[k] == op) {
+                        sc_count = t;
+                        orknn_log(1, "model: sc_count=%u (op=%u repeated at task %u)", sc_count, op, t);
+                        goto sc_found;
+                    }
+                }
+                if (n_seen < 16) seen_conv_ops[n_seen++] = op;
             }
-            if (em == 0x1d) past_first_conv = 1;
             if (em == 0x60) {
-                sc_count = t + 1; /* 0x60 ends a cycle */
-                break;
+                sc_count = t; /* 0x60 task belongs to the PREVIOUS conv, not a new stage */
+                orknn_log(2, "model: sc_count=%u (0x60 at task %u)", sc_count, t);
+                goto sc_found;
             }
         }
-        if (sc_count == 0) sc_count = total_tasks;
+        sc_found:;
     }
 
     /* Detect multi-core: if task pattern repeats at sc_count intervals

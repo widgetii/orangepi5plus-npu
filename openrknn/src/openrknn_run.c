@@ -6,6 +6,7 @@
 #include "openrknn.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 /* Scan FB weight_data entries to build a map of blob offsets within BO[1].
  * Returns offsets for each type=0 blob (weight/bias data) and type=4/6 blobs. */
@@ -47,8 +48,170 @@ static int scan_blob_offsets(struct orknn_model *m, struct bo1_blob_info *blobs,
     return count;
 }
 
+/* Copy the proxy's fully-patched regcmd into our weight BO, then
+ * rebase DMA addresses from proxy BO layout to ours.
+ * This handles FC layers and other operations where the template
+ * regcmd is completely rewritten by the runtime. */
+static int copy_proxy_regcmd(struct orknn_context *ctx)
+{
+    if (!ctx->real_ctx) return -1;
+
+    struct orknn_proxy *proxy = orknn_proxy_get();
+    if (!proxy) return -1;
+
+    /* Run proxy once so it patches everything */
+    struct orknn_model *m = &ctx->model;
+    uint32_t input_size = m->n_inputs > 0 ? m->inputs[0].size : 0;
+    if (input_size > 0) {
+        rknn_input inp;
+        memset(&inp, 0, sizeof(inp));
+        inp.index = 0;
+        inp.type = m->inputs[0].type;
+        inp.fmt = RKNN_TENSOR_NHWC;
+        inp.size = input_size;
+        inp.buf = calloc(1, input_size);
+        proxy->rknn_inputs_set(ctx->real_ctx, 1, &inp);
+        free(inp.buf);
+    }
+    proxy->rknn_run(ctx->real_ctx, NULL);
+
+    /* Now the proxy's BOs have fully-patched data.
+     * We need to read the proxy's weight BO. Unfortunately we can't
+     * directly access proxy BOs — they're in the proxy's address space.
+     *
+     * Alternative: use rknn_query to check if the model ran, then
+     * read the output. But we actually need the regcmd data...
+     *
+     * For now: check if an intercept dump exists at /tmp/rknn_dump/ */
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/rknn_dump/sub1_bo_001_%uB.bin",
+             ctx->weight_bo.size);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        /* Try common sizes */
+        for (uint32_t sz = ctx->weight_bo.size; sz > 0; sz -= 4096) {
+            snprintf(path, sizeof(path), "/tmp/rknn_dump/sub1_bo_001_%uB.bin", sz);
+            f = fopen(path, "rb");
+            if (f) break;
+        }
+    }
+    if (!f) {
+        orknn_log(1, "run: no proxy BO dump found, using template patching");
+        return -1;
+    }
+
+    /* Read proxy's weight BO */
+    uint32_t rc_off = (uint32_t)(m->regcmd_data - m->wt_data);
+    uint8_t *proxy_bo = calloc(1, ctx->weight_bo.size);
+    size_t nread = fread(proxy_bo, 1, ctx->weight_bo.size, f);
+    fclose(f);
+
+    if (nread < rc_off + m->regcmd_size) {
+        orknn_log(0, "run: proxy BO dump too small (%zu < %u)", nread, rc_off + m->regcmd_size);
+        free(proxy_bo);
+        return -1;
+    }
+
+    /* Copy proxy's regcmd section into our weight BO */
+    memcpy((uint8_t *)ctx->weight_bo.map + rc_off, proxy_bo + rc_off, m->regcmd_size);
+    orknn_log(1, "run: copied proxy regcmd (%u bytes at +0x%x)", m->regcmd_size, rc_off);
+
+    /* Now rebase DMA addresses from proxy layout to ours.
+     * Read proxy's BO addresses from the dump metadata. */
+    char meta_path[128];
+    snprintf(meta_path, sizeof(meta_path), "/tmp/rknn_dump/submit_1.txt");
+    FILE *mf = fopen(meta_path, "r");
+    uint32_t proxy_wt = 0, proxy_act = 0, proxy_in = 0, proxy_out = 0;
+    if (mf) {
+        char line[256];
+        while (fgets(line, sizeof(line), mf)) {
+            /* Parse: bo[N] handle=H dma=0xXXXX obj=0xXXXX size=S */
+            uint32_t bi, dma, sz;
+            if (sscanf(line, "bo[%u] handle=%*u dma=0x%x obj=%*s size=%u", &bi, &dma, &sz) == 3) {
+                if (bi == 1) proxy_wt = dma;
+                else if (bi == 2) proxy_act = dma;
+                else if (bi == 3) proxy_in = dma;
+                else if (bi == 4) proxy_out = dma;
+            }
+        }
+        fclose(mf);
+    }
+
+    if (!proxy_wt) {
+        orknn_log(0, "run: cannot read proxy BO addresses from dump");
+        free(proxy_bo);
+        return -1;
+    }
+
+    uint32_t our_wt = (uint32_t)ctx->weight_bo.dma_addr;
+    uint32_t our_act = (uint32_t)ctx->activation_bo.dma_addr;
+    uint32_t our_in = ctx->input_bos ? (uint32_t)ctx->input_bos[0].dma_addr : 0;
+    uint32_t our_out = ctx->output_bos ? (uint32_t)ctx->output_bos[0].dma_addr : 0;
+
+    orknn_log(1, "run: rebasing DMA: proxy wt=0x%x act=0x%x in=0x%x out=0x%x",
+              proxy_wt, proxy_act, proxy_in, proxy_out);
+    orknn_log(1, "run:               ours  wt=0x%x act=0x%x in=0x%x out=0x%x",
+              our_wt, our_act, our_in, our_out);
+
+    /* Rebase all DMA registers in the regcmd */
+    uint64_t *rc = (uint64_t *)((uint8_t *)ctx->weight_bo.map + rc_off);
+    uint32_t rc_entries = m->regcmd_size / 8;
+    uint32_t rebased = 0;
+
+    uint32_t dma_reg_list[] = {0x1070,0x1110,0x4020,0x4110,0x5018,0x5020,0x5038,0x0010,0x6070,0x701c};
+    int n_dma_regs = sizeof(dma_reg_list)/sizeof(dma_reg_list[0]);
+
+    for (uint32_t i = 0; i < rc_entries; i++) {
+        uint16_t reg = rc[i] & 0xFFFF;
+        uint32_t val = (rc[i] >> 16) & 0xFFFFFFFF;
+        if (val == 0) continue;
+
+        int is_dma = 0;
+        for (int d = 0; d < n_dma_regs; d++)
+            if (reg == dma_reg_list[d]) { is_dma = 1; break; }
+        if (!is_dma) continue;
+
+        /* Determine which proxy BO this address belongs to and rebase */
+        uint32_t new_val = val;
+        if (proxy_wt && val >= proxy_wt && val < proxy_wt + ctx->weight_bo.size)
+            new_val = our_wt + (val - proxy_wt);
+        else if (proxy_act && val >= proxy_act && val < proxy_act + ctx->activation_bo.size)
+            new_val = our_act + (val - proxy_act);
+        else if (proxy_in && val >= proxy_in && val < proxy_in + 0x100000)
+            new_val = our_in + (val - proxy_in);
+        else if (proxy_out && val >= proxy_out && val < proxy_out + 0x100000)
+            new_val = our_out + (val - proxy_out);
+
+        if (new_val != val) {
+            rc[i] = (rc[i] & 0xFFFF000000000000ULL) |
+                    ((uint64_t)new_val << 16) | (rc[i] & 0xFFFF);
+            rebased++;
+        }
+    }
+
+    orknn_log(1, "run: rebased %u DMA entries", rebased);
+
+    /* Also update task BO regcmd_addr pointers */
+    struct { uint32_t f[8]; uint64_t regcmd_addr; } __attribute__((packed)) *tasks = ctx->task_bo.map;
+    for (uint32_t t = 0; t < m->task_count; t++) {
+        uint64_t addr = tasks[t].regcmd_addr;
+        if (proxy_wt && addr >= proxy_wt && addr < proxy_wt + ctx->weight_bo.size) {
+            tasks[t].regcmd_addr = our_wt + (addr - proxy_wt);
+        }
+    }
+    orknn_bo_sync_to_device(ctx->npu_fd, &ctx->task_bo);
+    orknn_bo_sync_to_device(ctx->npu_fd, &ctx->weight_bo);
+
+    free(proxy_bo);
+    return 0;
+}
+
 static void patch_regcmd_addresses(struct orknn_context *ctx)
 {
+    /* Try to use proxy's fully-patched regcmd first.
+     * This handles FC layers and complex operations correctly. */
+    if (copy_proxy_regcmd(ctx) == 0) return;
+
     struct orknn_model *m = &ctx->model;
     uint32_t rc_off = (uint32_t)(m->regcmd_data - m->wt_data);
 
