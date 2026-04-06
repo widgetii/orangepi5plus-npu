@@ -284,6 +284,18 @@ int rknn_outputs_release(rknn_context context, uint32_t n_ouputs,
     struct orknn_context *ctx = ctx_from_handle(context);
     if (!ctx) return RKNN_ERR_CTX_INVALID;
 
+    if (ctx->own_flags & ORKNN_OWN_OUTPUTS) {
+        /* Free buffers we allocated in outputs_get */
+        for (uint32_t i = 0; i < n_ouputs; i++) {
+            if (!outputs[i].is_prealloc && outputs[i].buf) {
+                free(outputs[i].buf);
+                outputs[i].buf = NULL;
+            }
+        }
+        orknn_log(2, "rknn_outputs_release(own): n=%u -> 0", n_ouputs);
+        return RKNN_SUCC;
+    }
+
     struct orknn_proxy *proxy = orknn_proxy_get();
     if (!proxy || !ctx->real_ctx) return RKNN_ERR_CTX_INVALID;
 

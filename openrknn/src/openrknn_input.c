@@ -41,15 +41,17 @@ int orknn_own_inputs_set(struct orknn_context *ctx, uint32_t n_inputs,
 
             const uint8_t *src = inputs[i].buf;
             uint8_t *dst = bo->map;
-            uint8_t pad_val = (uint8_t)(ti->zp & 0xFF);
 
-            /* Clear with pad value (zero point for padded channels) */
-            memset(dst, pad_val, bo->size);
+            /* Pad with zero for padded channels.
+             * CNA_CVT handles zp offset, so we use raw 0 as pad. */
+            memset(dst, 0, bo->size);
 
-            if (inputs[i].type == ti->type) {
-                /* Same dtype — just layout transform, no quantize needed.
-                 * This is the common path: user provides uint8/int8 data
-                 * matching the model's quantized input type. */
+            if (inputs[i].type == ti->type ||
+                (inputs[i].type == RKNN_TENSOR_UINT8 && ti->type == RKNN_TENSOR_INT8) ||
+                (inputs[i].type == RKNN_TENSOR_INT8 && ti->type == RKNN_TENSOR_UINT8)) {
+                /* Same or compatible dtype — just layout transform.
+                 * CNA_CVT hardware handles uint8↔int8 conversion via
+                 * the offset register, so we pass raw bytes. */
                 for (uint32_t n = 0; n < N; n++) {
                     for (uint32_t h = 0; h < H; h++) {
                         for (uint32_t w = 0; w < W; w++) {
