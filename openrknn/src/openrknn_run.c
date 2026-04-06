@@ -130,6 +130,24 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         int is_conv = (enable_mask == 0x1d);
         int is_reformat = (enable_mask == 0x18);
 
+        /* CNA input conversion parameters (computed from model quantization).
+         * These are template placeholders that the RKNN runtime patches.
+         *
+         * For int8 models with input zp=-128:
+         *   CVT_CON0: truncate=14 for all channels, data_sign=0, round=0
+         *   CVT_CON1-3: scale=0x4000, offset=zp (0xff80 = -128)
+         *   CVT_CON5: 0xfff (enable mask for all channels)
+         *
+         * TODO: compute these from actual model quantization parameters.
+         * For now, derive from the input tensor's zero point. */
+        int32_t input_zp = 0;
+        if (m->n_inputs > 0) input_zp = m->inputs[0].zp;
+        uint16_t cvt_offset = (uint16_t)(input_zp & 0xFFFF);
+        uint16_t cvt_scale = 0x4000; /* fixed-point 1.0 in Q2.14 */
+        uint32_t cvt_con0 = 0x000e38e0; /* truncate=14 for 4 channels */
+        uint32_t cvt_con1 = ((uint32_t)cvt_scale << 16) | cvt_offset;
+        uint32_t cvt_con5 = 0x00000fff;
+
         for (uint32_t e = 0; e < total; e++) {
             uint16_t reg = entries[e] & 0xFFFF;
             uint32_t val = (entries[e] >> 16) & 0xFFFFFFFF;
@@ -223,6 +241,19 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     new_val = act_base + val;
                     do_patch = 1;
                 }
+                break;
+
+            /* CNA input conversion registers — runtime-computed from quant params */
+            case 0x104c: /* CNA_CVT_CON0 */
+                if (is_conv) { new_val = cvt_con0; do_patch = 1; }
+                break;
+            case 0x1050: /* CNA_CVT_CON1 */
+            case 0x1054: /* CNA_CVT_CON2 */
+            case 0x1058: /* CNA_CVT_CON3 */
+                if (is_conv) { new_val = cvt_con1; do_patch = 1; }
+                break;
+            case 0x1180: /* CNA_CVT_CON5 */
+                if (is_conv) { new_val = cvt_con5; do_patch = 1; }
                 break;
             }
 
