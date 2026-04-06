@@ -262,7 +262,7 @@ int orknn_npu_submit(int fd, struct orknn_bo *task_bo,
         .task_start = seg->sc_start,
         .task_number = seg->task_number,
         .task_obj_addr = task_bo->obj_addr,
-        .core_mask = 0x1,
+        .core_mask = 0x0, /* auto — matches proxy */
         .fence_fd = -1,
         .subcore_task = {
             { seg->sc_start, seg->sc_count },

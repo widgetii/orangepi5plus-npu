@@ -690,38 +690,79 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
     uint32_t total_tasks = tb_size / 40;
     uint32_t sc_tasks = total_tasks;
 
-    /* Detect multi-core duplication: tasks repeat with different regcmd addrs */
-    if (total_tasks > 3) {
-        for (int div = 3; div >= 2; div--) {
-            if (total_tasks % div != 0) continue;
-            uint32_t chunk = total_tasks / div;
-            int match = 1;
-            for (uint32_t t = 0; t < chunk && match; t++) {
-                uint32_t *a = (uint32_t *)(bo1_data + tb_offset + t * 40);
-                uint32_t *b = (uint32_t *)(bo1_data + tb_offset + (chunk + t) * 40);
-                if (a[1] != b[1] || a[2] != b[2]) match = 0;
-            }
-            if (match) {
-                uint64_t rc0 = orknn_fb_u64(bo1_data, tb_offset + 32);
-                uint64_t rc1 = orknn_fb_u64(bo1_data, tb_offset + chunk * 40 + 32);
-                if (rc0 != rc1) { sc_tasks = chunk; break; }
-            }
-        }
-    }
+    /* Detect single-core task count.
+     * The .rknn stores tasks for all 3 cores. Multi-core tasks share regcmd
+     * offsets (same rc_addr). Find the minimal set that covers all unique
+     * regcmd sections, then check for core-repetition patterns.
+     *
+     * RKNN submit uses task_number = total tasks in BO, sc_count = tasks
+     * per pipeline stage (first CONV→REFORMAT cycle). */
 
-    /* Build sc_count: tasks in first CONV block (up to REFORMAT transition) */
+    /* Find sc_count: first complete pipeline cycle.
+     * Pattern: CONV(0x1d) [→ REFORMAT(0x18)...] → next CONV or 0x60 */
     uint32_t sc_count = 0;
     {
-        int seen_reformat = 0;
-        for (uint32_t t = 0; t < sc_tasks; t++) {
+        int past_first_conv = 0;
+        for (uint32_t t = 0; t < total_tasks; t++) {
             uint32_t em = orknn_fb_u32(bo1_data, tb_offset + t * 40 + 8);
-            if (em == 0x18) seen_reformat = 1;
-            else if (seen_reformat && em == 0x1d) { sc_count = t + 1; break; }
+            if (em == 0x1d && past_first_conv) {
+                sc_count = t; /* next CONV starts a new cycle */
+                break;
+            }
+            if (em == 0x1d) past_first_conv = 1;
+            if (em == 0x60) {
+                sc_count = t + 1; /* 0x60 ends a cycle */
+                break;
+            }
         }
-        if (sc_count == 0) sc_count = sc_tasks;
+        if (sc_count == 0) sc_count = total_tasks;
     }
 
-    orknn_log(1, "model: %u total tasks, %u single-core, sc_count=%u",
+    /* Detect multi-core: if task pattern repeats at sc_count intervals
+     * with shared regcmd offsets, the total is multi-core × sc_count. */
+    sc_tasks = total_tasks;
+    if (total_tasks > sc_count) {
+        /* Check if tasks at sc_count share regcmd with tasks at 0 */
+        int repeats = 0;
+        for (uint32_t t = sc_count; t < total_tasks; t++) {
+            uint64_t rc = orknn_fb_u64(bo1_data, tb_offset + t * 40 + 32);
+            /* Check if this rc_addr matches any task in [0..sc_count) */
+            for (uint32_t r = 0; r < sc_count; r++) {
+                uint64_t rc0 = orknn_fb_u64(bo1_data, tb_offset + r * 40 + 32);
+                if (rc == rc0) { repeats++; break; }
+            }
+        }
+        /* If most tasks beyond sc_count share regcmd → they're multi-core dups.
+         * Use the point where non-shared tasks start as the total. */
+        if (repeats > 0) {
+            /* Find first task beyond sc_count with a NEW (non-shared) regcmd */
+            uint32_t unique_end = sc_count;
+            for (uint32_t t = sc_count; t < total_tasks; t++) {
+                uint64_t rc = orknn_fb_u64(bo1_data, tb_offset + t * 40 + 32);
+                int shared = 0;
+                for (uint32_t r = 0; r < sc_count; r++) {
+                    uint64_t rc0 = orknn_fb_u64(bo1_data, tb_offset + r * 40 + 32);
+                    if (rc == rc0) { shared = 1; break; }
+                }
+                if (shared) {
+                    /* Shared task = multi-core dup, skip. But include the tasks
+                     * between unique_end and here (they may be needed). */
+                    continue;
+                }
+                unique_end = t + 1;
+            }
+            /* Use tasks up to the last unique one, then add back the shared
+             * tasks that follow for the multi-core pipeline. The total
+             * task_number should cover all tasks that the submit needs. */
+            sc_tasks = unique_end;
+        }
+    }
+
+    /* For our submit: use only first pipeline stage (sc_count tasks).
+     * The remaining tasks are multi-core duplicates we don't need. */
+    sc_tasks = sc_count;
+
+    orknn_log(1, "model: %u total tasks, %u for submit, sc_count=%u",
               total_tasks, sc_tasks, sc_count);
 
     /* Copy task data and fix regcmd offsets */
