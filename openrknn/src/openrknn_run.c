@@ -15,84 +15,22 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-/* Patch regcmd DMA addresses: add BO bases to 0-based offsets.
- * The regcmd in .rknn has offsets relative to each BO's start.
+/* The .rknn regcmd contains placeholder DMA addresses (zeros) that the
+ * RKNN runtime patches during rknn_init based on its BO allocation layout.
+ * We cannot reproduce this patching because:
+ * 1. The offsets within the weight BO (e.g., bias at +2304) are computed
+ *    by the RKNN compiler and not stored explicitly in the .rknn file
+ * 2. The activation layout (which tensors at which offsets) is computed
+ *    during graph building
  *
- * From the BO layout investigation (memory/rknn_native_loading.md):
- *   SRC_BASE (0x1070) → activation or input BO
- *   WT_BASE  (0x1110) → weight BO (within the combined wt+rc BO)
- *   DST_BASE (0x4020) → activation BO
- *   WDMA_BASE(0x4110) → activation BO
- *   BS_BASE  (0x5020) → weight BO (bias section)
- *   RDMA act (0x5018) → activation BO
- *   RDMA rel (0x5038) → activation BO
- *   PC_BASE  (0x0010) → weight BO (regcmd chain pointer)
- *   PC rel   (0x6070) → weight BO
- *   PC rel   (0x701c) → weight BO
+ * Solution: let the proxy do rknn_init (which patches the regcmd), then
+ * intercept its BO data for our own submit. For now, skip own patching
+ * and just log what we would have done.
  */
 static void patch_regcmd_addresses(struct orknn_context *ctx)
 {
-    struct orknn_model *m = &ctx->model;
-    uint32_t rc_off = (uint32_t)(m->regcmd_data - m->wt_data);
-    uint32_t rc_entries = m->regcmd_size / 8;
-    uint64_t *rc = (uint64_t *)((uint8_t *)ctx->weight_bo.map + rc_off);
-
-    uint32_t wt_base  = (uint32_t)ctx->weight_bo.dma_addr;
-    uint32_t act_base = (uint32_t)ctx->activation_bo.dma_addr;
-    uint32_t in_base  = (uint32_t)ctx->input_bos[0].dma_addr;
-
-    orknn_log(2, "run: patching %u regcmd entries: wt=0x%x act=0x%x in=0x%x",
-              rc_entries, wt_base, act_base, in_base);
-
-    uint32_t patched = 0;
-    for (uint32_t i = 0; i < rc_entries; i++) {
-        uint16_t reg = rc[i] & 0xFFFF;
-        uint32_t val = (rc[i] >> 16) & 0xFFFFFFFF;
-        uint32_t new_val = val;
-
-        /* Only patch values that look like valid BO offsets.
-         * Values > 16MB or values with high bits set are scalars, not offsets.
-         * This avoids corrupting quantization params like OUT_CVT_OFFSET. */
-        if (val > 0x01000000 && reg != 0x0010 && reg != 0x6070 && reg != 0x701c)
-            continue;
-
-        switch (reg) {
-        /* Activation addresses → activation BO base */
-        case 0x1070: /* CNA_SRC_BASE */
-        case 0x4020: /* DPU_DST_BASE */
-        case 0x4110: /* WDMA_BASE */
-        case 0x5018: /* RDMA activation source */
-        case 0x5038: /* RDMA related */
-            new_val = act_base + val;
-            break;
-
-        /* Weight and bias addresses → weight BO base */
-        case 0x1110: /* RDMA_WT_BASE */
-        case 0x5020: /* RDMA_BS_BASE */
-            new_val = wt_base + val;
-            break;
-
-        /* PC chain pointers → regcmd within weight BO */
-        case 0x0010: /* PC_BASE_ADDRESS */
-        case 0x6070: /* PC related */
-        case 0x701c: /* PC related */
-            if (val == 0) continue; /* PC_BASE=0 means end of chain */
-            new_val = wt_base + rc_off + val;
-            break;
-
-        default:
-            continue;
-        }
-
-        if (new_val != val) {
-            rc[i] = (rc[i] & 0xFFFF000000000000ULL) |
-                    ((uint64_t)new_val << 16) |
-                    (rc[i] & 0xFFFF);
-            patched++;
-        }
-    }
-
-    orknn_log(1, "run: patched %u/%u regcmd entries", patched, rc_entries);
+    orknn_log(1, "run: regcmd DMA patching NOT YET IMPLEMENTED "
+              "(needs proxy BO intercept)");
 
     /* Dump patched regcmd for debugging (ORKNN_DUMP_REGCMD=/path) */
     const char *dump_path = getenv("ORKNN_DUMP_REGCMD");
