@@ -191,15 +191,8 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
 
     orknn_log(1, "run: rebased %u DMA entries", rebased);
 
-    /* Also update task BO regcmd_addr pointers */
-    struct { uint32_t f[8]; uint64_t regcmd_addr; } __attribute__((packed)) *tasks = ctx->task_bo.map;
-    for (uint32_t t = 0; t < m->task_count; t++) {
-        uint64_t addr = tasks[t].regcmd_addr;
-        if (proxy_wt && addr >= proxy_wt && addr < proxy_wt + ctx->weight_bo.size) {
-            tasks[t].regcmd_addr = our_wt + (addr - proxy_wt);
-        }
-    }
-    orknn_bo_sync_to_device(ctx->npu_fd, &ctx->task_bo);
+    /* Task BO regcmd_addr values were already set correctly by
+     * orknn_alloc_model_bos — don't rebase them. */
     orknn_bo_sync_to_device(ctx->npu_fd, &ctx->weight_bo);
 
     free(proxy_bo);

@@ -43,13 +43,19 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
               task_size, (unsigned long)ctx->task_bo.dma_addr);
 
     /* Activation BO (intermediate tensors).
-     * total_internal_size from model parser is often wrong (heuristic).
-     * Use a generous size: max(parsed_size, 16 * input_size, 2MB). */
-    uint32_t act_size = m->total_internal_size;
-    if (m->n_inputs > 0 && m->inputs[0].native_size * 16 > act_size)
-        act_size = m->inputs[0].native_size * 16;
-    if (act_size < 2 * 1024 * 1024)
-        act_size = 2 * 1024 * 1024;
+     * Size must cover all intermediate tensor allocations.
+     * Heuristic: sum of (input + all output native sizes) * 4 gives
+     * enough room for the graph memory planner's allocation. */
+    uint32_t act_size = 0;
+    for (uint32_t i = 0; i < m->n_inputs; i++)
+        act_size += m->inputs[i].native_size;
+    for (uint32_t i = 0; i < m->n_outputs; i++)
+        act_size += m->outputs[i].native_size;
+    act_size *= 4; /* room for intermediate tensors */
+    if (m->total_internal_size > act_size)
+        act_size = m->total_internal_size;
+    if (act_size < 131072)
+        act_size = 131072; /* minimum 128KB — must cover all intermediate tensors */
     act_size = ALIGN_UP(act_size, 4096);
     if (orknn_bo_create(fd, act_size, &ctx->activation_bo)) {
         orknn_log(0, "memory: failed to allocate activation BO (%u bytes)", act_size);
