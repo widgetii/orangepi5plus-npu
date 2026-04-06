@@ -699,37 +699,68 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
      * per pipeline stage (first CONV→REFORMAT cycle). */
 
     /* Find sc_count: first complete pipeline stage.
-     * The pipeline ends just before the first task whose op_idx repeats
-     * a previous task's op_idx (indicating the next core's execution).
-     * Also ends after an em=0x60 task. */
+     *
+     * Method 1: For multi-op models, find where a CONV task's op_idx
+     * repeats (but skip the 0x60 continuation tasks which share op_idx).
+     * Method 2: If all CONV tasks share the same op_idx (e.g., MBv1 NNBG),
+     * use regcmd sharing detection instead.
+     */
     uint32_t sc_count = total_tasks;
     {
-        uint32_t seen_conv_ops[16];
-        int n_seen = 0;
-        for (uint32_t t = 0; t < total_tasks; t++) {
+        /* Count unique op_ids across ALL task types */
+        uint32_t seen_ops[16];
+        int n_unique = 0;
+        for (uint32_t t = 0; t < total_tasks && n_unique < 16; t++) {
             uint32_t op = orknn_fb_u32(bo1_data, tb_offset + t * 40 + 4);
-            uint32_t em = orknn_fb_u32(bo1_data, tb_offset + t * 40 + 8);
-            /* Only track CONV task op_ids (em=0x1d) for repeat detection.
-             * REFORMAT (em=0x18) tasks can share op_idx within one stage. */
-            orknn_log(3, "model: sc scan t=%u op=%u em=0x%x n_seen=%d", t, op, em, n_seen);
-            if (em == 0x1d) {
+            int found = 0;
+            for (int k = 0; k < n_unique; k++)
+                if (seen_ops[k] == op) { found = 1; break; }
+            if (!found) seen_ops[n_unique++] = op;
+        }
+
+        if (n_unique > 1) {
+            /* Multi-op model: find first CONV op_idx repeat.
+             * The 0x60 task between CONV repeats extends the stage. */
+            int n_seen = 0;
+            uint32_t conv_seen[16];
+            for (uint32_t t = 0; t < total_tasks; t++) {
+                uint32_t em = orknn_fb_u32(bo1_data, tb_offset + t * 40 + 8);
+                if (em != 0x1d) continue;
+                uint32_t op = orknn_fb_u32(bo1_data, tb_offset + t * 40 + 4);
                 for (int k = 0; k < n_seen; k++) {
-                    if (seen_conv_ops[k] == op) {
+                    if (conv_seen[k] == op) {
                         sc_count = t;
-                        orknn_log(1, "model: sc_count=%u (op=%u repeated at task %u)", sc_count, op, t);
+                        /* Include any preceding 0x60 task */
+                        if (t > 0) {
+                            uint32_t prev_em = orknn_fb_u32(bo1_data, tb_offset + (t-1) * 40 + 8);
+                            if (prev_em == 0x60) sc_count = t - 1;
+                        }
+                        orknn_log(1, "model: sc_count=%u (multi-op, op=%u repeat at %u)",
+                                  sc_count, op, t);
                         goto sc_found;
                     }
                 }
-                if (n_seen < 16) seen_conv_ops[n_seen++] = op;
+                if (n_seen < 16) conv_seen[n_seen++] = op;
             }
-            if (em == 0x60) {
-                sc_count = t; /* 0x60 task belongs to the PREVIOUS conv, not a new stage */
-                orknn_log(2, "model: sc_count=%u (0x60 at task %u)", sc_count, t);
-                goto sc_found;
+        } else {
+            /* Single-op model (e.g., MBv1): use regcmd sharing */
+            for (uint32_t t = 1; t < total_tasks; t++) {
+                uint64_t rc = orknn_fb_u64(bo1_data, tb_offset + t * 40 + 32);
+                for (uint32_t r = 0; r < t; r++) {
+                    uint64_t rc0 = orknn_fb_u64(bo1_data, tb_offset + r * 40 + 32);
+                    if (rc == rc0) {
+                        sc_count = t;
+                        orknn_log(1, "model: sc_count=%u (single-op, regcmd sharing at %u)",
+                                  sc_count, t);
+                        goto sc_found;
+                    }
+                }
             }
+            /* No sharing → all tasks single-core */
+            orknn_log(1, "model: sc_count=%u (no sharing, all single-core)", sc_count);
         }
-        sc_found:;
     }
+    sc_found:
 
     /* Detect multi-core: if task pattern repeats at sc_count intervals
      * with shared regcmd offsets, the total is multi-core × sc_count. */
@@ -771,11 +802,10 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
         }
     }
 
-    /* RKNN submit uses task_number = 3 * sc_count (3-core layout).
-     * All 3 subcores reference {0, sc_count} but the task BO must
-     * contain 3 * sc_count tasks. */
-    sc_tasks = sc_count * 3;
-    if (sc_tasks > total_tasks) sc_tasks = total_tasks;
+    /* Submit all tasks in one block. sc_count = task_count = total_tasks.
+     * The RKNPU driver handles the pipeline internally. */
+    sc_tasks = total_tasks;
+    sc_count = total_tasks;
 
     orknn_log(1, "model: %u total tasks, %u for submit, sc_count=%u",
               total_tasks, sc_tasks, sc_count);
