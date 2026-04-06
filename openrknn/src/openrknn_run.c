@@ -61,27 +61,88 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
     struct bo1_blob_info blobs[128];
     int n_blobs = scan_blob_offsets(m, blobs, 128);
 
-    /* First type=0 blob = weights, second type=0 = bias */
-    uint32_t weight_off = 0, bias_off = 0;
-    int wt_found = 0;
-    for (int i = 0; i < n_blobs; i++) {
-        if (blobs[i].type == 0) {
-            if (!wt_found) { weight_off = blobs[i].offset; wt_found = 1; }
-            else { bias_off = blobs[i].offset; break; }
-        }
-    }
+    /* Build per-operation weight/bias offset table.
+     *
+     * Weight/bias blobs come in pairs within BO[1]. The pairs are ordered
+     * in reverse execution order: last-executing op's weights first in BO[1],
+     * first-executing op's weights last. We detect pairs by scanning blobs
+     * for consecutive (weight, bias) entries and assign to op_idx values
+     * found in the task BO.
+     *
+     * Weight blob: larger, contains kernel data
+     * Bias blob: smaller, immediately follows weight, contains bias values
+     * Both can be type=0 or type=6.
+     */
+    struct { uint32_t wt_off; uint32_t bs_off; } op_wt_bs[16];
+    int n_ops = 0;
 
-    /* Find type=4 and type=6 small blobs for PC2/PC3 (0x6070/0x701c).
-     * The em=0x60 tasks reference these for output channel formatting.
-     * First type=4 small blob → PC2, first type=6 small blob (not regcmd/task) → PC3 */
+    /* Collect weight+bias pairs from type=0 blobs.
+     * Type=0 blobs are weight data, coming in pairs (weight, bias).
+     * For models with additional operations beyond the type=0 pairs,
+     * type=6 small blobs (not regcmd/task) serve as weight/bias for those ops. */
+    /* PC2/PC3 blobs for em=0x60 tasks — detect early so we can skip them in pairing */
     uint32_t pc2_off = 0, pc3_off = 0;
     for (int i = 0; i < n_blobs; i++) {
         if (blobs[i].type == 4 && blobs[i].size <= 4096 && !pc2_off)
             pc2_off = blobs[i].offset;
         if (blobs[i].type == 6 && blobs[i].size <= 4096 &&
-            blobs[i].offset != (uint32_t)(m->regcmd_data - m->wt_data) && !pc3_off)
+            blobs[i].offset != rc_off &&
+            blobs[i].size != m->task_data_size && !pc3_off)
             pc3_off = blobs[i].offset;
     }
+
+    struct { uint32_t wt_off; uint32_t bs_off; } pairs[16];
+    int n_pairs = 0;
+
+    /* Collect weight+bias pairs by grouping consecutive same-type blobs.
+     * Skip: regcmd, task BO, type=4 blobs, PC3 blob, and 1024-byte type=6
+     * blobs (per-channel metadata referenced by em=0x60 tasks). */
+    for (int i = 0; i < n_blobs - 1 && n_pairs < 16; i++) {
+        if (blobs[i].offset == rc_off) continue;
+        if (blobs[i].size == m->task_data_size) continue;
+        if (blobs[i].type == 4) continue;
+        if (blobs[i].offset == pc3_off) continue;
+        if (blobs[i].type == 6 && blobs[i].size == 1024) continue; /* per-ch metadata */
+        int j = i + 1;
+        while (j < n_blobs && (blobs[j].offset == rc_off ||
+               blobs[j].size == m->task_data_size ||
+               blobs[j].type == 4 || blobs[j].offset == pc3_off ||
+               (blobs[j].type == 6 && blobs[j].size == 1024)))
+            j++;
+        if (j >= n_blobs) break;
+        if (blobs[i].type == blobs[j].type) {
+            pairs[n_pairs].wt_off = blobs[i].offset;
+            pairs[n_pairs].bs_off = blobs[j].offset;
+            n_pairs++;
+            i = j;
+        }
+    }
+
+    /* Discover unique op_idx values from CONV tasks (em=0x1d), in order of first appearance */
+    struct { uint32_t f[8]; uint64_t regcmd_addr; } __attribute__((packed)) *tasks = ctx->task_bo.map;
+    uint32_t op_ids[16];
+    int n_op_ids = 0;
+    for (uint32_t t = 0; t < m->task_count; t++) {
+        uint32_t em = tasks[t].f[2];
+        uint32_t op = tasks[t].f[1];
+        if (em != 0x1d) continue; /* only CONV tasks have WT/BS */
+        int found = 0;
+        for (int k = 0; k < n_op_ids; k++)
+            if (op_ids[k] == op) { found = 1; break; }
+        if (!found && n_op_ids < 16)
+            op_ids[n_op_ids++] = op;
+    }
+
+    /* Assign pairs to ops: last pair → first op_id, first pair → last op_id.
+     * (Blobs stored in reverse execution order.) */
+    for (int k = 0; k < n_op_ids && k < n_pairs; k++) {
+        int pair_idx = n_pairs - 1 - k; /* reverse */
+        op_wt_bs[k].wt_off = pairs[pair_idx].wt_off;
+        op_wt_bs[k].bs_off = pairs[pair_idx].bs_off;
+        orknn_log(2, "run: op_idx=%u -> wt=0x%x bs=0x%x (pair %d)",
+                  op_ids[k], pairs[pair_idx].wt_off, pairs[pair_idx].bs_off, pair_idx);
+    }
+    n_ops = n_op_ids < n_pairs ? n_op_ids : n_pairs;
 
     /* Compute activation DST offset for first CONV output.
      * Proxy uses raw NCHW tensor size (H*W*C), NOT NC1HWC2 padded. */
@@ -94,14 +155,9 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
     }
 
     orknn_log(1, "run: patching: wt=0x%x act=0x%x in=0x%x out=0x%x "
-              "wt_off=0x%x bs_off=0x%x rc_off=0x%x act_dst=0x%x",
+              "rc_off=0x%x act_dst=0x%x n_ops=%d n_pairs=%d",
               wt_base, act_base, in_base, out_base,
-              weight_off, bias_off, rc_off, act_dst_off);
-
-    struct {
-        uint32_t f[8];
-        uint64_t regcmd_addr;
-    } __attribute__((packed)) *tasks = ctx->task_bo.map;
+              rc_off, act_dst_off, n_ops, n_pairs);
 
     uint32_t patched = 0;
 
@@ -129,22 +185,24 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
 
         int is_conv = (enable_mask == 0x1d);
         int is_reformat = (enable_mask == 0x18);
+        uint32_t op = tasks[t].f[1]; /* op_idx */
 
-        /* CNA input conversion parameters (computed from model quantization).
-         * These are template placeholders that the RKNN runtime patches.
-         *
-         * For int8 models with input zp=-128:
-         *   CVT_CON0: truncate=14 for all channels, data_sign=0, round=0
-         *   CVT_CON1-3: scale=0x4000, offset=zp (0xff80 = -128)
-         *   CVT_CON5: 0xfff (enable mask for all channels)
-         *
-         * TODO: compute these from actual model quantization parameters.
-         * For now, derive from the input tensor's zero point. */
+        /* Find this task's WT/BS offsets from per-op table */
+        uint32_t task_wt_off = 0, task_bs_off = 0;
+        for (int k = 0; k < n_ops; k++) {
+            if (op_ids[k] == op) {
+                task_wt_off = op_wt_bs[k].wt_off;
+                task_bs_off = op_wt_bs[k].bs_off;
+                break;
+            }
+        }
+
+        /* CNA input conversion parameters */
         int32_t input_zp = 0;
         if (m->n_inputs > 0) input_zp = m->inputs[0].zp;
         uint16_t cvt_offset = (uint16_t)(input_zp & 0xFFFF);
-        uint16_t cvt_scale = 0x4000; /* fixed-point 1.0 in Q2.14 */
-        uint32_t cvt_con0 = 0x000e38e0; /* truncate=14 for 4 channels */
+        uint16_t cvt_scale = 0x4000;
+        uint32_t cvt_con0 = 0x000e38e0;
         uint32_t cvt_con1 = ((uint32_t)cvt_scale << 16) | cvt_offset;
         uint32_t cvt_con5 = 0x00000fff;
 
@@ -166,7 +224,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 break;
 
             case 0x1110: /* WT_BASE */
-                new_val = wt_base + (val ? val : weight_off);
+                new_val = wt_base + (val ? val : task_wt_off);
                 do_patch = 1;
                 break;
 
@@ -200,7 +258,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
 
             case 0x5020: /* BS_BASE */
                 if (val == 0 && is_conv) {
-                    new_val = wt_base + bias_off;
+                    new_val = wt_base + task_bs_off;
                     do_patch = 1;
                 } else if (val != 0) {
                     new_val = wt_base + val;
