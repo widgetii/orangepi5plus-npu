@@ -293,6 +293,18 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         }
     }
 
+    /* Dump task BO binary for comparison with proxy */
+    const char *task_dump = getenv("ORKNN_DUMP_TASKBO");
+    if (task_dump) {
+        FILE *tf = fopen(task_dump, "wb");
+        if (tf) {
+            fwrite(ctx->task_bo.map, 1, m->task_count * 40, tf);
+            fclose(tf);
+            orknn_log(1, "run: dumped task BO (%u tasks, %u bytes) to %s",
+                      m->task_count, m->task_count * 40, task_dump);
+        }
+    }
+
     orknn_bo_sync_to_device(ctx->npu_fd, &ctx->weight_bo);
 }
 

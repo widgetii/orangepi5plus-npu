@@ -758,9 +758,11 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
         }
     }
 
-    /* For our submit: use only first pipeline stage (sc_count tasks).
-     * The remaining tasks are multi-core duplicates we don't need. */
-    sc_tasks = sc_count;
+    /* RKNN submit uses task_number = 3 * sc_count (3-core layout).
+     * All 3 subcores reference {0, sc_count} but the task BO must
+     * contain 3 * sc_count tasks. */
+    sc_tasks = sc_count * 3;
+    if (sc_tasks > total_tasks) sc_tasks = total_tasks;
 
     orknn_log(1, "model: %u total tasks, %u for submit, sc_count=%u",
               total_tasks, sc_tasks, sc_count);

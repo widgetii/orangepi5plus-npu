@@ -201,6 +201,7 @@ uint8_t  orknn_fb_byte(const uint8_t *b, uint32_t fpos);
 
 int  orknn_drm_open(void);
 int  orknn_bo_create(int fd, uint32_t size, struct orknn_bo *bo);
+int  orknn_bo_create_flags(int fd, uint32_t size, uint32_t flags, struct orknn_bo *bo);
 void orknn_bo_destroy(int fd, struct orknn_bo *bo);
 int  orknn_bo_sync_to_device(int fd, struct orknn_bo *bo);
 int  orknn_bo_sync_from_device(int fd, struct orknn_bo *bo);

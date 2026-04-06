@@ -32,10 +32,10 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
     orknn_log(1, "memory: weight BO: %u bytes, dma=0x%lx",
               wt_size, (unsigned long)ctx->weight_bo.dma_addr);
 
-    /* Task BO */
+    /* Task BO — needs KERNEL_MAPPING (0x8) flag so RKNPU driver can read it */
     uint32_t task_size = ALIGN_UP(m->task_data_size, 4096);
     if (task_size < 4096) task_size = 4096;
-    if (orknn_bo_create(fd, task_size, &ctx->task_bo)) {
+    if (orknn_bo_create_flags(fd, task_size, 0x40b, &ctx->task_bo)) {
         orknn_log(0, "memory: failed to allocate task BO (%u bytes)", task_size);
         return -1;
     }

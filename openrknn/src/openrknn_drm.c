@@ -179,14 +179,14 @@ int orknn_drm_open(void)
  * BO operations
  * ====================================================================== */
 
-int orknn_bo_create(int fd, uint32_t size, struct orknn_bo *bo)
+int orknn_bo_create_flags(int fd, uint32_t size, uint32_t flags, struct orknn_bo *bo)
 {
     memset(bo, 0, sizeof(*bo));
     bo->size = size;
 
     struct rknpu_mem_create mc = {
         .size = size,
-        .flags = 0x403, /* NON_CONTIGUOUS | CACHEABLE | IOMMU_LIMIT_IOVA_ALIGNMENT */
+        .flags = flags,
         .iommu_domain_id = 0,
     };
     if (ioctl(fd, DRM_IOCTL_RKNPU_MEM_CREATE, &mc)) {
@@ -211,6 +211,11 @@ int orknn_bo_create(int fd, uint32_t size, struct orknn_bo *bo)
         return -1;
     }
     return 0;
+}
+
+int orknn_bo_create(int fd, uint32_t size, struct orknn_bo *bo)
+{
+    return orknn_bo_create_flags(fd, size, 0x403, bo);
 }
 
 void orknn_bo_destroy(int fd, struct orknn_bo *bo)
