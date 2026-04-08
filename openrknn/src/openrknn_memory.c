@@ -106,10 +106,30 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
                   i, in_size, (unsigned long)ctx->input_bos[i].dma_addr);
     }
 
+    /* Read proxy output BO sizes from dump if available */
+    uint32_t proxy_out_sizes[16] = {0};
+    {
+        FILE *sf2 = fopen("/tmp/rknn_dump/submit_1.txt", "r");
+        if (sf2) {
+            char line[256];
+            while (fgets(line, sizeof(line), sf2)) {
+                uint32_t bi, sz;
+                if (sscanf(line, "bo[%u] handle=%*u dma=%*s obj=%*s size=%u", &bi, &sz) == 2) {
+                    if (bi >= 4 && bi < 20)
+                        proxy_out_sizes[bi - 4] = sz;
+                }
+            }
+            fclose(sf2);
+        }
+    }
+
     /* Output BOs */
     ctx->output_bos = calloc(m->n_outputs, sizeof(struct orknn_bo));
     for (uint32_t i = 0; i < m->n_outputs; i++) {
         uint32_t out_size = ALIGN_UP(m->outputs[i].native_size, 4096);
+        /* Use proxy's output BO size if larger */
+        if (i < 16 && proxy_out_sizes[i] > out_size)
+            out_size = ALIGN_UP(proxy_out_sizes[i], 4096);
         if (out_size < 4096) out_size = 4096;
         if (orknn_bo_create(fd, out_size, &ctx->output_bos[i])) {
             orknn_log(0, "memory: failed to allocate output BO[%u] (%u bytes)", i, out_size);

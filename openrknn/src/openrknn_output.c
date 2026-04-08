@@ -33,15 +33,27 @@ int orknn_own_outputs_get(struct orknn_context *ctx, uint32_t n_outputs,
         orknn_bo_sync_from_device(ctx->npu_fd, &ctx->activation_bo);
 
         /* Determine where to read the output from.
-         * The NPU writes output into the activation BO at a compiler-
-         * decided offset (discovered during init via proxy signature match).
-         * If we have a valid offset, read from activation BO; otherwise
-         * fall back to the dedicated output BO. */
+         * Discovered during init by signature match against proxy dumps:
+         *   valid=0: not discovered, fall back to dedicated output BO
+         *   valid=1: read from activation BO at act_output_offsets[idx]
+         *   valid=2..N: read from output_bos[valid-2] at offset */
         uint8_t *npu_output_src = (uint8_t *)bo->map;
         if (idx < 16 && ctx->act_output_valid[idx]) {
-            npu_output_src = (uint8_t *)ctx->activation_bo.map + ctx->act_output_offsets[idx];
-            orknn_log(2, "outputs_get: reading output[%u] from act+0x%x",
-                      idx, ctx->act_output_offsets[idx]);
+            uint8_t v = ctx->act_output_valid[idx];
+            if (v == 1) {
+                /* Read from activation BO */
+                orknn_bo_sync_from_device(ctx->npu_fd, &ctx->activation_bo);
+                npu_output_src = (uint8_t *)ctx->activation_bo.map + ctx->act_output_offsets[idx];
+                orknn_log(2, "outputs_get: reading output[%u] from act+0x%x",
+                          idx, ctx->act_output_offsets[idx]);
+            } else if (v >= 2 && v - 2 < ctx->model.n_outputs && ctx->output_bos) {
+                /* Read from a different output BO */
+                int obo_idx = v - 2;
+                orknn_bo_sync_from_device(ctx->npu_fd, &ctx->output_bos[obo_idx]);
+                npu_output_src = (uint8_t *)ctx->output_bos[obo_idx].map + ctx->act_output_offsets[idx];
+                orknn_log(2, "outputs_get: reading output[%u] from output_bos[%d]+0x%x",
+                          idx, obo_idx, ctx->act_output_offsets[idx]);
+            }
         }
 
         /* Debug: dump first 32 bytes of output BO */
