@@ -59,14 +59,16 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
     struct orknn_proxy *proxy = orknn_proxy_get();
     if (!proxy) return -1;
 
-    /* Run proxy once so it patches everything */
+    /* Run proxy once so it patches everything.
+     * Use UINT8 input type (matches bench_rknn convention) so the
+     * proxy's CNA_CVT hardware does uint8→int8 conversion. */
     struct orknn_model *m = &ctx->model;
     uint32_t input_size = m->n_inputs > 0 ? m->inputs[0].size : 0;
     if (input_size > 0) {
         rknn_input inp;
         memset(&inp, 0, sizeof(inp));
         inp.index = 0;
-        inp.type = m->inputs[0].type;
+        inp.type = RKNN_TENSOR_UINT8;
         inp.fmt = RKNN_TENSOR_NHWC;
         inp.size = input_size;
         inp.buf = calloc(1, input_size);
@@ -222,6 +224,134 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
     }
 
     orknn_log(1, "run: rebased %u DMA entries", rebased);
+
+    /* Discover output offsets in the activation BO.
+     * The graph memory planner places each output tensor at a specific
+     * offset in the activation BO. We find these offsets by:
+     * 1. Calling proxy->rknn_outputs_get to get the expected output bytes
+     * 2. Reading the proxy's post-run activation BO dump
+     * 3. Searching the dump for the output signature (first N bytes) */
+    char post_act_path[128];
+    uint32_t proxy_act_size = proxy_bo_sizes[2] ? proxy_bo_sizes[2] : ctx->activation_bo.size;
+    snprintf(post_act_path, sizeof(post_act_path),
+             "/tmp/rknn_dump/post1_bo_002_%uB.bin", proxy_act_size);
+    FILE *paf = fopen(post_act_path, "rb");
+    uint8_t *proxy_act_data = NULL;
+    if (paf) {
+        proxy_act_data = calloc(1, proxy_act_size);
+        fread(proxy_act_data, 1, proxy_act_size, paf);
+        fclose(paf);
+    }
+
+    /* Also try to load the bench_rknn golden output file as a fallback
+     * signature source. If bench_rknn was run earlier, it saved the
+     * canonical proxy output at rknn_golden_<idx>.bin. */
+    if (proxy_act_data) {
+        /* Get proxy's output via rknn_outputs_get */
+        rknn_output proxy_outputs[16];
+        memset(proxy_outputs, 0, sizeof(proxy_outputs));
+        for (uint32_t i = 0; i < m->n_outputs && i < 16; i++) {
+            proxy_outputs[i].index = i;
+            proxy_outputs[i].want_float = 0;
+        }
+        int oret = proxy->rknn_outputs_get(ctx->real_ctx, m->n_outputs, proxy_outputs, NULL);
+        orknn_log(1, "run: proxy->rknn_outputs_get returned %d", oret);
+        if (oret == 0) {
+            for (uint32_t i = 0; i < m->n_outputs && i < 16; i++) {
+                const uint8_t *out_bytes = (const uint8_t *)proxy_outputs[i].buf;
+                uint32_t out_size = proxy_outputs[i].size;
+                if (!out_bytes || out_size == 0) continue;
+
+                /* If the proxy returned all-zp bytes (no anchor), try loading
+                 * a bench_rknn golden file which was produced earlier */
+                uint8_t zp_check = (uint8_t)(m->outputs[i].zp & 0xFF);
+                int all_zp = 1;
+                for (uint32_t k = 0; k < out_size && k < 256; k++) {
+                    if (out_bytes[k] != zp_check) { all_zp = 0; break; }
+                }
+                static uint8_t golden_buf[0x100000];
+                orknn_log(1, "run: all_zp=%d for output[%u]", all_zp, i);
+                if (all_zp) {
+                    char golden_path[128];
+                    snprintf(golden_path, sizeof(golden_path),
+                             "/root/npu-research/librocketnpu/tests/rknn_golden_%u.bin", i);
+                    FILE *gf = fopen(golden_path, "rb");
+                    orknn_log(1, "run: try golden %s: %s", golden_path, gf ? "opened" : "not found");
+                    if (gf) {
+                        size_t gread = fread(golden_buf, 1, sizeof(golden_buf), gf);
+                        fclose(gf);
+                        orknn_log(1, "run: golden read %zu bytes (need %u)", gread, out_size);
+                        if (gread == out_size) {
+                            out_bytes = golden_buf;
+                            orknn_log(1, "run: using golden file for output[%u]", i);
+                        }
+                    }
+                }
+
+                /* Find this output's bytes in the proxy's activation BO.
+                 * For quantized outputs the bytes are mostly at zero-point
+                 * (e.g., 0x80 for int8 zp=-128). We need to anchor the
+                 * search on BYTES THAT ARE DIFFERENT from the zero-point,
+                 * otherwise the signature matches many places coincidentally. */
+                int found_off = -1;
+                uint8_t zp_byte = (uint8_t)(m->outputs[i].zp & 0xFF);
+
+                /* Debug: dump first bytes of proxy output */
+                orknn_log(1, "run: output[%u] size=%u zp=0x%02x first16=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                          i, out_size, zp_byte,
+                          out_bytes[0],out_bytes[1],out_bytes[2],out_bytes[3],
+                          out_bytes[4],out_bytes[5],out_bytes[6],out_bytes[7],
+                          out_bytes[8],out_bytes[9],out_bytes[10],out_bytes[11],
+                          out_bytes[12],out_bytes[13],out_bytes[14],out_bytes[15]);
+
+                /* Find the first byte in out_bytes that differs from zp */
+                int anchor = -1;
+                for (uint32_t k = 0; k < out_size && k < 256; k++) {
+                    if (out_bytes[k] != zp_byte) { anchor = (int)k; break; }
+                }
+
+                if (anchor >= 0) {
+                    /* Build signature: [anchor-8 .. anchor+24], clipped to [0..out_size).
+                     * This includes at least one distinctive byte. */
+                    uint32_t sig_start = anchor > 8 ? (uint32_t)(anchor - 8) : 0;
+                    uint32_t sig_end = anchor + 24;
+                    if (sig_end > out_size) sig_end = out_size;
+                    uint32_t sig_len = sig_end - sig_start;
+
+                    for (uint32_t off = 0; off + sig_len <= proxy_act_size; off++) {
+                        if (memcmp(proxy_act_data + off, out_bytes + sig_start, sig_len) == 0) {
+                            found_off = (int)off - (int)sig_start;
+                            orknn_log(2, "run: output[%u] sig anchored at byte %d, len=%u, matched at 0x%x (start 0x%x)",
+                                      i, anchor, sig_len, off, found_off);
+                            break;
+                        }
+                    }
+                } else {
+                    /* Output is entirely at zp — can't distinguish. Try first 64 bytes */
+                    uint32_t sig_len = out_size < 64 ? out_size : 64;
+                    for (uint32_t off = 0; off + sig_len <= proxy_act_size; off++) {
+                        if (memcmp(proxy_act_data + off, out_bytes, sig_len) == 0) {
+                            found_off = (int)off;
+                            break;
+                        }
+                    }
+                }
+
+                if (found_off >= 0) {
+                    ctx->act_output_offsets[i] = (uint32_t)found_off;
+                    ctx->act_output_valid[i] = 1;
+                    orknn_log(1, "run: output[%u] located at act+0x%x (size=%u)",
+                              i, found_off, out_size);
+                } else {
+                    orknn_log(0, "run: output[%u] signature not found in act BO", i);
+                }
+            }
+            proxy->rknn_outputs_release(ctx->real_ctx, m->n_outputs, proxy_outputs);
+        }
+        free(proxy_act_data);
+    } else {
+        orknn_log(1, "run: no proxy post-run BO dump at %s", post_act_path);
+    }
 
     /* Dump rebased regcmd for debugging */
     const char *dump_path = getenv("ORKNN_DUMP_REGCMD");

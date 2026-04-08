@@ -157,6 +157,11 @@ struct orknn_context {
     rknn_core_mask core_mask;
     int64_t hw_elapse_time;
     uint64_t frame_id;
+    /* Output discovery: offsets within activation BO where the final
+     * output tensors live. Discovered from proxy's rknn_outputs_get
+     * during init. */
+    uint32_t act_output_offsets[16];
+    uint8_t  act_output_valid[16];
     /* Logging */
     int log_level;
 };

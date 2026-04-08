@@ -29,6 +29,20 @@ int orknn_own_outputs_get(struct orknn_context *ctx, uint32_t n_outputs,
 
         /* Sync output BO from device */
         orknn_bo_sync_from_device(ctx->npu_fd, bo);
+        /* Also sync activation BO since output often lands there */
+        orknn_bo_sync_from_device(ctx->npu_fd, &ctx->activation_bo);
+
+        /* Determine where to read the output from.
+         * The NPU writes output into the activation BO at a compiler-
+         * decided offset (discovered during init via proxy signature match).
+         * If we have a valid offset, read from activation BO; otherwise
+         * fall back to the dedicated output BO. */
+        uint8_t *npu_output_src = (uint8_t *)bo->map;
+        if (idx < 16 && ctx->act_output_valid[idx]) {
+            npu_output_src = (uint8_t *)ctx->activation_bo.map + ctx->act_output_offsets[idx];
+            orknn_log(2, "outputs_get: reading output[%u] from act+0x%x",
+                      idx, ctx->act_output_offsets[idx]);
+        }
 
         /* Debug: dump first 32 bytes of output BO */
         if (getenv("ORKNN_DUMP_OUTPUT")) {
@@ -57,7 +71,7 @@ int orknn_own_outputs_get(struct orknn_context *ctx, uint32_t n_outputs,
         }
         outputs[i].size = out_size;
 
-        uint8_t *src = (uint8_t *)bo->map;
+        uint8_t *src = npu_output_src;
         uint8_t *dst = (uint8_t *)outputs[i].buf;
 
         if (ti->n_dims == 4) {
