@@ -30,6 +30,20 @@ int orknn_own_outputs_get(struct orknn_context *ctx, uint32_t n_outputs,
         /* Sync output BO from device */
         orknn_bo_sync_from_device(ctx->npu_fd, bo);
 
+        /* Debug: dump first 32 bytes of output BO */
+        if (getenv("ORKNN_DUMP_OUTPUT")) {
+            uint8_t *p = (uint8_t *)bo->map;
+            fprintf(stderr, "[openrknn] output BO[%u] first 32 bytes:", idx);
+            for (int k = 0; k < 32; k++) fprintf(stderr, " %02x", p[k]);
+            fprintf(stderr, "\n");
+            /* Also dump activation BO around offset 0x700 */
+            orknn_bo_sync_from_device(ctx->npu_fd, &ctx->activation_bo);
+            uint8_t *act = (uint8_t *)ctx->activation_bo.map;
+            fprintf(stderr, "[openrknn] act BO +0x700 first 32:");
+            for (int k = 0; k < 32; k++) fprintf(stderr, " %02x", act[0x700 + k]);
+            fprintf(stderr, "\n");
+        }
+
         uint32_t out_size;
         if (outputs[i].want_float)
             out_size = ti->n_elems * sizeof(float);

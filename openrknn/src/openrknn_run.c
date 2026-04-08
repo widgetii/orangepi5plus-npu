@@ -157,9 +157,8 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
     orknn_log(1, "run:               ours  wt=0x%x act=0x%x in=0x%x out=0x%x",
               our_wt, our_act, our_in, our_out);
 
-    /* Rebase DMA addresses: check EVERY register's VALUE against proxy BO ranges.
-     * This is safer than checking register IDs — it only touches values that
-     * are actually within a known proxy BO address range. */
+    /* Rebase DMA addresses: only touch registers that are actually DMA
+     * address registers AND whose values fall in a known proxy BO range. */
     uint64_t *rc = (uint64_t *)((uint8_t *)ctx->weight_bo.map + rc_off);
     uint32_t rc_entries = m->regcmd_size / 8;
     uint32_t rebased = 0;
@@ -183,9 +182,25 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
     uint32_t pi_end = proxy_in + (proxy_bo_sizes[3] ? proxy_bo_sizes[3] : 0x100000);
     uint32_t po_end = proxy_out + (proxy_bo_sizes[4] ? proxy_bo_sizes[4] : 0x100000);
 
+    /* Known DMA address registers (verified from librocketnpu rnpu_registers.h) */
+    #define IS_DMA_REG(r) ( \
+        (r) == 0x0010 || /* PC_BASE_ADDRESS */ \
+        (r) == 0x1070 || /* CNA_SRC_BASE */ \
+        (r) == 0x1110 || /* RDMA_WT_BASE */ \
+        (r) == 0x4020 || /* DPU_DST_BASE */ \
+        (r) == 0x4110 || /* WDMA_BASE */ \
+        (r) == 0x5018 || /* RDMA activation */ \
+        (r) == 0x5020 || /* RDMA_BS_BASE */ \
+        (r) == 0x5038 || /* RDMA related */ \
+        (r) == 0x6070 || /* PC related */ \
+        (r) == 0x701c    /* PC related */ \
+    )
+
     for (uint32_t i = 0; i < rc_entries; i++) {
+        uint16_t reg = rc[i] & 0xFFFF;
         uint32_t val = (rc[i] >> 16) & 0xFFFFFFFF;
         if (val == 0) continue;
+        if (!IS_DMA_REG(reg)) continue;
 
         uint32_t new_val = val;
         if (val >= proxy_wt && val < pw_end)
@@ -197,7 +212,7 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
         else if (proxy_out && val >= proxy_out && val < po_end)
             new_val = our_out + (val - proxy_out);
         else
-            continue; /* not a BO address — don't touch */
+            continue;
 
         if (new_val != val) {
             rc[i] = (rc[i] & 0xFFFF000000000000ULL) |
@@ -207,6 +222,31 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
     }
 
     orknn_log(1, "run: rebased %u DMA entries", rebased);
+
+    /* Dump rebased regcmd for debugging */
+    const char *dump_path = getenv("ORKNN_DUMP_REGCMD");
+    if (dump_path) {
+        FILE *df = fopen(dump_path, "w");
+        if (df) {
+            struct { uint32_t f[8]; uint64_t regcmd_addr; } __attribute__((packed)) *tsk = ctx->task_bo.map;
+            for (uint32_t t = 0; t < m->task_count && t < 10; t++) {
+                uint32_t amt = tsk[t].f[6];
+                uint64_t addr = tsk[t].regcmd_addr;
+                uint32_t bo_off = (uint32_t)(addr - ctx->weight_bo.dma_addr);
+                uint64_t *ent = (uint64_t *)((uint8_t *)ctx->weight_bo.map + bo_off);
+                fprintf(df, "=== TASK[%u] addr=0x%lx bo_off=%u amt=%u em=0x%x ===\n",
+                        t, (unsigned long)addr, bo_off, amt, tsk[t].f[2]);
+                for (uint32_t e2 = 0; e2 < amt + 4; e2++) {
+                    uint16_t reg2 = ent[e2] & 0xFFFF;
+                    uint32_t val2 = (ent[e2] >> 16) & 0xFFFFFFFF;
+                    uint16_t tgt2 = (ent[e2] >> 48) & 0xFFFF;
+                    fprintf(df, "  [%3u] tgt=0x%04x reg=0x%04x val=0x%08x\n",
+                            e2, tgt2, reg2, val2);
+                }
+            }
+            fclose(df);
+        }
+    }
 
     /* Task BO regcmd_addr values were already set correctly by
      * orknn_alloc_model_bos — don't rebase them. */
