@@ -120,14 +120,6 @@ int orknn_own_inputs_set(struct orknn_context *ctx, uint32_t n_inputs,
 
         orknn_bo_sync_to_device(ctx->npu_fd, bo);
 
-        /* Also copy input data to the beginning of the activation BO.
-         * The regcmd SRC_BASE for the first op is offset 0 in the activation
-         * BO, which is where the NPU reads input from. */
-        if (bo->size <= ctx->activation_bo.size) {
-            memcpy(ctx->activation_bo.map, bo->map, bo->size);
-            orknn_bo_sync_to_device(ctx->npu_fd, &ctx->activation_bo);
-        }
-
         orknn_log(2, "inputs_set: input[%u] %u bytes -> BO dma=0x%lx + act BO",
                   idx, inputs[i].size, (unsigned long)bo->dma_addr);
     }

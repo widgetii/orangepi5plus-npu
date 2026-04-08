@@ -931,22 +931,27 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
         uint32_t v = (uint32_t)strtoul(getenv("ORKNN_MAX_SEGS"), NULL, 10);
         if (v < max_segs) max_segs = v;
     }
+    /* Pick cycle snapshot by run count — cycle[run_count] capped at last
+     * available cycle. This matches bench_rknn's warmup + iter 1 pattern:
+     * call 0 = warmup, call 1 = iter 1 (saved), etc. */
     for (uint32_t i = 0; i < max_segs; i++) {
-        /* If a per-submit task BO snapshot exists, copy it into our task BO
-         * and rebase regcmd_addr from proxy to our weight BO.
-         * Only do this for segments > 0 — segment 0 uses the task data set
-         * up by orknn_alloc_model_bos from the FB (which produces correct
-         * results for single-submit models like MBv1 when running only
-         * segment 0). */
         struct orknn_segment *seg = &m->segments[i];
-        if (i > 0 && seg->task_bo_data && seg->task_bo_size <= ctx->task_bo.size) {
-            memcpy(ctx->task_bo.map, seg->task_bo_data, seg->task_bo_size);
+        uint32_t cycle_idx = ctx->run_count;
+        if (cycle_idx >= seg->n_cycles)
+            cycle_idx = seg->n_cycles > 0 ? seg->n_cycles - 1 : 0;
+        uint8_t *seg_task_data = seg->n_cycles > 0
+            ? seg->task_bo_data[cycle_idx] : NULL;
+        uint32_t seg_task_size = seg->n_cycles > 0
+            ? seg->task_bo_size[cycle_idx] : 0;
+
+        if (seg_task_data && seg_task_size <= ctx->task_bo.size) {
+            memcpy(ctx->task_bo.map, seg_task_data, seg_task_size);
             /* Rebase regcmd_addr field for every task (offset 32 in each 40-byte task) */
             struct {
                 uint32_t f[8];
                 uint64_t regcmd_addr;
             } __attribute__((packed)) *ts = ctx->task_bo.map;
-            uint32_t n_tasks = seg->task_bo_size / 40;
+            uint32_t n_tasks = seg_task_size / 40;
             /* Proxy weight BO base from dump's submit_1.txt */
             uint64_t proxy_wt_base = 0;
             FILE *mf = fopen("/tmp/rknn_dump/submit_1.txt", "r");
@@ -981,5 +986,6 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
         }
     }
 
+    ctx->run_count++;
     return RKNN_SUCC;
 }

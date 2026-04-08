@@ -805,21 +805,28 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
 
     /* Try to read proxy submit metadata from the intercept dump.
      * Models like YOLO issue MULTIPLE submits per rknn_run (one per
-     * hardware stage). We read submit_1.txt, submit_2.txt, ... until
-     * we either exhaust the files OR detect a repeat (indicating the
-     * next run's submits). */
+     * hardware stage). bench_rknn runs warmup + N iters and saves the
+     * LAST iter's output. The proxy uses DIFFERENT task BO content for
+     * each iteration (MBv1 iter 1 writes the final output to output
+     * BO[0], warmup doesn't). We must use the LAST cycle's task data.
+     *
+     * Approach:
+     *  1. Read all submit_*.txt files.
+     *  2. Detect cycle length by the first sc_start repeat.
+     *  3. Use the LAST complete cycle's submits as our segments
+     *     (and remember their submit indices so we load the right
+     *     sub<N>_bo_000 snapshot later). */
     #define MAX_SEGS 32
-    uint32_t seg_flags[MAX_SEGS] = {0};
-    uint32_t seg_sc_start[MAX_SEGS] = {0};
-    uint32_t seg_sc_count[MAX_SEGS] = {0};
-    uint32_t seg_task_num[MAX_SEGS] = {0};
-    int n_segs = 0;
-    uint32_t first_sc_start_seen = UINT32_MAX;
+    uint32_t all_flags[128] = {0};
+    uint32_t all_sc_start[128] = {0};
+    uint32_t all_sc_count[128] = {0};
+    uint32_t all_task_num[128] = {0};
+    int n_all = 0;
 
     sc_tasks = total_tasks;
     sc_count = total_tasks;
 
-    for (int sn = 1; sn <= 64 && n_segs < MAX_SEGS; sn++) {
+    for (int sn = 1; sn <= 128 && n_all < 128; sn++) {
         char path[64];
         snprintf(path, sizeof(path), "/tmp/rknn_dump/submit_%d.txt", sn);
         FILE *sf = fopen(path, "r");
@@ -842,17 +849,44 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
         }
         fclose(sf);
 
-        /* A second appearance of sc_start=first_seen means the next
-         * iteration's first submit — stop. */
-        if (sn > 1 && scs == first_sc_start_seen) break;
-        if (sn == 1) first_sc_start_seen = scs;
+        all_flags[n_all] = flags;
+        all_sc_start[n_all] = scs;
+        all_sc_count[n_all] = scc;
+        all_task_num[n_all] = tasks_n;
+        n_all++;
+    }
 
-        seg_flags[n_segs] = flags;
-        seg_sc_start[n_segs] = scs;
-        seg_sc_count[n_segs] = scc;
-        seg_task_num[n_segs] = tasks_n;
+    /* Detect cycle length: first index >0 where sc_start == all_sc_start[0]. */
+    int cycle = n_all;
+    for (int k = 1; k < n_all; k++) {
+        if (all_sc_start[k] == all_sc_start[0]) { cycle = k; break; }
+    }
+
+    /* Last-cycle start index: largest multiple of cycle <= n_all - cycle. */
+    int last_start = n_all - cycle;
+    if (last_start < 0) last_start = 0;
+
+    uint32_t seg_flags[MAX_SEGS] = {0};
+    uint32_t seg_sc_start[MAX_SEGS] = {0};
+    uint32_t seg_sc_count[MAX_SEGS] = {0};
+    uint32_t seg_task_num[MAX_SEGS] = {0};
+    int seg_submit_idx[MAX_SEGS] = {0}; /* 1-based submit index for dump path */
+    int n_segs = 0;
+
+    /* Segments themselves describe cycle layout from submit 1..cycle.
+     * Per-cycle task BO snapshots are loaded separately below. */
+    for (int k = 0; k < cycle && n_segs < MAX_SEGS && k < n_all; k++) {
+        seg_flags[n_segs] = all_flags[k];
+        seg_sc_start[n_segs] = all_sc_start[k];
+        seg_sc_count[n_segs] = all_sc_count[k];
+        seg_task_num[n_segs] = all_task_num[k];
+        seg_submit_idx[n_segs] = k + 1;
         n_segs++;
     }
+    (void)last_start;
+
+    orknn_log(2, "model: read %d submits, cycle=%d, last_cycle starts at submit_%d",
+              n_all, cycle, last_start + 1);
 
     if (n_segs == 0) {
         /* No dump available — single-segment fallback */
@@ -918,14 +952,19 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
         orknn_log(2, "model: seg[%d] flags=0x%x sc_start=%u sc_count=%u task_number=%u",
                   s, seg_flags[s], seg_sc_start[s], seg_sc_count[s], seg_task_num[s]);
 
-        /* Try to load the per-submit task BO snapshot. The proxy may
-         * patch the task BO in place between submits (YOLO does this).
-         * We snapshot each submit's task BO and replay the copies
-         * verbatim before each submit. */
-        DIR *dd = opendir("/tmp/rknn_dump");
-        if (dd) {
+        /* Load per-cycle task BO snapshots.
+         * Cycle c's submit index for this segment = s + 1 + c * cycle.
+         * The proxy uses different task data per iteration, so we store
+         * all available cycles and pick by run_count at submit time. */
+        int total_cycles = cycle > 0 ? (n_all / cycle) : 1;
+        if (total_cycles > ORKNN_MAX_CYCLES) total_cycles = ORKNN_MAX_CYCLES;
+        model->segments[s].n_cycles = 0;
+        for (int c = 0; c < total_cycles; c++) {
+            int submit_idx = s + 1 + c * cycle;
+            DIR *dd = opendir("/tmp/rknn_dump");
+            if (!dd) break;
             char pfx[32];
-            snprintf(pfx, sizeof(pfx), "sub%d_bo_000_", s + 1);
+            snprintf(pfx, sizeof(pfx), "sub%d_bo_000_", submit_idx);
             struct dirent *de;
             char tpath[256] = {0};
             while ((de = readdir(dd))) {
@@ -935,22 +974,22 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
                 }
             }
             closedir(dd);
-            if (tpath[0]) {
-                FILE *tf = fopen(tpath, "rb");
-                if (tf) {
-                    fseek(tf, 0, SEEK_END);
-                    long fsz = ftell(tf);
-                    fseek(tf, 0, SEEK_SET);
-                    if (fsz > 0) {
-                        model->segments[s].task_bo_data = malloc(fsz);
-                        model->segments[s].task_bo_size = (uint32_t)fsz;
-                        fread(model->segments[s].task_bo_data, 1, fsz, tf);
-                        orknn_log(2, "model: seg[%d] task_bo_data loaded from %s (%ld bytes)",
-                                  s, tpath, fsz);
-                    }
-                    fclose(tf);
-                }
+            if (!tpath[0]) continue;
+            FILE *tf = fopen(tpath, "rb");
+            if (!tf) continue;
+            fseek(tf, 0, SEEK_END);
+            long fsz = ftell(tf);
+            fseek(tf, 0, SEEK_SET);
+            if (fsz > 0) {
+                uint32_t idx = model->segments[s].n_cycles;
+                model->segments[s].task_bo_data[idx] = malloc(fsz);
+                model->segments[s].task_bo_size[idx] = (uint32_t)fsz;
+                fread(model->segments[s].task_bo_data[idx], 1, fsz, tf);
+                model->segments[s].n_cycles++;
+                orknn_log(2, "model: seg[%d] cycle[%u] loaded from %s (%ld bytes)",
+                          s, idx, tpath, fsz);
             }
+            fclose(tf);
         }
     }
 

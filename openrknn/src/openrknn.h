@@ -99,17 +99,21 @@ struct orknn_bo {
  * Submit segment (from .rknn model)
  * ====================================================================== */
 
+#define ORKNN_MAX_CYCLES 4
+
 struct orknn_segment {
     uint32_t flags;
     uint32_t sc_start;
     uint32_t sc_count;
     uint32_t task_number;
-    /* Per-submit task BO snapshot loaded from proxy dump.
-     * YOLO-style models patch the task BO between submits in place.
-     * To replicate, we copy task_bo_data into the task BO before
-     * each submit. NULL if no snapshot is available. */
-    uint8_t *task_bo_data;
-    uint32_t task_bo_size;
+    /* Per-cycle task BO snapshots. The proxy patches task BO data
+     * differently between iterations (MBv1 iter 1 writes output BO
+     * while warmup doesn't). cycle[0] = warmup/first iter, cycle[1] =
+     * second iter, etc. We pick cycle[min(run_count, n-1)] on each
+     * orknn_own_run call. n_cycles=0 means no snapshots available. */
+    uint8_t *task_bo_data[ORKNN_MAX_CYCLES];
+    uint32_t task_bo_size[ORKNN_MAX_CYCLES];
+    uint32_t n_cycles;
 };
 
 /* ======================================================================
@@ -163,6 +167,7 @@ struct orknn_context {
     rknn_core_mask core_mask;
     int64_t hw_elapse_time;
     uint64_t frame_id;
+    uint32_t run_count;
     /* Output discovery: offsets within activation BO where the final
      * output tensors live. Discovered from proxy's rknn_outputs_get
      * during init. */

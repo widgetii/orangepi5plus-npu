@@ -6,6 +6,7 @@
 #include "openrknn.h"
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
@@ -32,8 +33,18 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
     orknn_log(1, "memory: weight BO: %u bytes, dma=0x%lx",
               wt_size, (unsigned long)ctx->weight_bo.dma_addr);
 
-    /* Task BO — needs KERNEL_MAPPING (0x8) flag so RKNPU driver can read it */
+    /* Task BO — needs KERNEL_MAPPING (0x8) flag so RKNPU driver can read it.
+     * Must be large enough to fit the proxy's per-segment task BO snapshots
+     * (which may be larger than our own FB-derived task data). */
     uint32_t task_size = ALIGN_UP(m->task_data_size, 4096);
+    for (uint32_t s = 0; s < m->segment_count; s++) {
+        for (uint32_t c = 0; c < m->segments[s].n_cycles; c++) {
+            if (m->segments[s].task_bo_size[c] > 0) {
+                uint32_t need = ALIGN_UP(m->segments[s].task_bo_size[c], 4096);
+                if (need > task_size) task_size = need;
+            }
+        }
+    }
     if (task_size < 4096) task_size = 4096;
     if (orknn_bo_create_flags(fd, task_size, 0x40b, &ctx->task_bo)) {
         orknn_log(0, "memory: failed to allocate task BO (%u bytes)", task_size);
