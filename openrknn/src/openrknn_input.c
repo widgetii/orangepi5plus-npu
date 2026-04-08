@@ -111,6 +111,23 @@ int orknn_own_inputs_set(struct orknn_context *ctx, uint32_t n_inputs,
                           inputs[i].type, ti->type);
                 return RKNN_ERR_INPUT_INVALID;
             }
+
+            /* Restore proxy's W-padding bytes from the cached BO[3].
+             * For each byte where the cache holds a NON-ZERO value that
+             * our NC1HWC2 write didn't touch (padding slot), copy it
+             * into our BO. This restores DeepLabv3's 0x80 W-padding
+             * (mean/std-derived) without corrupting user data positions.
+             * For MBv1/YOLOv5 the cache is all zeros so this is a no-op. */
+            if (i == 0 && ctx->proxy_input_cache &&
+                ctx->proxy_input_cache_size > 0) {
+                const uint8_t *cache = ctx->proxy_input_cache;
+                uint32_t lim = ctx->proxy_input_cache_size;
+                if (lim > bo->size) lim = bo->size;
+                for (uint32_t k = 0; k < lim; k++) {
+                    if (cache[k] != 0)
+                        dst[k] = cache[k];
+                }
+            }
         } else {
             /* Non-4D or non-NHWC: direct copy */
             uint32_t copy_size = inputs[i].size;

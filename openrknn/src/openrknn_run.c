@@ -162,6 +162,29 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
         return -1;
     }
 
+    /* Cache the proxy's BO[3] (first input BO) contents for use by
+     * inputs_set. The proxy's W-padding bytes (e.g. 0x80 for DeepLabv3
+     * with mean/std=127.5) can't be derived from FB metadata, so we
+     * snapshot them from the dump and restore after every inputs_set
+     * data write. For W 16-aligned models (MBv1, YOLOv5), the proxy
+     * BO[3] is all zeros so the cache copy is a no-op. */
+    if (!ctx->proxy_input_cache && proxy_bo_sizes[3] > 0) {
+        char ipath[128];
+        snprintf(ipath, sizeof(ipath), "/tmp/rknn_dump/sub1_bo_003_%uB.bin",
+                 proxy_bo_sizes[3]);
+        FILE *f3 = fopen(ipath, "rb");
+        if (f3) {
+            ctx->proxy_input_cache = malloc(proxy_bo_sizes[3]);
+            if (ctx->proxy_input_cache) {
+                ctx->proxy_input_cache_size = (uint32_t)fread(
+                    ctx->proxy_input_cache, 1, proxy_bo_sizes[3], f3);
+                orknn_log(1, "run: cached proxy BO[3] (%u bytes)",
+                          ctx->proxy_input_cache_size);
+            }
+            fclose(f3);
+        }
+    }
+
     uint32_t our_wt = (uint32_t)ctx->weight_bo.dma_addr;
     uint32_t our_act = (uint32_t)ctx->activation_bo.dma_addr;
     uint32_t our_in = ctx->input_bos ? (uint32_t)ctx->input_bos[0].dma_addr : 0;
@@ -199,16 +222,27 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
     uint32_t pw_end = proxy_wt + (proxy_bo_sizes[1] ? proxy_bo_sizes[1] : ctx->weight_bo.size);
     uint32_t pa_end = proxy_act + (proxy_bo_sizes[2] ? proxy_bo_sizes[2] : ctx->activation_bo.size);
     uint32_t pi_end = proxy_in + (proxy_bo_sizes[3] ? proxy_bo_sizes[3] : 0x100000);
+    /* Proxy task BO (BO[0]) — models like ResNet50 embed per-task CVT
+     * scale/offset tables inline in the task BO and reference them via
+     * DMA pointers in the regcmd. */
+    uint32_t proxy_task = proxy_bo_dma[0];
+    uint32_t pt_end = proxy_task + proxy_bo_sizes[0];
+    uint32_t our_task = (uint32_t)ctx->task_bo.dma_addr;
 
-    /* Known DMA address registers (verified from librocketnpu rnpu_registers.h) */
+    /* Known DMA address registers (verified from librocketnpu rnpu_registers.h
+     * plus empirically from ResNet50 regcmd analysis). */
     #define IS_DMA_REG(r) ( \
         (r) == 0x0010 || /* PC_BASE_ADDRESS */ \
         (r) == 0x1070 || /* CNA_SRC_BASE */ \
         (r) == 0x1110 || /* RDMA_WT_BASE */ \
+        (r) == 0x1184 || /* CNA per-task CVT table ptr (ResNet50) */ \
         (r) == 0x4020 || /* DPU_DST_BASE */ \
+        (r) == 0x4074 || /* DPU per-task data ptr (ResNet50) */ \
+        (r) == 0x4080 || /* DPU_OUT_CVT_OFFSET table ptr (ResNet50) */ \
         (r) == 0x4110 || /* WDMA_BASE */ \
         (r) == 0x5018 || /* RDMA activation */ \
         (r) == 0x5020 || /* RDMA_BS_BASE */ \
+        (r) == 0x502c || /* RDMA BS extended ptr (ResNet50) */ \
         (r) == 0x5038 || /* RDMA related */ \
         (r) == 0x6070 || /* PC related */ \
         (r) == 0x701c    /* PC related */ \
@@ -231,6 +265,9 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
             matched = 1;
         } else if (proxy_in && val >= proxy_in && val < pi_end) {
             new_val = our_in + (val - proxy_in);
+            matched = 1;
+        } else if (proxy_task && val >= proxy_task && val < pt_end) {
+            new_val = our_task + (val - proxy_task);
             matched = 1;
         } else {
             /* Check each output BO range */
@@ -368,6 +405,11 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
                 /* layout tag stored on successful match:
                  * 0=NC1HWC2, 1=HWC1C2, 3=HBWCH16 */
                 uint8_t sig_layouts[6] = {3, 3, 0, 0, 1, 1};
+                /* user-output byte order: 0=NHWC (c-minor), 1=NCHW (c-major).
+                 * Matches the writes: sig_a=HBWCH16+NHWC, sig_b=HBWCH16+NCHW,
+                 * sig_c=NC1HWC2+NHWC, sig_d=NC1HWC2+NCHW, sig_e=HWC1C2+NHWC,
+                 * sig_f=HWC1C2+NCHW. */
+                uint8_t sig_src_orders[6] = {0, 1, 0, 1, 0, 1};
 
                 if (oti->n_dims == 4) {
                     uint32_t N = oti->dims[0], H = oti->dims[1];
@@ -378,19 +420,26 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
                     uint32_t H_blk = (H + 15) / 16;
                     uint32_t padH = H_blk * 16;
                     uint32_t tile_len = N * C1 * H * W * c2;
-                    /* HBWCH16 uses UNPADDED C in strides */
-                    uint32_t hbwch16_len = N * H_blk * W * C * 16;
+                    /* HBWCH16 per-h_blk stride = W*C*16 aligned up to 64 bytes.
+                     * YOLOv5 outputs are naturally 64-aligned; DeepLabv3
+                     * (W*C*16 = 21840 not aligned) gets +48 padding per h_blk. */
+                    uint32_t hbwch16_stride = ((W * C * 16) + 63u) & ~63u;
+                    uint32_t hbwch16_len = N * H_blk * hbwch16_stride;
 
-                    if (tile_len <= sizeof(raw_sig_a) &&
-                        hbwch16_len <= sizeof(raw_sig_e)) {
-                        memset(raw_sig_a, zp_byte, tile_len);
-                        memset(raw_sig_b, zp_byte, tile_len);
+                    if (tile_len <= sizeof(raw_sig_c) &&
+                        hbwch16_len <= sizeof(raw_sig_a)) {
+                        /* HEAD order: sig_a/b=HBWCH16, sig_c/d=NC1HWC2,
+                         * sig_e/f=HWC1C2. HBWCH16 uses hbwch16_len (64-
+                         * aligned stride); the others use tile_len. */
+                        memset(raw_sig_a, zp_byte, hbwch16_len);
+                        memset(raw_sig_b, zp_byte, hbwch16_len);
                         memset(raw_sig_c, zp_byte, tile_len);
                         memset(raw_sig_d, zp_byte, tile_len);
-                        memset(raw_sig_e, zp_byte, hbwch16_len);
-                        memset(raw_sig_f, zp_byte, hbwch16_len);
-                        sig_lens[0] = sig_lens[1] = sig_lens[2] = sig_lens[3] = tile_len;
-                        sig_lens[4] = sig_lens[5] = hbwch16_len;
+                        memset(raw_sig_e, zp_byte, tile_len);
+                        memset(raw_sig_f, zp_byte, tile_len);
+                        sig_lens[0] = sig_lens[1] = hbwch16_len;
+                        sig_lens[2] = sig_lens[3] = tile_len;
+                        sig_lens[4] = sig_lens[5] = tile_len;
 
                         for (uint32_t n = 0; n < N; n++) {
                             for (uint32_t h = 0; h < H; h++) {
@@ -407,8 +456,8 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
                                         uint32_t hwc1c2_off =
                                             ((n * H + h) * W + w) * padC + c;
                                         uint32_t hbwch16_off =
-                                            ((n * H_blk + h_blk) * W + w) * C * 16
-                                            + c * 16 + h_in;
+                                            (n * H_blk + h_blk) * hbwch16_stride
+                                            + w * C * 16 + c * 16 + h_in;
                                         raw_sig_a[hbwch16_off] = out_bytes[nhwc_off];
                                         raw_sig_b[hbwch16_off] = out_bytes[nchw_off];
                                         raw_sig_c[nc1hwc2_off] = out_bytes[nhwc_off];
@@ -427,12 +476,14 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
                 const uint8_t *cands[7];
                 uint32_t cand_sizes[7];
                 uint8_t cand_layouts[7];
+                uint8_t cand_src_orders[7];
                 int n_cands = 0;
                 for (int s = 0; s < 6; s++) {
                     if (sig_lens[s] > 0) {
                         cands[n_cands] = sig_ptrs[s];
                         cand_sizes[n_cands] = sig_lens[s];
                         cand_layouts[n_cands] = sig_layouts[s];
+                        cand_src_orders[n_cands] = sig_src_orders[s];
                         n_cands++;
                     }
                 }
@@ -440,6 +491,7 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
                 cands[n_cands] = out_bytes;
                 cand_sizes[n_cands] = out_size;
                 cand_layouts[n_cands] = 2;
+                cand_src_orders[n_cands] = 0;
                 n_cands++;
 
                 /* Search outer loop: sig_len (longest → shortest).
@@ -468,6 +520,47 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
                     fclose(of);
                 }
 
+                /* Fast path: most proxies lay out output BOs in natural
+                 * order (proxy BO[4 + i] → user output[i]). Try this
+                 * direct mapping for each candidate layout before doing
+                 * the expensive full scan. Critical for models with many
+                 * outputs like YOLOv8 (9 outputs) where sig search tends
+                 * to collide on tensors with similar value distributions. */
+                if (4 + (int)i < n_proxy_bos && oti->n_dims == 4) {
+                    int direct_ci = (int)i;
+                    if (direct_ci < 16) {
+                        uint32_t obo_read = out_bo_cached_size[direct_ci];
+                        if (obo_read > 0) {
+                            /* Try each 4D-layout candidate at offset 0.
+                             * Skip the linear fallback (cl=2): for linear
+                             * outputs the data usually lives in the act BO,
+                             * not the output BO, so the direct mapping to
+                             * the output BO would give zeros. */
+                            for (int ci2 = 0; ci2 < n_cands && found_off < 0; ci2++) {
+                                const uint8_t *cb2 = cands[ci2];
+                                uint32_t cs2 = cand_sizes[ci2];
+                                uint8_t cl2 = cand_layouts[ci2];
+                                uint8_t so2 = cand_src_orders[ci2];
+                                if (cl2 == 2) continue; /* skip linear */
+                                uint32_t verify_len = cs2 < 4096 ? cs2 : 4096;
+                                if (verify_len < 64) continue;
+                                if (verify_len > obo_read) continue;
+                                if (memcmp(out_bo_buf[direct_ci], cb2, verify_len) == 0) {
+                                    found_off = 0;
+                                    ctx->act_output_offsets[i] = 0;
+                                    ctx->act_output_valid[i] = 2 + direct_ci;
+                                    ctx->act_output_layout[i] = cl2;
+                                    ctx->act_output_src_order[i] = so2;
+                                    orknn_log(1, "run: output[%u] direct proxy BO[%d] @ 0x0 (verify_len=%u, cand=%d, layout=%u, src=%s)",
+                                              i, 4 + direct_ci, verify_len, ci2, cl2,
+                                              so2 ? "NCHW" : "NHWC");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 /* For each sig length (long → short), for each candidate:
                  *   - HBWCH16 layouts (cl=3): search OUTPUT BOs only. Our
                  *     NPU's activation BO doesn't carry this tiled form —
@@ -481,6 +574,7 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
                         const uint8_t *cb = cands[ci];
                         uint32_t cs = cand_sizes[ci];
                         uint8_t cl = cand_layouts[ci];
+                        uint8_t so = cand_src_orders[ci];
 
                         int anchor = -1;
                         for (uint32_t k = 0; k < cs && k < 4096; k++) {
@@ -509,8 +603,9 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
                                     ctx->act_output_offsets[i] = (uint32_t)found_off;
                                     ctx->act_output_valid[i] = 1;
                                     ctx->act_output_layout[i] = cl;
-                                    orknn_log(1, "run: output[%u] ACT BO @ 0x%x (sig_len=%u, cand=%d, layout=%u)",
-                                              i, found_off, sig_len, ci, cl);
+                                    ctx->act_output_src_order[i] = so;
+                                    orknn_log(1, "run: output[%u] ACT BO @ 0x%x (sig_len=%u, cand=%d, layout=%u, src=%s)",
+                                              i, found_off, sig_len, ci, cl, so ? "NCHW" : "NHWC");
                                     break;
                                 }
                             }
@@ -530,8 +625,9 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
                                             ctx->act_output_offsets[i] = (uint32_t)found_off;
                                             ctx->act_output_valid[i] = 2 + obo_ci;
                                             ctx->act_output_layout[i] = cl;
-                                            orknn_log(1, "run: output[%u] proxy BO[%d] @ 0x%x -> output_bos[%d] (sig_len=%u, cand=%d, layout=%u)",
-                                                      i, b, found_off, obo_ci, sig_len, ci, cl);
+                                            ctx->act_output_src_order[i] = so;
+                                            orknn_log(1, "run: output[%u] proxy BO[%d] @ 0x%x -> output_bos[%d] (sig_len=%u, cand=%d, layout=%u, src=%s)",
+                                                      i, b, found_off, obo_ci, sig_len, ci, cl, so ? "NCHW" : "NHWC");
                                         }
                                         break;
                                     }

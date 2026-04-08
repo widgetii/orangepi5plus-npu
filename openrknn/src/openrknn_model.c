@@ -486,6 +486,25 @@ static void extract_fb_tensor_info(const uint8_t *fb, uint32_t tensor_table_fpos
     uint32_t f12 = orknn_fb_field(fb, t, 12);
     if (f12) ti->native_size = orknn_fb_u32(fb, f12);
 
+    /* native_dims-based dim reorder for NCHW-stored 4D tensors.
+     * Some models (YOLOv8) store user dims in NCHW order [N,C,H,W] with
+     * layout=2 (NCHW); others (DeepLabv3) store them in NHWC order
+     * [N,H,W,C] but also with layout=2. The FB native_dims field
+     * (NC1HWC2 shape [N,C1,H,W,C2]) unambiguously identifies H and W.
+     * If the current dims look like [N,C,H,W] (d2=nH, d3=nW), reorder
+     * to [N,H,W,C] so the rest of openrknn (which assumes NHWC) works. */
+    if (ti->n_dims == 4 && ti->native_n_dims == 5) {
+        uint32_t nH = ti->native_dims[2];
+        uint32_t nW = ti->native_dims[3];
+        uint32_t d1 = ti->dims[1], d2 = ti->dims[2], d3 = ti->dims[3];
+        if (d2 == nH && d3 == nW && (d1 != nH || d2 != nW)) {
+            /* Stored as [N, C, H, W] → reorder to [N, H, W, C] */
+            ti->dims[1] = nH;
+            ti->dims[2] = nW;
+            ti->dims[3] = d1;
+        }
+    }
+
     /* w_stride: set for NHWC 4D tensors only. */
     if (ti->n_dims == 4 && ti->fmt == RKNN_TENSOR_NHWC)
         ti->w_stride = ti->dims[2]; /* W */
@@ -816,17 +835,17 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
      *  3. Use the LAST complete cycle's submits as our segments
      *     (and remember their submit indices so we load the right
      *     sub<N>_bo_000 snapshot later). */
-    #define MAX_SEGS 32
-    uint32_t all_flags[128] = {0};
-    uint32_t all_sc_start[128] = {0};
-    uint32_t all_sc_count[128] = {0};
-    uint32_t all_task_num[128] = {0};
+    #define MAX_SEGS 128
+    uint32_t all_flags[256] = {0};
+    uint32_t all_sc_start[256] = {0};
+    uint32_t all_sc_count[256] = {0};
+    uint32_t all_task_num[256] = {0};
     int n_all = 0;
 
     sc_tasks = total_tasks;
     sc_count = total_tasks;
 
-    for (int sn = 1; sn <= 128 && n_all < 128; sn++) {
+    for (int sn = 1; sn <= 256 && n_all < 256; sn++) {
         char path[64];
         snprintf(path, sizeof(path), "/tmp/rknn_dump/submit_%d.txt", sn);
         FILE *sf = fopen(path, "r");

@@ -98,21 +98,30 @@ int orknn_own_outputs_get(struct orknn_context *ctx, uint32_t n_outputs,
             uint32_t C1 = (C + c2 - 1) / c2;
             uint32_t padC = C1 * c2;
             uint32_t H_blk = (H + 15) / 16;
+            /* HBWCH16 per-h_blk stride: W*C*16 aligned up to 64 bytes.
+             * Must match the sig-search formula in openrknn_run.c. */
+            uint32_t hbwch16_stride = ((W * C * 16) + 63u) & ~63u;
             uint8_t layout = idx < 16 ? ctx->act_output_layout[idx] : 0;
+            uint8_t src_order = idx < 16 ? ctx->act_output_src_order[idx] : 0;
+
+            #define USER_OFF(n,h,w,c) \
+                (src_order == 1 \
+                    ? (((n) * C + (c)) * H + (h)) * W + (w)   /* NCHW */ \
+                    : (((n) * H + (h)) * W + (w)) * C + (c))  /* NHWC */
 
             #define SRC_OFF_NC1HWC2(n,h,w,c) \
                 (((n) * C1 + (c)/c2) * H * W * c2 + (h) * W * c2 + (w) * c2 + (c)%c2)
             #define SRC_OFF_HWC1C2(n,h,w,c) \
                 (((n) * H + (h)) * W * padC + (w) * padC + (c))
             #define SRC_OFF_HBWCH16(n,h,w,c) \
-                (((n) * H_blk + (h)/16) * W * C * 16 + (w) * C * 16 + (c) * 16 + (h)%16)
+                (((n) * H_blk + (h)/16) * hbwch16_stride + (w) * C * 16 + (c) * 16 + (h)%16)
             #define SRC_OFF(n,h,w,c) \
                 (layout == 3 ? SRC_OFF_HBWCH16(n,h,w,c) : \
                  layout == 1 ? SRC_OFF_HWC1C2(n,h,w,c) : SRC_OFF_NC1HWC2(n,h,w,c))
             (void)H_blk;
 
             if (outputs[i].want_float) {
-                /* native → NHWC float32 with dequantization */
+                /* native → user float32 with dequantization */
                 float *fdst = (float *)dst;
                 float scale = ti->scale;
                 int32_t zp = ti->zp;
@@ -122,7 +131,7 @@ int orknn_own_outputs_get(struct orknn_context *ctx, uint32_t n_outputs,
                         for (uint32_t w = 0; w < W; w++) {
                             for (uint32_t c = 0; c < C; c++) {
                                 uint32_t src_off = SRC_OFF(n,h,w,c);
-                                uint32_t dst_off = ((n * H + h) * W + w) * C + c;
+                                uint32_t dst_off = USER_OFF(n,h,w,c);
                                 int8_t raw = (int8_t)src[src_off];
                                 fdst[dst_off] = ((float)raw - (float)zp) * scale;
                             }
@@ -130,15 +139,13 @@ int orknn_own_outputs_get(struct orknn_context *ctx, uint32_t n_outputs,
                     }
                 }
             } else {
-                /* native → NHWC (user-visible layout).
-                 * Empirically, proxy returns NHWC bytes for all 4D models
-                 * regardless of the declared fmt field. */
+                /* native → user byte order (NHWC or NCHW per detected src) */
                 for (uint32_t n = 0; n < N; n++) {
                     for (uint32_t h = 0; h < H; h++) {
                         for (uint32_t w = 0; w < W; w++) {
                             for (uint32_t c = 0; c < C; c++) {
                                 uint32_t src_off = SRC_OFF(n,h,w,c);
-                                uint32_t dst_off = ((n * H + h) * W + w) * C + c;
+                                uint32_t dst_off = USER_OFF(n,h,w,c);
                                 dst[dst_off] = src[src_off];
                             }
                         }
@@ -150,6 +157,7 @@ int orknn_own_outputs_get(struct orknn_context *ctx, uint32_t n_outputs,
             #undef SRC_OFF_HWC1C2
             #undef SRC_OFF_HBWCH16
             #undef SRC_OFF
+            #undef USER_OFF
         } else {
             /* Non-4D (e.g., 2D [1,1001]): direct copy, trim padding.
              * Native BO may be padded (e.g., 1024 for 1001 elements).
