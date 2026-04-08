@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <dirent.h>
 
 /* ======================================================================
  * JSON config mini-parser
@@ -802,41 +803,101 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
         }
     }
 
-    /* Try to read the proxy's task count and sc_count from the intercept dump.
-     * This is the most reliable source since it comes directly from RKNN. */
+    /* Try to read proxy submit metadata from the intercept dump.
+     * Models like YOLO issue MULTIPLE submits per rknn_run (one per
+     * hardware stage). We read submit_1.txt, submit_2.txt, ... until
+     * we either exhaust the files OR detect a repeat (indicating the
+     * next run's submits). */
+    #define MAX_SEGS 32
+    uint32_t seg_flags[MAX_SEGS] = {0};
+    uint32_t seg_sc_start[MAX_SEGS] = {0};
+    uint32_t seg_sc_count[MAX_SEGS] = {0};
+    uint32_t seg_task_num[MAX_SEGS] = {0};
+    int n_segs = 0;
+    uint32_t first_sc_start_seen = UINT32_MAX;
+
     sc_tasks = total_tasks;
     sc_count = total_tasks;
-    {
-        FILE *sf = fopen("/tmp/rknn_dump/submit_1.txt", "r");
-        if (sf) {
-            char line[256];
-            while (fgets(line, sizeof(line), sf)) {
-                /* Parse: submit=1 flags=0x5 tasks=N ... sc_start=S sc_count=C */
-                if (strncmp(line, "submit=", 7) == 0) {
-                    char *tp = strstr(line, "tasks=");
-                    char *scp = strstr(line, "sc_count=");
-                    if (tp) sc_tasks = (uint32_t)strtoul(tp + 6, NULL, 10);
-                    if (scp) sc_count = (uint32_t)strtoul(scp + 9, NULL, 10);
-                    break;
-                }
+
+    for (int sn = 1; sn <= 64 && n_segs < MAX_SEGS; sn++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/rknn_dump/submit_%d.txt", sn);
+        FILE *sf = fopen(path, "r");
+        if (!sf) break;
+
+        uint32_t flags = 0, tasks_n = 0, scs = 0, scc = 0;
+        char line[256];
+        while (fgets(line, sizeof(line), sf)) {
+            if (strncmp(line, "submit=", 7) == 0) {
+                char *fp = strstr(line, "flags=0x");
+                char *tp = strstr(line, "tasks=");
+                char *ssp = strstr(line, "sc_start=");
+                char *scp = strstr(line, "sc_count=");
+                if (fp) flags = (uint32_t)strtoul(fp + 8, NULL, 16);
+                if (tp) tasks_n = (uint32_t)strtoul(tp + 6, NULL, 10);
+                if (ssp) scs = (uint32_t)strtoul(ssp + 9, NULL, 10);
+                if (scp) scc = (uint32_t)strtoul(scp + 9, NULL, 10);
+                break;
             }
-            fclose(sf);
         }
+        fclose(sf);
+
+        /* A second appearance of sc_start=first_seen means the next
+         * iteration's first submit — stop. */
+        if (sn > 1 && scs == first_sc_start_seen) break;
+        if (sn == 1) first_sc_start_seen = scs;
+
+        seg_flags[n_segs] = flags;
+        seg_sc_start[n_segs] = scs;
+        seg_sc_count[n_segs] = scc;
+        seg_task_num[n_segs] = tasks_n;
+        n_segs++;
     }
+
+    if (n_segs == 0) {
+        /* No dump available — single-segment fallback */
+        sc_tasks = total_tasks;
+        sc_count = total_tasks;
+        n_segs = 1;
+        seg_flags[0] = 0x5;
+        seg_sc_start[0] = 0;
+        seg_sc_count[0] = sc_count;
+        seg_task_num[0] = sc_tasks;
+    } else {
+        /* sc_tasks = max task_number across all segments.
+         * Segments share a task BO — each submit can reference the
+         * full task array. */
+        sc_tasks = 0;
+        for (int s = 0; s < n_segs; s++) {
+            if (seg_task_num[s] > sc_tasks) sc_tasks = seg_task_num[s];
+        }
+        /* Add max sc_start so we can reach all tasks the segments need */
+        for (int s = 0; s < n_segs; s++) {
+            uint32_t need = seg_sc_start[s] + seg_sc_count[s];
+            /* Actual multi-core total = sc_count * cores, covered by task_number */
+            (void)need;
+        }
+        sc_count = seg_sc_count[0];
+    }
+
     if (sc_tasks > total_tasks) sc_tasks = total_tasks;
-    if (sc_count > sc_tasks) sc_count = sc_tasks;
 
-    orknn_log(1, "model: %u total tasks, %u for submit, sc_count=%u",
-              total_tasks, sc_tasks, sc_count);
+    orknn_log(1, "model: %u total tasks, %u segs, seg0 task_num=%u sc_count=%u",
+              total_tasks, n_segs, sc_tasks, sc_count);
 
-    /* Copy task data and fix regcmd offsets */
-    model->task_count = sc_tasks;
-    model->task_data_size = sc_tasks * 40;
+    /* Copy task data — only the tasks referenced by segment 0.
+     * The FB task array has total_tasks entries, but for models like MBv1
+     * only the first seg_task_num[0] tasks are valid — the rest have
+     * uninitialized values that corrupt execution if copied. */
+    uint32_t copy_tasks = seg_task_num[0] > 0 ? seg_task_num[0] : total_tasks;
+    if (copy_tasks > total_tasks) copy_tasks = total_tasks;
+    model->task_count = copy_tasks;
+    model->task_data_size = copy_tasks * 40;
     model->task_data = malloc(model->task_data_size);
     memcpy(model->task_data, bo1_data + tb_offset, model->task_data_size);
 
     struct orknn_rknpu_task *tasks = (struct orknn_rknpu_task *)model->task_data;
-    for (uint32_t t = 0; t < sc_tasks; t++)
+    for (uint32_t t = 0; t < copy_tasks; t++)
         tasks[t].regcmd_addr += rc_offset;
 
     /* Store weight+regcmd combined BO data */
@@ -846,13 +907,52 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
     model->regcmd_size = rc_size;
     model->total_weight_size = bo1_size;
 
-    /* Build single submit segment */
-    model->segment_count = 1;
-    model->segments = calloc(1, sizeof(*model->segments));
-    model->segments[0].flags = 0x5; /* PC + PINGPONG */
-    model->segments[0].sc_start = 0;
-    model->segments[0].sc_count = sc_count;
-    model->segments[0].task_number = sc_tasks;
+    /* Build submit segments from proxy dump info */
+    model->segment_count = n_segs;
+    model->segments = calloc(n_segs, sizeof(*model->segments));
+    for (int s = 0; s < n_segs; s++) {
+        model->segments[s].flags = seg_flags[s];
+        model->segments[s].sc_start = seg_sc_start[s];
+        model->segments[s].sc_count = seg_sc_count[s];
+        model->segments[s].task_number = seg_task_num[s];
+        orknn_log(2, "model: seg[%d] flags=0x%x sc_start=%u sc_count=%u task_number=%u",
+                  s, seg_flags[s], seg_sc_start[s], seg_sc_count[s], seg_task_num[s]);
+
+        /* Try to load the per-submit task BO snapshot. The proxy may
+         * patch the task BO in place between submits (YOLO does this).
+         * We snapshot each submit's task BO and replay the copies
+         * verbatim before each submit. */
+        DIR *dd = opendir("/tmp/rknn_dump");
+        if (dd) {
+            char pfx[32];
+            snprintf(pfx, sizeof(pfx), "sub%d_bo_000_", s + 1);
+            struct dirent *de;
+            char tpath[256] = {0};
+            while ((de = readdir(dd))) {
+                if (strncmp(de->d_name, pfx, strlen(pfx)) == 0) {
+                    snprintf(tpath, sizeof(tpath), "/tmp/rknn_dump/%s", de->d_name);
+                    break;
+                }
+            }
+            closedir(dd);
+            if (tpath[0]) {
+                FILE *tf = fopen(tpath, "rb");
+                if (tf) {
+                    fseek(tf, 0, SEEK_END);
+                    long fsz = ftell(tf);
+                    fseek(tf, 0, SEEK_SET);
+                    if (fsz > 0) {
+                        model->segments[s].task_bo_data = malloc(fsz);
+                        model->segments[s].task_bo_size = (uint32_t)fsz;
+                        fread(model->segments[s].task_bo_data, 1, fsz, tf);
+                        orknn_log(2, "model: seg[%d] task_bo_data loaded from %s (%ld bytes)",
+                                  s, tpath, fsz);
+                    }
+                    fclose(tf);
+                }
+            }
+        }
+    }
 
     /* Extract activation BO size from metadata blobs */
     model->total_internal_size = 0;

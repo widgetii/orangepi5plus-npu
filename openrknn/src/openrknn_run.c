@@ -264,8 +264,21 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
      * 3. Searching the dump for the output signature (first N bytes) */
     char post_act_path[128];
     uint32_t proxy_act_size = proxy_bo_sizes[2] ? proxy_bo_sizes[2] : ctx->activation_bo.size;
+    /* Find the highest post<N>_bo_002 dump — that's the final activation BO
+     * state after all submits. Models with multiple submits (YOLO has 18)
+     * only have valid output data in the LAST post dump. */
+    int max_post = 0;
+    for (int n = 1; n <= 64; n++) {
+        char test_path[128];
+        snprintf(test_path, sizeof(test_path),
+                 "/tmp/rknn_dump/post%d_bo_002_%uB.bin", n, proxy_act_size);
+        FILE *tf = fopen(test_path, "rb");
+        if (tf) { fclose(tf); max_post = n; }
+    }
+    if (max_post == 0) max_post = 1;
     snprintf(post_act_path, sizeof(post_act_path),
-             "/tmp/rknn_dump/post1_bo_002_%uB.bin", proxy_act_size);
+             "/tmp/rknn_dump/post%d_bo_002_%uB.bin", max_post, proxy_act_size);
+    orknn_log(1, "run: using post%d act BO dump for output discovery", max_post);
     FILE *paf = fopen(post_act_path, "rb");
     uint8_t *proxy_act_data = NULL;
     if (paf) {
@@ -334,140 +347,194 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
                 uint8_t zp_byte = (uint8_t)(m->outputs[i].zp & 0xFF);
                 struct orknn_tensor_info *oti = &m->outputs[i];
 
-                /* Build the NC1HWC2 raw signature buffer. For 4D NCHW outputs,
-                 * invert the detile transform. For other shapes, copy as-is. */
-                static uint8_t raw_sig[0x100000]; /* 1MB scratch */
-                uint32_t raw_sig_len = 0;
+                /* Build raw signature buffers. Four candidates:
+                 *   nc1hwc2_nchw: NC1HWC2 layout, source interpreted as NCHW
+                 *   nc1hwc2_nhwc: NC1HWC2 layout, source interpreted as NHWC
+                 *   hwc1c2_nchw:  HWC1C2 layout,  source interpreted as NCHW
+                 *   hwc1c2_nhwc:  HWC1C2 layout,  source interpreted as NHWC
+                 * We don't trust the model's fmt field because proxies may
+                 * return different physical orderings. Try all that fit.
+                 * For non-4D outputs we fall back to the raw linear bytes. */
+                static uint8_t raw_sig_a[0x200000]; /* HBWCH16+NHWC */
+                static uint8_t raw_sig_b[0x200000]; /* HBWCH16+NCHW */
+                static uint8_t raw_sig_c[0x200000]; /* NC1HWC2+NHWC */
+                static uint8_t raw_sig_d[0x200000]; /* NC1HWC2+NCHW */
+                static uint8_t raw_sig_e[0x200000]; /* HWC1C2 +NHWC */
+                static uint8_t raw_sig_f[0x200000]; /* HWC1C2 +NCHW */
+                uint32_t sig_lens[6] = {0};
+                const uint8_t *sig_ptrs[6] = {
+                    raw_sig_a, raw_sig_b, raw_sig_c, raw_sig_d, raw_sig_e, raw_sig_f
+                };
+                /* layout tag stored on successful match:
+                 * 0=NC1HWC2, 1=HWC1C2, 3=HBWCH16 */
+                uint8_t sig_layouts[6] = {3, 3, 0, 0, 1, 1};
 
-                if (oti->n_dims == 4 && oti->fmt == RKNN_TENSOR_NCHW) {
+                if (oti->n_dims == 4) {
                     uint32_t N = oti->dims[0], H = oti->dims[1];
                     uint32_t W = oti->dims[2], C = oti->dims[3];
                     uint32_t c2 = 16;
                     uint32_t C1 = (C + c2 - 1) / c2;
-                    raw_sig_len = N * C1 * H * W * c2;
-                    if (raw_sig_len <= sizeof(raw_sig)) {
-                        /* Initialize with zp (padded channels stay at zp) */
-                        memset(raw_sig, zp_byte, raw_sig_len);
-                        /* Invert: for each NCHW element, place it at the
-                         * corresponding NC1HWC2 position. */
-                        for (uint32_t n = 0; n < N; n++) {
-                            for (uint32_t c = 0; c < C; c++) {
-                                uint32_t c1 = c / c2;
-                                uint32_t c2_idx = c % c2;
-                                for (uint32_t h = 0; h < H; h++) {
-                                    for (uint32_t w = 0; w < W; w++) {
-                                        uint32_t nchw = ((n * C + c) * H + h) * W + w;
-                                        uint32_t nc1hwc2 = ((n * C1 + c1) * H + h) * W * c2 + w * c2 + c2_idx;
-                                        raw_sig[nc1hwc2] = out_bytes[nchw];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else if (oti->n_dims == 4 && oti->fmt == RKNN_TENSOR_NHWC) {
-                    uint32_t N = oti->dims[0], H = oti->dims[1];
-                    uint32_t W = oti->dims[2], C = oti->dims[3];
-                    uint32_t c2 = 16;
-                    uint32_t C1 = (C + c2 - 1) / c2;
-                    raw_sig_len = N * C1 * H * W * c2;
-                    if (raw_sig_len <= sizeof(raw_sig)) {
-                        memset(raw_sig, zp_byte, raw_sig_len);
-                        /* NHWC → NC1HWC2 */
+                    uint32_t padC = C1 * c2;
+                    uint32_t H_blk = (H + 15) / 16;
+                    uint32_t padH = H_blk * 16;
+                    uint32_t tile_len = N * C1 * H * W * c2;
+                    /* HBWCH16 uses UNPADDED C in strides */
+                    uint32_t hbwch16_len = N * H_blk * W * C * 16;
+
+                    if (tile_len <= sizeof(raw_sig_a) &&
+                        hbwch16_len <= sizeof(raw_sig_e)) {
+                        memset(raw_sig_a, zp_byte, tile_len);
+                        memset(raw_sig_b, zp_byte, tile_len);
+                        memset(raw_sig_c, zp_byte, tile_len);
+                        memset(raw_sig_d, zp_byte, tile_len);
+                        memset(raw_sig_e, zp_byte, hbwch16_len);
+                        memset(raw_sig_f, zp_byte, hbwch16_len);
+                        sig_lens[0] = sig_lens[1] = sig_lens[2] = sig_lens[3] = tile_len;
+                        sig_lens[4] = sig_lens[5] = hbwch16_len;
+
                         for (uint32_t n = 0; n < N; n++) {
                             for (uint32_t h = 0; h < H; h++) {
+                                uint32_t h_blk = h / 16;
+                                uint32_t h_in = h % 16;
                                 for (uint32_t w = 0; w < W; w++) {
                                     for (uint32_t c = 0; c < C; c++) {
                                         uint32_t c1 = c / c2;
                                         uint32_t c2_idx = c % c2;
-                                        uint32_t nhwc = ((n * H + h) * W + w) * C + c;
-                                        uint32_t nc1hwc2 = ((n * C1 + c1) * H + h) * W * c2 + w * c2 + c2_idx;
-                                        raw_sig[nc1hwc2] = out_bytes[nhwc];
+                                        uint32_t nchw_off = ((n * C + c) * H + h) * W + w;
+                                        uint32_t nhwc_off = ((n * H + h) * W + w) * C + c;
+                                        uint32_t nc1hwc2_off =
+                                            ((n * C1 + c1) * H + h) * W * c2 + w * c2 + c2_idx;
+                                        uint32_t hwc1c2_off =
+                                            ((n * H + h) * W + w) * padC + c;
+                                        uint32_t hbwch16_off =
+                                            ((n * H_blk + h_blk) * W + w) * C * 16
+                                            + c * 16 + h_in;
+                                        raw_sig_a[hbwch16_off] = out_bytes[nhwc_off];
+                                        raw_sig_b[hbwch16_off] = out_bytes[nchw_off];
+                                        raw_sig_c[nc1hwc2_off] = out_bytes[nhwc_off];
+                                        raw_sig_d[nc1hwc2_off] = out_bytes[nchw_off];
+                                        raw_sig_e[hwc1c2_off]  = out_bytes[nhwc_off];
+                                        raw_sig_f[hwc1c2_off]  = out_bytes[nchw_off];
                                     }
                                 }
                             }
                         }
+                        (void)padH;
                     }
                 }
 
-                const uint8_t *search_bytes;
-                uint32_t search_size;
-                if (raw_sig_len > 0) {
-                    search_bytes = raw_sig;
-                    search_size = raw_sig_len;
-                    orknn_log(2, "run: output[%u] using NC1HWC2 raw signature (%u bytes)",
-                              i, raw_sig_len);
-                } else {
-                    search_bytes = out_bytes;
-                    search_size = out_size;
+                /* Build list of candidate sigs. */
+                const uint8_t *cands[7];
+                uint32_t cand_sizes[7];
+                uint8_t cand_layouts[7];
+                int n_cands = 0;
+                for (int s = 0; s < 6; s++) {
+                    if (sig_lens[s] > 0) {
+                        cands[n_cands] = sig_ptrs[s];
+                        cand_sizes[n_cands] = sig_lens[s];
+                        cand_layouts[n_cands] = sig_layouts[s];
+                        n_cands++;
+                    }
                 }
+                /* Always include linear fallback. */
+                cands[n_cands] = out_bytes;
+                cand_sizes[n_cands] = out_size;
+                cand_layouts[n_cands] = 2;
+                n_cands++;
 
-                /* Find the first byte in search_bytes that differs from zp */
-                int anchor = -1;
-                for (uint32_t k = 0; k < search_size && k < 4096; k++) {
-                    if (search_bytes[k] != zp_byte) { anchor = (int)k; break; }
-                }
-
-                /* Try multiple signature lengths from largest to smallest.
-                 * Larger sigs are more unique; smaller sigs are more tolerant
-                 * of minor differences after the anchor region. */
-                uint32_t try_lens[] = {256, 128, 64, 32, 16, 10, 8};
+                /* Search outer loop: sig_len (longest → shortest).
+                 * Inner loop: each candidate sig.
+                 * This picks the sig that matches with the LONGEST unambiguous
+                 * byte sequence — avoiding false-positive short matches that
+                 * would mis-tag the layout. */
+                uint32_t try_lens[] = {4096, 1024, 512, 256, 128, 64, 32, 16};
                 int n_try = sizeof(try_lens)/sizeof(try_lens[0]);
 
+                static uint8_t out_bo_buf[16][0x200000]; /* cache per BO */
+                static uint32_t out_bo_cached_size[16] = {0};
+                /* Load all proxy output BO dumps once */
+                for (int b = 4; b < n_proxy_bos; b++) {
+                    int ci = b - 4;
+                    if (ci >= 16 || out_bo_cached_size[ci] > 0) continue;
+                    char obo_path[128];
+                    snprintf(obo_path, sizeof(obo_path),
+                             "/tmp/rknn_dump/post%d_bo_%03d_%uB.bin",
+                             max_post, b, proxy_bo_sizes[b]);
+                    FILE *of = fopen(obo_path, "rb");
+                    if (!of) continue;
+                    size_t sz = proxy_bo_sizes[b] < sizeof(out_bo_buf[0])
+                                ? proxy_bo_sizes[b] : sizeof(out_bo_buf[0]);
+                    out_bo_cached_size[ci] = (uint32_t)fread(out_bo_buf[ci], 1, sz, of);
+                    fclose(of);
+                }
+
+                /* For each sig length (long → short), for each candidate:
+                 *   - HBWCH16 layouts (cl=3): search OUTPUT BOs only. Our
+                 *     NPU's activation BO doesn't carry this tiled form —
+                 *     the true data lives in the dedicated output BO.
+                 *   - NC1HWC2/HWC1C2/linear (cl=0/1/2): search ACT BO
+                 *     first, then output BOs as fallback. Matches the
+                 *     baseline behavior for MBv1/conv/FC models. */
                 for (int tl = 0; tl < n_try && found_off < 0; tl++) {
                     uint32_t want_len = try_lens[tl];
-                    uint32_t sig_start, sig_len;
+                    for (int ci = 0; ci < n_cands && found_off < 0; ci++) {
+                        const uint8_t *cb = cands[ci];
+                        uint32_t cs = cand_sizes[ci];
+                        uint8_t cl = cand_layouts[ci];
 
-                    if (anchor >= 0) {
-                        sig_start = anchor > 8 ? (uint32_t)(anchor - 8) : 0;
-                        uint32_t sig_end = sig_start + want_len;
-                        if (sig_end > search_size) sig_end = search_size;
-                        sig_len = sig_end - sig_start;
-                    } else {
-                        sig_start = 0;
-                        sig_len = want_len < search_size ? want_len : search_size;
-                    }
-
-                    if (sig_len < 4) continue;
-
-                    /* Search the activation BO first */
-                    for (uint32_t off = 0; off + sig_len <= proxy_act_size; off++) {
-                        if (memcmp(proxy_act_data + off, search_bytes + sig_start, sig_len) == 0) {
-                            found_off = (int)off - (int)sig_start;
-                            ctx->act_output_offsets[i] = (uint32_t)found_off;
-                            ctx->act_output_valid[i] = 1;
-                            orknn_log(1, "run: output[%u] found in ACT BO at 0x%x (sig_len=%u)",
-                                      i, found_off, sig_len);
-                            break;
+                        int anchor = -1;
+                        for (uint32_t k = 0; k < cs && k < 4096; k++) {
+                            if (cb[k] != zp_byte) { anchor = (int)k; break; }
                         }
-                    }
 
-                    /* If not in activation BO, try the proxy's output BO dumps */
-                    if (found_off < 0) {
-                        static uint8_t out_bo_buf[0x200000]; /* 2MB scratch */
-                        for (int b = 4; b < n_proxy_bos && found_off < 0; b++) {
-                            char obo_path[128];
-                            snprintf(obo_path, sizeof(obo_path),
-                                     "/tmp/rknn_dump/post1_bo_%03d_%uB.bin",
-                                     b, proxy_bo_sizes[b]);
-                            FILE *of = fopen(obo_path, "rb");
-                            if (!of) continue;
-                            size_t obo_read = fread(out_bo_buf, 1,
-                                                    proxy_bo_sizes[b] < sizeof(out_bo_buf)
-                                                        ? proxy_bo_sizes[b] : sizeof(out_bo_buf),
-                                                    of);
-                            fclose(of);
+                        uint32_t sig_start, sig_len;
+                        if (anchor >= 0) {
+                            sig_start = anchor > 8 ? (uint32_t)(anchor - 8) : 0;
+                            uint32_t sig_end = sig_start + want_len;
+                            if (sig_end > cs) sig_end = cs;
+                            sig_len = sig_end - sig_start;
+                        } else {
+                            sig_start = 0;
+                            sig_len = want_len < cs ? want_len : cs;
+                        }
+                        if (sig_len < 4) continue;
 
-                            for (uint32_t off = 0; off + sig_len <= obo_read; off++) {
-                                if (memcmp(out_bo_buf + off, search_bytes + sig_start, sig_len) == 0) {
+                        int search_act_first = (cl != 3);
+
+                        /* Activation BO (if preferred) */
+                        if (search_act_first) {
+                            for (uint32_t off = 0; off + sig_len <= proxy_act_size; off++) {
+                                if (memcmp(proxy_act_data + off, cb + sig_start, sig_len) == 0) {
                                     found_off = (int)off - (int)sig_start;
-                                    int our_obo_idx = b - 4;
-                                    if (our_obo_idx < (int)m->n_outputs) {
-                                        ctx->act_output_offsets[i] = (uint32_t)found_off;
-                                        ctx->act_output_valid[i] = 2 + our_obo_idx;
-                                        orknn_log(1, "run: output[%u] found in proxy BO[%d] at 0x%x (-> output_bos[%d], sig_len=%u)",
-                                                  i, b, found_off, our_obo_idx, sig_len);
-                                    }
+                                    ctx->act_output_offsets[i] = (uint32_t)found_off;
+                                    ctx->act_output_valid[i] = 1;
+                                    ctx->act_output_layout[i] = cl;
+                                    orknn_log(1, "run: output[%u] ACT BO @ 0x%x (sig_len=%u, cand=%d, layout=%u)",
+                                              i, found_off, sig_len, ci, cl);
                                     break;
+                                }
+                            }
+                        }
+
+                        /* Output BOs */
+                        if (found_off < 0) {
+                            for (int b = 4; b < n_proxy_bos && found_off < 0; b++) {
+                                int obo_ci = b - 4;
+                                if (obo_ci >= 16) continue;
+                                uint32_t obo_read = out_bo_cached_size[obo_ci];
+                                if (!obo_read) continue;
+                                for (uint32_t off = 0; off + sig_len <= obo_read; off++) {
+                                    if (memcmp(out_bo_buf[obo_ci] + off, cb + sig_start, sig_len) == 0) {
+                                        found_off = (int)off - (int)sig_start;
+                                        if (obo_ci < (int)m->n_outputs) {
+                                            ctx->act_output_offsets[i] = (uint32_t)found_off;
+                                            ctx->act_output_valid[i] = 2 + obo_ci;
+                                            ctx->act_output_layout[i] = cl;
+                                            orknn_log(1, "run: output[%u] proxy BO[%d] @ 0x%x -> output_bos[%d] (sig_len=%u, cand=%d, layout=%u)",
+                                                      i, b, found_off, obo_ci, sig_len, ci, cl);
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -859,8 +926,55 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
 
     orknn_log(2, "run: submitting %u segments...", m->segment_count);
 
-    for (uint32_t i = 0; i < m->segment_count; i++) {
-        int ret = orknn_npu_submit(ctx->npu_fd, &ctx->task_bo, &m->segments[i]);
+    uint32_t max_segs = m->segment_count;
+    if (getenv("ORKNN_MAX_SEGS")) {
+        uint32_t v = (uint32_t)strtoul(getenv("ORKNN_MAX_SEGS"), NULL, 10);
+        if (v < max_segs) max_segs = v;
+    }
+    for (uint32_t i = 0; i < max_segs; i++) {
+        /* If a per-submit task BO snapshot exists, copy it into our task BO
+         * and rebase regcmd_addr from proxy to our weight BO.
+         * Only do this for segments > 0 — segment 0 uses the task data set
+         * up by orknn_alloc_model_bos from the FB (which produces correct
+         * results for single-submit models like MBv1 when running only
+         * segment 0). */
+        struct orknn_segment *seg = &m->segments[i];
+        if (i > 0 && seg->task_bo_data && seg->task_bo_size <= ctx->task_bo.size) {
+            memcpy(ctx->task_bo.map, seg->task_bo_data, seg->task_bo_size);
+            /* Rebase regcmd_addr field for every task (offset 32 in each 40-byte task) */
+            struct {
+                uint32_t f[8];
+                uint64_t regcmd_addr;
+            } __attribute__((packed)) *ts = ctx->task_bo.map;
+            uint32_t n_tasks = seg->task_bo_size / 40;
+            /* Proxy weight BO base from dump's submit_1.txt */
+            uint64_t proxy_wt_base = 0;
+            FILE *mf = fopen("/tmp/rknn_dump/submit_1.txt", "r");
+            if (mf) {
+                char line[256];
+                while (fgets(line, sizeof(line), mf)) {
+                    if (strncmp(line, "bo[1]", 5) == 0) {
+                        char *dp = strstr(line, "dma=0x");
+                        if (dp) proxy_wt_base = strtoull(dp + 6, NULL, 16);
+                        break;
+                    }
+                }
+                fclose(mf);
+            }
+            if (proxy_wt_base) {
+                uint64_t our_wt_base = ctx->weight_bo.dma_addr;
+                for (uint32_t t = 0; t < n_tasks; t++) {
+                    if (ts[t].regcmd_addr >= proxy_wt_base &&
+                        ts[t].regcmd_addr < proxy_wt_base + ctx->weight_bo.size) {
+                        ts[t].regcmd_addr =
+                            our_wt_base + (ts[t].regcmd_addr - proxy_wt_base);
+                    }
+                }
+            }
+            orknn_bo_sync_to_device(ctx->npu_fd, &ctx->task_bo);
+        }
+
+        int ret = orknn_npu_submit(ctx->npu_fd, &ctx->task_bo, seg);
         if (ret) {
             orknn_log(0, "run: segment %u submit failed", i);
             return RKNN_ERR_FAIL;

@@ -104,6 +104,12 @@ struct orknn_segment {
     uint32_t sc_start;
     uint32_t sc_count;
     uint32_t task_number;
+    /* Per-submit task BO snapshot loaded from proxy dump.
+     * YOLO-style models patch the task BO between submits in place.
+     * To replicate, we copy task_bo_data into the task BO before
+     * each submit. NULL if no snapshot is available. */
+    uint8_t *task_bo_data;
+    uint32_t task_bo_size;
 };
 
 /* ======================================================================
@@ -162,6 +168,13 @@ struct orknn_context {
      * during init. */
     uint32_t act_output_offsets[16];
     uint8_t  act_output_valid[16];
+    /* Native layout of data at the output offset:
+     * 0 = NC1HWC2 ([N, C1, H, W, C2])
+     * 1 = HWC1C2  ([N, H, W, C1*C2]) — padded NHWC
+     * 3 = HBWCH16 ([H/16, W, padC, 16]) — YOLO output BO layout:
+     *     byte = (h/16)*W*padC*16 + w*padC*16 + c*16 + (h%16)
+     */
+    uint8_t  act_output_layout[16];
     /* Logging */
     int log_level;
 };
