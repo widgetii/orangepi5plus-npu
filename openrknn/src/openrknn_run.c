@@ -112,9 +112,13 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
         return -1;
     }
 
-    /* Copy proxy's regcmd section into our weight BO */
-    memcpy((uint8_t *)ctx->weight_bo.map + rc_off, proxy_bo + rc_off, m->regcmd_size);
-    orknn_log(1, "run: copied proxy regcmd (%u bytes at +0x%x)", m->regcmd_size, rc_off);
+    /* Copy the ENTIRE proxy BO[1] into our weight BO.
+     * This includes both weight data and regcmd — ensures all runtime-
+     * patched register values are correct. Weight data is the same as
+     * ours (from the .rknn file), so only the regcmd section differs. */
+    uint32_t copy_size = nread < ctx->weight_bo.size ? (uint32_t)nread : ctx->weight_bo.size;
+    memcpy(ctx->weight_bo.map, proxy_bo, copy_size);
+    orknn_log(1, "run: copied proxy BO[1] (%u bytes)", copy_size);
 
     /* Now rebase DMA addresses from proxy layout to ours.
      * Read proxy's BO addresses from the dump metadata. */
@@ -153,34 +157,47 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
     orknn_log(1, "run:               ours  wt=0x%x act=0x%x in=0x%x out=0x%x",
               our_wt, our_act, our_in, our_out);
 
-    /* Rebase all DMA registers in the regcmd */
+    /* Rebase DMA addresses: check EVERY register's VALUE against proxy BO ranges.
+     * This is safer than checking register IDs — it only touches values that
+     * are actually within a known proxy BO address range. */
     uint64_t *rc = (uint64_t *)((uint8_t *)ctx->weight_bo.map + rc_off);
     uint32_t rc_entries = m->regcmd_size / 8;
     uint32_t rebased = 0;
 
-    uint32_t dma_reg_list[] = {0x1070,0x1110,0x4020,0x4110,0x5018,0x5020,0x5038,0x0010,0x6070,0x701c};
-    int n_dma_regs = sizeof(dma_reg_list)/sizeof(dma_reg_list[0]);
+    /* Read proxy BO sizes from submit metadata */
+    uint32_t proxy_bo_sizes[5] = {0};
+    {
+        FILE *sf = fopen(meta_path, "r");
+        if (sf) {
+            char line2[256];
+            while (fgets(line2, sizeof(line2), sf)) {
+                uint32_t bi2, sz2;
+                if (sscanf(line2, "bo[%u] handle=%*u dma=%*s obj=%*s size=%u", &bi2, &sz2) == 2)
+                    if (bi2 < 5) proxy_bo_sizes[bi2] = sz2;
+            }
+            fclose(sf);
+        }
+    }
+    uint32_t pw_end = proxy_wt + (proxy_bo_sizes[1] ? proxy_bo_sizes[1] : ctx->weight_bo.size);
+    uint32_t pa_end = proxy_act + (proxy_bo_sizes[2] ? proxy_bo_sizes[2] : ctx->activation_bo.size);
+    uint32_t pi_end = proxy_in + (proxy_bo_sizes[3] ? proxy_bo_sizes[3] : 0x100000);
+    uint32_t po_end = proxy_out + (proxy_bo_sizes[4] ? proxy_bo_sizes[4] : 0x100000);
 
     for (uint32_t i = 0; i < rc_entries; i++) {
-        uint16_t reg = rc[i] & 0xFFFF;
         uint32_t val = (rc[i] >> 16) & 0xFFFFFFFF;
         if (val == 0) continue;
 
-        int is_dma = 0;
-        for (int d = 0; d < n_dma_regs; d++)
-            if (reg == dma_reg_list[d]) { is_dma = 1; break; }
-        if (!is_dma) continue;
-
-        /* Determine which proxy BO this address belongs to and rebase */
         uint32_t new_val = val;
-        if (proxy_wt && val >= proxy_wt && val < proxy_wt + ctx->weight_bo.size)
+        if (val >= proxy_wt && val < pw_end)
             new_val = our_wt + (val - proxy_wt);
-        else if (proxy_act && val >= proxy_act && val < proxy_act + ctx->activation_bo.size)
+        else if (val >= proxy_act && val < pa_end)
             new_val = our_act + (val - proxy_act);
-        else if (proxy_in && val >= proxy_in && val < proxy_in + 0x100000)
+        else if (proxy_in && val >= proxy_in && val < pi_end)
             new_val = our_in + (val - proxy_in);
-        else if (proxy_out && val >= proxy_out && val < proxy_out + 0x100000)
+        else if (proxy_out && val >= proxy_out && val < po_end)
             new_val = our_out + (val - proxy_out);
+        else
+            continue; /* not a BO address — don't touch */
 
         if (new_val != val) {
             rc[i] = (rc[i] & 0xFFFF000000000000ULL) |

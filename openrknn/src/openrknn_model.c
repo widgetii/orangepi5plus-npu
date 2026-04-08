@@ -802,10 +802,29 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
         }
     }
 
-    /* Submit all tasks in one block. sc_count = task_count = total_tasks.
-     * The RKNPU driver handles the pipeline internally. */
+    /* Try to read the proxy's task count and sc_count from the intercept dump.
+     * This is the most reliable source since it comes directly from RKNN. */
     sc_tasks = total_tasks;
     sc_count = total_tasks;
+    {
+        FILE *sf = fopen("/tmp/rknn_dump/submit_1.txt", "r");
+        if (sf) {
+            char line[256];
+            while (fgets(line, sizeof(line), sf)) {
+                /* Parse: submit=1 flags=0x5 tasks=N ... sc_start=S sc_count=C */
+                if (strncmp(line, "submit=", 7) == 0) {
+                    char *tp = strstr(line, "tasks=");
+                    char *scp = strstr(line, "sc_count=");
+                    if (tp) sc_tasks = (uint32_t)strtoul(tp + 6, NULL, 10);
+                    if (scp) sc_count = (uint32_t)strtoul(scp + 9, NULL, 10);
+                    break;
+                }
+            }
+            fclose(sf);
+        }
+    }
+    if (sc_tasks > total_tasks) sc_tasks = total_tasks;
+    if (sc_count > sc_tasks) sc_count = sc_tasks;
 
     orknn_log(1, "model: %u total tasks, %u for submit, sc_count=%u",
               total_tasks, sc_tasks, sc_count);
