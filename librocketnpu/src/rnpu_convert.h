@@ -21,13 +21,12 @@ void rnpu_convert_output_ex(uint8_t *nhwc, const uint8_t *npu_buf,
                              unsigned width, unsigned height, unsigned channels,
                              bool add_offset);
 
-/* Convert NC1HWC2 (RKNN native output BO) to NHWC uint8.
- * c2: channel tile size (8 or 16).
+/* Convert NC1HWC2 (C2=8, RKNN native) to NHWC uint8.
  * add_offset: true adds +128 to convert int8→uint8. */
-void rnpu_convert_nc1hwc2(uint8_t *nhwc, const uint8_t *nc1hwc2,
-                           unsigned w, unsigned h, unsigned c,
-                           unsigned w_pad, unsigned h_pad,
-                           unsigned c2, bool add_offset);
+void rnpu_convert_nc1hwc2_8(uint8_t *nhwc, const uint8_t *nc1hwc2,
+                             unsigned w, unsigned h, unsigned c,
+                             unsigned w_pad, unsigned h_pad,
+                             bool add_offset);
 
 /* Compute NPU tensor size (with 2x group padding). */
 unsigned rnpu_calc_npu_tensor_size(unsigned w, unsigned h, unsigned c);
