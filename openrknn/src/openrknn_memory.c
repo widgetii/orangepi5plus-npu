@@ -22,16 +22,29 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
     struct orknn_model *m = &ctx->model;
     int fd = ctx->npu_fd;
 
-    /* Weight + regcmd BO */
-    uint32_t wt_size = ALIGN_UP(m->wt_size, 4096);
-    if (orknn_bo_create(fd, wt_size, &ctx->weight_bo)) {
-        orknn_log(0, "memory: failed to allocate weight BO (%u bytes)", wt_size);
-        return -1;
+    /* If extract_npu_data failed (e.g. MobileSAM: task data is split
+     * across many small per-op blobs that our parser can't assemble),
+     * m->wt_size == 0. Skip weight/task/activation BO allocation entirely
+     * and rely on proxy dispatch for run. Only allocate input/output BOs
+     * so query+inputs_set+outputs_get can still use our own metadata. */
+    int have_npu_data = (m->wt_size > 0);
+
+    if (have_npu_data) {
+        /* Weight + regcmd BO */
+        uint32_t wt_size = ALIGN_UP(m->wt_size, 4096);
+        if (orknn_bo_create(fd, wt_size, &ctx->weight_bo)) {
+            orknn_log(0, "memory: failed to allocate weight BO (%u bytes)", wt_size);
+            return -1;
+        }
+        memcpy(ctx->weight_bo.map, m->wt_data, m->wt_size);
+        orknn_bo_sync_to_device(fd, &ctx->weight_bo);
+        orknn_log(1, "memory: weight BO: %u bytes, dma=0x%lx",
+                  wt_size, (unsigned long)ctx->weight_bo.dma_addr);
+    } else {
+        orknn_log(1, "memory: skipping weight/task/act BO allocation "
+                     "(no NPU data — proxy run path)");
     }
-    memcpy(ctx->weight_bo.map, m->wt_data, m->wt_size);
-    orknn_bo_sync_to_device(fd, &ctx->weight_bo);
-    orknn_log(1, "memory: weight BO: %u bytes, dma=0x%lx",
-              wt_size, (unsigned long)ctx->weight_bo.dma_addr);
+    if (!have_npu_data) goto alloc_io_bos;
 
     /* Task BO — needs KERNEL_MAPPING (0x8) flag so RKNPU driver can read it.
      * Must be large enough to fit the proxy's per-segment task BO snapshots
@@ -94,18 +107,22 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
     orknn_log(1, "memory: activation BO: %u bytes, dma=0x%lx",
               act_size, (unsigned long)ctx->activation_bo.dma_addr);
 
-    /* Input BOs — need NC1HWC2 padded size, not just native_size.
-     * For a 4D NHWC [N,H,W,C] tensor: NC1HWC2 = N*ceil(C/16)*H*W*16. */
+alloc_io_bos:
+    /* Input BOs — use the model's native_size (set from FB f[12]) which
+     * already encodes the correct NC1HWC2 layout for that input, including
+     * the actual c2 (3 for RGB inputs, 16 for deeper feature maps) and any
+     * W padding. Hardcoding c2=16 here would over-allocate AND mismatch
+     * the proxy's regcmd byte offsets, causing wrong reads for non-zero
+     * RGB input. */
     ctx->input_bos = calloc(m->n_inputs, sizeof(struct orknn_bo));
     for (uint32_t i = 0; i < m->n_inputs; i++) {
         uint32_t in_size = m->inputs[i].native_size;
-        /* Ensure size covers NC1HWC2 with c2=16 padding */
-        if (m->inputs[i].n_dims == 4) {
+        if (in_size == 0 && m->inputs[i].n_dims == 4) {
+            /* Fallback: compute conservative c2=16 size if FB had no native_size */
             uint32_t N = m->inputs[i].dims[0], H = m->inputs[i].dims[1];
             uint32_t W = m->inputs[i].dims[2], C = m->inputs[i].dims[3];
             uint32_t c2 = 16;
-            uint32_t nc1hwc2_size = N * ((C + c2 - 1) / c2) * H * W * c2;
-            if (nc1hwc2_size > in_size) in_size = nc1hwc2_size;
+            in_size = N * ((C + c2 - 1) / c2) * H * W * c2;
         }
         in_size = ALIGN_UP(in_size, 4096);
         if (in_size < 4096) in_size = 4096;

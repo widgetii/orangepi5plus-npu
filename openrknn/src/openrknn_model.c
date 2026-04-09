@@ -552,24 +552,13 @@ static void extract_fb_tensor_info(const uint8_t *fb, uint32_t tensor_table_fpos
     uint32_t f12 = orknn_fb_field(fb, t, 12);
     if (f12) ti->native_size = orknn_fb_u32(fb, f12);
 
-    /* native_dims-based dim reorder for NCHW-stored 4D tensors.
-     * Some models (YOLOv8) store user dims in NCHW order [N,C,H,W] with
-     * layout=2 (NCHW); others (DeepLabv3) store them in NHWC order
-     * [N,H,W,C] but also with layout=2. The FB native_dims field
-     * (NC1HWC2 shape [N,C1,H,W,C2]) unambiguously identifies H and W.
-     * If the current dims look like [N,C,H,W] (d2=nH, d3=nW), reorder
-     * to [N,H,W,C] so the rest of openrknn (which assumes NHWC) works. */
-    if (ti->n_dims == 4 && ti->native_n_dims == 5) {
-        uint32_t nH = ti->native_dims[2];
-        uint32_t nW = ti->native_dims[3];
-        uint32_t d1 = ti->dims[1], d2 = ti->dims[2], d3 = ti->dims[3];
-        if (d2 == nH && d3 == nW && (d1 != nH || d2 != nW)) {
-            /* Stored as [N, C, H, W] → reorder to [N, H, W, C] */
-            ti->dims[1] = nH;
-            ti->dims[2] = nW;
-            ti->dims[3] = d1;
-        }
-    }
+    /* Do NOT apply a native_dims-based dim reorder here. The FB f[4]
+     * field already stores the user-facing shape in the correct order
+     * for each tensor (NHWC for YOLOv5/DeepLabv3 outputs, NCHW for
+     * YOLOv8 outputs, etc.) and the vendor library reports them as-is.
+     * An earlier heuristic that used JSON-derived native_dims fired
+     * incorrectly on YOLOv5 because the native_dims was stale from
+     * parse_tensor_json's c2=16 assumption. */
 
     /* w_stride: set for NHWC 4D tensors only. */
     if (ti->n_dims == 4 && ti->fmt == RKNN_TENSOR_NHWC)
@@ -1290,16 +1279,10 @@ int orknn_own_init(struct orknn_context *ctx, void *model_buf, uint32_t size,
 
     int ret = extract_npu_data(fb, fb_size, m->version, m);
     if (ret != 0) {
-        /* NPU extraction failure is fatal only if we OWN the run/inputs_set
-         * path (we need task BO + regcmd to submit to the NPU). For
-         * init/query/outputs-only own modes (or complex models like
-         * MobileSAM where the proxy assembles the task BO at runtime from
-         * many small blobs), fall back to proxy dispatch for run and just
-         * keep our parsed tensor metadata for query. */
-        if (ctx->own_flags & (ORKNN_OWN_RUN | ORKNN_OWN_INPUTS_SET)) {
-            orknn_log(0, "model: NPU data extraction failed (needed for RUN/INPUTS_SET own)");
-            return RKNN_ERR_MODEL_INVALID;
-        }
+        /* Complex models like MobileSAM store task data as many small
+         * per-op blobs (not a single monolithic task BO), which our FB
+         * parser can't assemble. Fall back to proxy dispatch for run —
+         * init/query still work with our parsed tensor metadata. */
         orknn_log(1, "model: NPU data extraction failed — proxy-dispatched run path will be used");
     }
 
