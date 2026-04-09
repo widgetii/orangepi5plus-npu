@@ -5,6 +5,7 @@ on:
     branches: [main, master]
     paths:
       - 'librocketnpu/**'
+      - 'openrknn/**'
       - '.github/workflows/ci.yml'
   pull_request:
 
@@ -65,3 +66,45 @@ jobs:
 
       - name: Run hardware smoke tests
         run: bash tests/ci_hw_smoke.sh
+
+  openrknn-build:
+    # Cross-compile openrknn for aarch64 on the Ubuntu runner —
+    # catches build breakages without needing the board.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: openrknn
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cross-compile librknn_api.so for aarch64
+        run: make CC=aarch64-linux-gnu-gcc
+
+      - name: Verify shared library
+        run: |
+          file librknn_api.so
+          aarch64-linux-gnu-objdump -T librknn_api.so | grep -E 'rknn_(init|query|run|inputs_set|outputs_get|destroy)' | sort
+
+  openrknn-hw-test:
+    # Real-image accuracy validation on Orange Pi 5 Plus — only on push.
+    # Exercises the full openrknn pipeline (init, query, inputs_set, run,
+    # outputs_get) with real test images and semantic post-processing
+    # (softmax + top-k, YOLOv5/v8 NMS, DeepLabv3 argmax) against the
+    # vendor library baseline.
+    if: github.event_name == 'push'
+    needs: openrknn-build
+    runs-on: [self-hosted, orangepi5plus]
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: openrknn
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run openrknn real-image validation
+        run: bash tests/ci_validate.sh
