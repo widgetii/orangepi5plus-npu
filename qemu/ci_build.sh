@@ -127,7 +127,7 @@ echo "Building librocketnpu (aarch64 static)..."
 LIBSRC="librocketnpu/src"
 OBJDIR=$(mktemp -d)
 for f in rnpu_drm.c rnpu_tflite.c rnpu_coefs.c rnpu_task.c rnpu_regcmd.c \
-         rnpu_convert.c rnpu_sw_ops.c rnpu_rknn.c rnpu_rknn_fb.c rnpu_model.c; do
+         rnpu_convert.c rnpu_sw_ops.c rnpu_rknn.c rnpu_model.c; do
     ${CROSS}gcc -O2 -Wall -Wno-unused-function \
         -I"$LIBSRC" -Ilibrocketnpu/include -march=armv8-a \
         -fPIC -c -o "$OBJDIR/$(basename "$f" .c).o" "$LIBSRC/$f"
