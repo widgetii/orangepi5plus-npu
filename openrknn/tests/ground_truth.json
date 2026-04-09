@@ -1,0 +1,69 @@
+{
+  "mobilenet_v1": {
+    "model": "mobilenet_v1.rknn",
+    "image": "dog_224x224.jpg",
+    "input_size": [224, 224],
+    "type": "classification",
+    "expect": {
+      "top1_class_in": [156, 155, 154, 209, 208, 207, 205, 193, 210, 263],
+      "top5_must_include_any": [156, 155, 209, 207]
+    }
+  },
+  "resnet50": {
+    "model": "resnet50-v2-7.rknn",
+    "image": "dog_224x224.jpg",
+    "input_size": [224, 224],
+    "type": "classification",
+    "expect": {
+      "top1_class_in": [155, 154, 156, 209, 208, 207, 205, 193, 210, 262, 263],
+      "top5_must_include_any": [155, 154, 209, 207]
+    }
+  },
+  "yolov5": {
+    "model": "yolov5s_relu_int8.rknn",
+    "image": "bus.jpg",
+    "input_size": [640, 640],
+    "type": "detection_v5",
+    "expect": {
+      "required_classes": ["person"],
+      "min_detections": 1
+    }
+  },
+  "yolov8": {
+    "model": "yolov8.rknn",
+    "image": "bus.jpg",
+    "input_size": [640, 640],
+    "type": "detection_v8",
+    "expect": {
+      "required_classes": ["person"],
+      "min_detections": 1
+    }
+  },
+  "deeplabv3": {
+    "model": "deeplabv3.rknn",
+    "image": "test_image.jpg",
+    "input_size": [513, 513],
+    "type": "segmentation",
+    "expect": {
+      "classes_present": [0, 15],
+      "min_pixel_fraction": {"15": 0.02}
+    }
+  },
+  "mobilesam_encoder": {
+    "model": "mobilesam_encoder.rknn",
+    "type": "fp16_parse",
+    "expect": {
+      "input_type": 1,
+      "input_dims": [1, 448, 448, 3],
+      "output_type": 1
+    }
+  },
+  "lprnet": {
+    "model": "lprnet.rknn",
+    "type": "fp16_parse",
+    "expect": {
+      "input_type": 1,
+      "input_dims": [1, 24, 94, 3]
+    }
+  }
+}
