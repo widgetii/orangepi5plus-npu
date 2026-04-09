@@ -209,7 +209,8 @@ static rknn_tensor_qnt_type qnt_from_string(const char *s)
  *    "dtype":{"qnt_method":"layer","qnt_type":"int8","vx_type":"int8"}}
  * Note: scale and zp are NOT in the JSON — they come from FlatBuffer quant tables.
  */
-static void parse_tensor_json(const char *obj, struct orknn_tensor_info *ti)
+static void parse_tensor_json(const char *obj, struct orknn_tensor_info *ti,
+                              const uint8_t *file_data)
 {
     memset(ti, 0, sizeof(*ti));
 
@@ -229,6 +230,45 @@ static void parse_tensor_json(const char *obj, struct orknn_tensor_info *ti)
     }
     ti->type = dtype_from_string(dtype_str);
 
+    /* Fallback for FP16 models: norm_tensor JSON may have empty vx_type.
+     * The authoritative dtype lives in per-tensor hint dicts stored in
+     * the RKNN file header (first ~2KB), e.g.:
+     *   {"input.1": {"dtype": "float16", "layout": "NHWC"}}
+     * Search for the tensor name in the hint area and extract dtype. */
+    if (ti->type == RKNN_TENSOR_INT8 && !dtype_str[0] && ti->name[0] && file_data) {
+        /* Search first 4KB of file for {"<name>": {"dtype": "..."}} */
+        char needle[128];
+        snprintf(needle, sizeof(needle), "\"%s\":", ti->name);
+        size_t nlen = strlen(needle);
+        const char *hit = NULL;
+        for (uint32_t p = 0; p + nlen + 20 < 4096; p++) {
+            if (memcmp(file_data + p, needle, nlen) == 0) {
+                hit = (const char *)(file_data + p);
+                break;
+            }
+        }
+        if (hit) {
+            const char *dp = strstr(hit, "\"dtype\"");
+            if (dp && dp < hit + 200) {
+                dp = strchr(dp + 7, '"');
+                if (dp) {
+                    dp++;
+                    char htype[32] = {0};
+                    int k = 0;
+                    while (*dp && *dp != '"' && k < 31)
+                        htype[k++] = *dp++;
+                    htype[k] = '\0';
+                    rknn_tensor_type ht = dtype_from_string(htype);
+                    if (ht != RKNN_TENSOR_INT8) {
+                        ti->type = ht;
+                        orknn_log(2, "  tensor '%s': dtype '%s' from header hint",
+                                  ti->name, htype);
+                    }
+                }
+            }
+        }
+    }
+
     /* qnt_type from nested dtype object */
     char qnt_str[64] = {0};
     if (dtype_obj) {
@@ -243,6 +283,15 @@ static void parse_tensor_json(const char *obj, struct orknn_tensor_info *ti)
         ti->qnt_type = RKNN_TENSOR_QNT_DFP;
     else
         ti->qnt_type = RKNN_TENSOR_QNT_NONE;
+
+    /* FP16 tensors: proxy reports QNT_AFFINE with scale=1.0 zp=0 (identity quant).
+     * Set this automatically when dtype is FP16 and qnt is empty/NONE. */
+    if ((ti->type == RKNN_TENSOR_FLOAT16 || ti->type == RKNN_TENSOR_BFLOAT16) &&
+        ti->qnt_type == RKNN_TENSOR_QNT_NONE) {
+        ti->qnt_type = RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC;
+        ti->scale = 1.0f;
+        ti->zp = 0;
+    }
 
     /* Shape: JSON "size" is in NCHW order [N,C,H,W].
      * We need to determine the user-facing format and reorder dims. */
@@ -398,20 +447,25 @@ static void extract_fb_tensor_info(const uint8_t *fb, uint32_t tensor_table_fpos
     uint32_t f5 = orknn_fb_field(fb, t, 5);
     if (f5) orknn_fb_string(fb, f5, ti->name, sizeof(ti->name));
 
-    /* f[7]: dtype string */
+    /* f[7]: dtype string — override JSON dtype only if non-empty.
+     * FP16 models (MobileSAM) may have empty f[7] in which case we
+     * keep the dtype from the header hint parsed by parse_tensor_json. */
     uint32_t f7 = orknn_fb_field(fb, t, 7);
     if (f7) {
-        char dtype_str[32];
+        char dtype_str[32] = {0};
         orknn_fb_string(fb, f7, dtype_str, sizeof(dtype_str));
-        ti->type = dtype_from_string(dtype_str);
+        if (dtype_str[0])
+            ti->type = dtype_from_string(dtype_str);
     }
 
-    /* f[6]: qnt_method */
+    /* f[6]: qnt_method — skip if empty (FP16 models have empty qnt fields) */
     uint32_t f6 = orknn_fb_field(fb, t, 6);
     if (f6) {
-        char qnt_str[32];
+        char qnt_str[32] = {0};
         orknn_fb_string(fb, f6, qnt_str, sizeof(qnt_str));
-        if (strstr(qnt_str, "layer") || strstr(qnt_str, "channel"))
+        if (!qnt_str[0]) {
+            /* empty — keep JSON/header-derived qnt_type */
+        } else if (strstr(qnt_str, "layer") || strstr(qnt_str, "channel"))
             ti->qnt_type = RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC;
         else if (strstr(qnt_str, "dfp"))
             ti->qnt_type = RKNN_TENSOR_QNT_DFP;
@@ -419,9 +473,21 @@ static void extract_fb_tensor_info(const uint8_t *fb, uint32_t tensor_table_fpos
             ti->qnt_type = RKNN_TENSOR_QNT_NONE;
     }
 
-    /* f[10]: scale */
+    /* f[10]: scale — only override if non-zero (FP16 models may store 0).
+     * For FP16 tensors with scale already set to 1.0 (identity quant from
+     * parse_tensor_json FP16 fallback), preserve the 1.0 if FB has 0. */
     uint32_t f10 = orknn_fb_field(fb, t, 10);
-    if (f10) ti->scale = fb_float_vec_at(fb, f10, 0);
+    if (f10) {
+        float fb_scale = fb_float_vec_at(fb, f10, 0);
+        if (fb_scale != 0.0f)
+            ti->scale = fb_scale;
+    }
+    /* FP16 tensors: ensure scale=1.0 if still 0 (identity quantization) */
+    if ((ti->type == RKNN_TENSOR_FLOAT16 || ti->type == RKNN_TENSOR_BFLOAT16) &&
+        ti->scale == 0.0f) {
+        ti->scale = 1.0f;
+        ti->qnt_type = RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC;
+    }
 
     /* f[11]: zero_point (stored as int32 in a vector) */
     uint32_t f11 = orknn_fb_field(fb, t, 11);
@@ -1187,7 +1253,7 @@ int orknn_own_init(struct orknn_context *ctx, void *model_buf, uint32_t size,
         orknn_log(3, "  norm_tensor[%d] JSON: %.200s", ti, obj);
 
         struct orknn_tensor_info info;
-        parse_tensor_json(obj, &info);
+        parse_tensor_json(obj, &info, m->file_data);
 
         int tensor_id = -1;
         json_int(obj, "tensor_id", &tensor_id);
@@ -1224,8 +1290,17 @@ int orknn_own_init(struct orknn_context *ctx, void *model_buf, uint32_t size,
 
     int ret = extract_npu_data(fb, fb_size, m->version, m);
     if (ret != 0) {
-        orknn_log(0, "model: NPU data extraction failed");
-        return RKNN_ERR_MODEL_INVALID;
+        /* NPU extraction failure is fatal only if we OWN the run/inputs_set
+         * path (we need task BO + regcmd to submit to the NPU). For
+         * init/query/outputs-only own modes (or complex models like
+         * MobileSAM where the proxy assembles the task BO at runtime from
+         * many small blobs), fall back to proxy dispatch for run and just
+         * keep our parsed tensor metadata for query. */
+        if (ctx->own_flags & (ORKNN_OWN_RUN | ORKNN_OWN_INPUTS_SET)) {
+            orknn_log(0, "model: NPU data extraction failed (needed for RUN/INPUTS_SET own)");
+            return RKNN_ERR_MODEL_INVALID;
+        }
+        orknn_log(1, "model: NPU data extraction failed — proxy-dispatched run path will be used");
     }
 
     /* Extract tensor metadata from FlatBuffer (scale, zp, format, native shape).
