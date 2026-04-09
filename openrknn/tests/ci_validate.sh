@@ -84,18 +84,57 @@ make -C "$OPENRKNN_DIR"
 LIB="$OPENRKNN_DIR/librknn_api.so"
 [ -f "$LIB" ] || { echo "ERROR: build did not produce $LIB"; exit 2; }
 
+# Get list of model names from ground_truth.json
+MODELS=$(python3 -c "import json; print(' '.join(json.load(open('$GT')).keys()))")
+
+# Helper: run validate_accuracy.py for a single model. Returns 0 on pass,
+# non-zero on failure. Segfaults in one model don't abort the suite —
+# each model runs in its own Python process for isolation.
+run_one() {
+    local lib="$1"; local name="$2"; shift 2
+    python3 "$SCRIPT_DIR/validate_accuracy.py" \
+        --lib "$lib" \
+        --models-dir "$MODEL_DIR" \
+        --images-dir "$IMAGES_DIR" \
+        --ground-truth "$GT" \
+        --only "$name" \
+        "$@" 2>&1 | tail -15
+    return ${PIPESTATUS[0]}
+}
+
+run_phase() {
+    local phase_name="$1"; local lib="$2"; shift 2
+    echo ""
+    echo "=== $phase_name ==="
+    local n_pass=0 n_fail=0 n_total=0
+    local failures=""
+    for name in $MODELS; do
+        n_total=$((n_total + 1))
+        echo ""
+        echo "--- $name ---"
+        if run_one "$lib" "$name" "$@"; then
+            n_pass=$((n_pass + 1))
+        else
+            n_fail=$((n_fail + 1))
+            failures="$failures $name"
+        fi
+    done
+    echo ""
+    echo "  Phase result: $n_pass/$n_total passed"
+    if [ -n "$failures" ]; then
+        echo "  Failed:$failures"
+        return 1
+    fi
+    return 0
+}
+
 # --- Phase 1: vendor baseline ---
 # Ensures the models + test images produce the expected ground-truth
 # classes. If this fails, the ground_truth.json is wrong or a model is
 # corrupt — not an openrknn regression.
 
-echo ""
-echo "=== Phase 1: vendor librknnrt.so baseline ==="
-python3 "$SCRIPT_DIR/validate_accuracy.py" \
-    --lib /lib/librknnrt.so \
-    --models-dir "$MODEL_DIR" \
-    --images-dir "$IMAGES_DIR" \
-    --ground-truth "$GT"
+overall_rc=0
+run_phase "Phase 1: vendor librknnrt.so baseline" /lib/librknnrt.so || overall_rc=1
 
 # --- Phase 2: openrknn OWN path ---
 # Exercises every openrknn code path: init, query, inputs_set (UINT8
@@ -104,29 +143,21 @@ python3 "$SCRIPT_DIR/validate_accuracy.py" \
 # --populate-dumps runs bench_rknn first per model to seed /tmp/rknn_dump
 # which openrknn's copy_proxy_regcmd reads.
 
-echo ""
-echo "=== Phase 2: openrknn OWN path (full pipeline) ==="
-python3 "$SCRIPT_DIR/validate_accuracy.py" \
-    --lib "$LIB" \
-    --models-dir "$MODEL_DIR" \
-    --images-dir "$IMAGES_DIR" \
-    --ground-truth "$GT" \
-    --populate-dumps \
-    --bench-dir "$BENCH_DIR" \
-    --own init,query,input,run,outputs
+run_phase "Phase 2: openrknn OWN path (full pipeline)" "$LIB" \
+    --populate-dumps --bench-dir "$BENCH_DIR" \
+    --own init,query,input,run,outputs || overall_rc=1
 
 # --- Phase 3: openrknn proxy-dispatch path ---
 # The default user-facing mode — LD_PRELOAD=./librknn_api.so without
 # any ORKNN_OWN env var. This exercises the proxy delegation path which
 # existing applications use when upgrading to openrknn.
 
-echo ""
-echo "=== Phase 3: openrknn proxy-dispatch path ==="
-python3 "$SCRIPT_DIR/validate_accuracy.py" \
-    --lib "$LIB" \
-    --models-dir "$MODEL_DIR" \
-    --images-dir "$IMAGES_DIR" \
-    --ground-truth "$GT"
+run_phase "Phase 3: openrknn proxy-dispatch path" "$LIB" || overall_rc=1
 
 echo ""
-echo "=== All openrknn CI validation tests passed ==="
+if [ "$overall_rc" -eq 0 ]; then
+    echo "=== All openrknn CI validation tests passed ==="
+else
+    echo "=== openrknn CI validation FAILED (see phase results above) ==="
+fi
+exit "$overall_rc"
