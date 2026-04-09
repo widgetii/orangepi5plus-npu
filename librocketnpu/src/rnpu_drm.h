@@ -52,5 +52,7 @@ struct rnpu_native_segment {
 };
 extern struct rnpu_native_segment *rnpu_native_segments;
 extern unsigned rnpu_native_segment_count;
+extern uint64_t rnpu_native_wt_obj_addr;
+extern uint32_t rnpu_native_wt_size;
 
 #endif /* RNPU_DRM_H */

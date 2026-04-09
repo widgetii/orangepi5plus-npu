@@ -227,6 +227,9 @@ int ioctl(int fd, unsigned long request, ...) {
             bo_table[bo_count].handle = mc->handle;
             bo_table[bo_count].dma = mc->dma_addr;
             bo_table[bo_count].size = mc->size;
+            fprintf(stderr, "TRACE: MEM_CREATE[%d] handle=%u dma=0x%llx size=%llu flags=0x%x\n",
+                    bo_count, mc->handle, (unsigned long long)mc->dma_addr,
+                    (unsigned long long)mc->size, mc->flags);
             bo_count++;
             if (drm_fd < 0) drm_fd = fd;
         }
@@ -350,7 +353,25 @@ int ioctl(int fd, unsigned long request, ...) {
 
             fprintf(stderr, "DUMP_ALL: submit %d: %d BOs, %u tasks → /tmp/rknn_dump/\n",
                     submit_count, bo_count, s->task_number);
-            return real_ioctl(fd, request, arg);
+
+            int ret = real_ioctl(fd, request, arg);
+
+            /* Post-submit: blocking submit waited for NPU completion */
+
+            /* Post-submit dump: BOs now contain NPU output */
+            for (int i = 0; i < bo_count; i++) {
+                struct rknpu_mem_map bm2 = { .handle = bo_table[i].handle };
+                if (real_ioctl(fd, IOCTL_MEM_MAP, &bm2) != 0) continue;
+                void *map2 = mmap(NULL, bo_table[i].size, PROT_READ, MAP_SHARED, fd, bm2.offset);
+                if (!map2 || map2 == MAP_FAILED) continue;
+                snprintf(mpath, sizeof(mpath), "/tmp/rknn_dump/post%d_bo_%03d_%lluB.bin",
+                         submit_count, i, (unsigned long long)bo_table[i].size);
+                FILE *pf = fopen(mpath, "wb");
+                if (pf) { fwrite(map2, 1, bo_table[i].size, pf); fclose(pf); }
+                munmap(map2, bo_table[i].size);
+            }
+
+            return ret;
         }
 
         /* Mode BRDMA: Dump BRDMA data (bias+scale) from each task's BS_BASE_ADDR */
