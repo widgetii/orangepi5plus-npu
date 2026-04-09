@@ -22,7 +22,6 @@
 #include "rnpu_convert.h"
 #include "rnpu_sw_ops.h"
 #include "rnpu_rknn.h"
-#include "rnpu_rknn_fb.h"
 
 /* ---- Helpers ---- */
 
@@ -1032,31 +1031,28 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
              bo_table[b].orig_size <= out_bytes * 2) {
             unsigned oi = m->native_output_bo_count++;
             m->native_output_bos[oi] = native_bos[b];
-            /* Compute NC1HWC2 padded dims. c2=8 is standard for int8. */
+            /* Compute NC1HWC2 padded dims (C2=8 for int8) */
             unsigned out_c = t->shape[t->shape_len - 1];
             unsigned out_h = t->shape_len >= 4 ? t->shape[1] : 1;
             unsigned out_w = t->shape_len >= 4 ? t->shape[2] : 1;
-            unsigned bo_sz = (unsigned)bo_table[b].orig_size;
-            unsigned actual_c2 = 8, wp = out_w, hp = out_h;
-            for (unsigned try_c2 = 8; try_c2 <= 16; try_c2 *= 2) {
-               unsigned c1 = DIV_ROUND_UP(out_c, try_c2);
-               unsigned spatial = bo_sz / (c1 * try_c2);
-               if (spatial < out_h * out_w) continue;
-               actual_c2 = try_c2;
-               for (unsigned align = 1; align <= 64; align *= 2) {
-                  unsigned try_wp = ((out_w + align - 1) / align) * align;
-                  if (try_wp > 0 && spatial % try_wp == 0) {
-                     unsigned try_hp = spatial / try_wp;
-                     if (try_hp >= out_h) { wp = try_wp; hp = try_hp; break; }
-                  }
+            unsigned c_pad = ((out_c + 7) / 8) * 8;
+            unsigned total_px = (unsigned)bo_table[b].orig_size / c_pad;
+            /* Find smallest W_pad >= W that evenly divides total_px
+             * and gives H_pad >= H. Try multiples of 8, 16, 32. */
+            unsigned wp = out_w, hp = 0;
+            for (unsigned align = 8; align <= 64; align *= 2) {
+               unsigned try_wp = ((out_w + align - 1) / align) * align;
+               if (try_wp > 0 && total_px % try_wp == 0) {
+                  unsigned try_hp = total_px / try_wp;
+                  if (try_hp >= out_h) { wp = try_wp; hp = try_hp; break; }
                }
-               break;
             }
+            if (hp == 0) { wp = out_w; hp = total_px / out_w; }
             m->native_output_w_pad[oi] = wp;
             m->native_output_h_pad[oi] = hp;
-            m->native_output_c2[oi] = actual_c2;
-            fprintf(stderr, "rnpu: native output %u → BO[%u] (%u bytes, %ux%ux%u pad %ux%u c2=%u)\n",
-                    i, b, bo_sz, out_w, out_h, out_c, wp, hp, actual_c2);
+            fprintf(stderr, "rnpu: native output %u → BO[%u] (%u bytes, %ux%ux%u pad %ux%u)\n",
+                    i, b, (unsigned)bo_table[b].orig_size,
+                    out_w, out_h, out_c, wp, hp);
             break;
          }
       }
@@ -1297,386 +1293,6 @@ static int load_native_cache(struct rnpu_model *m, const char *cache_path)
    free(wt_rc_data);
    free(bo_table);
    free(task_table);
-   return 0;
-}
-
-/* Load model directly from .rknn FlatBuffer (no intercept/cache needed).
- * DMA patching: for each regcmd DMA register, ADD the target BO's DMA
- * base address to the template value (which is an offset within that BO). */
-static int load_rknn_direct(struct rnpu_model *m, const char *rknn_path)
-{
-   struct rknn_parsed p;
-   if (rknn_parse_model(rknn_path, &p) != 0)
-      return -1;
-
-   /* Allocate BOs */
-   rnpu_bo_create(m->fd, p.bos[1].size, &m->weight_bo);
-   m->regcmd_bo.handle = m->weight_bo.handle;
-   m->regcmd_bo.dma_addr = m->weight_bo.dma_addr + p.rc_start_offset;
-   m->regcmd_bo.map = (uint8_t *)m->weight_bo.map + p.rc_start_offset;
-   m->regcmd_bo.size = p.wt_rc_size - p.rc_start_offset;
-
-   rnpu_bo_create(m->fd, p.bos[2].size, &m->activation_bo);
-   rnpu_bo_create(m->fd, p.bos[3].size, &m->native_input_bo);
-
-   /* Override input_size from TFLite (parser's extraction is unreliable) */
-   {
-      const struct rnpu_tfl_tensor *it = &m->tfl.tensors[m->tfl.graph_inputs[0]];
-      uint32_t tfl_input_size = 1;
-      for (int d = 0; d < it->shape_len; d++) tfl_input_size *= it->shape[d];
-      if (tfl_input_size > 0 && tfl_input_size < 0x1000000)
-         p.input_size = tfl_input_size;
-   }
-
-   /* Copy template data into weight+regcmd BO */
-   memcpy(m->weight_bo.map, p.wt_rc_data, p.wt_rc_size);
-
-   /* DMA patching: for each DMA register in regcmd, compute:
-    *   runtime_value = template_value + BO_DMA + blob_delta
-    * where blob_delta maps to a specific data section within BO[1].
-    *
-    * The deltas are derived from blob offsets in the BO assembly:
-    *   0x0010 PC_BASE:  delta = rc_start (regcmd section)
-    *   0x1070 SRC:      delta = 0 (template already has offset into inp/act BO)
-    *   0x1110 WT:       delta = varies per op (weight metadata or 0)
-    *   0x4020 DST:      delta = varies (activation tensor offset)
-    *   0x5018 RDMA:     delta = 0 (template has offset into act BO)
-    *   0x5020 BS:       delta = varies (bias data offset)
-    *   0x6070, 0x701c:  delta = mask blob offsets
-    */
-   uint8_t *bo1 = (uint8_t *)m->weight_bo.map;
-   uint32_t wt_dma = (uint32_t)m->weight_bo.dma_addr;
-   uint32_t act_dma = (uint32_t)m->activation_bo.dma_addr;
-   uint32_t inp_dma = (uint32_t)m->native_input_bo.dma_addr;
-   uint32_t rc_start = p.rc_start_offset;
-   uint32_t patched = 0;
-
-   /* Identify blob offsets by type and position.
-    * Convention: type=0 blobs are weight data, type=6 are NPU metadata.
-    * We need specific type=6 blobs for DMA register mapping. */
-   uint32_t type6_offsets[16];
-   uint32_t type6_sizes[16];
-   unsigned n_t6 = 0;
-   uint32_t type0_offsets[16];
-   unsigned n_t0 = 0;
-
-   for (unsigned i = 0; i < p.n_blob_offsets && i < 64; i++) {
-      if (p.blob_types[i] == 0 && n_t0 < 16)
-         type0_offsets[n_t0++] = p.blob_offsets[i];
-      if (p.blob_types[i] == 6 && n_t6 < 16) {
-         if (p.blob_offsets[i] == rc_start) continue;
-         if (p.blob_sizes[i] % 40 == 0 && p.blob_sizes[i] >= 40) continue;
-         type6_offsets[n_t6] = p.blob_offsets[i];
-         type6_sizes[n_t6] = p.blob_sizes[i];
-         n_t6++;
-      }
-   }
-
-   /* Map type=6 blobs to their roles (by index after filtering):
-    * [0] = output info (16B), [1] = memory layout (64B),
-    * [2] = padded dims (128B), [3] = mask1 (1024B), [4] = mask2 (1024B) */
-   uint32_t off_mem_layout = (n_t6 > 1) ? type6_offsets[1] : 0;
-   uint32_t off_padded     = (n_t6 > 2) ? type6_offsets[2] : 0;
-   uint32_t off_mask1      = (n_t6 > 3) ? type6_offsets[3] : 0;
-   uint32_t off_mask2      = (n_t6 > 4) ? type6_offsets[4] : 0;
-   uint32_t off_bias       = (n_t0 > 1) ? type0_offsets[1] : 0;
-
-   /* First CONV op reads from input; others from activation */
-   uint32_t first_conv_op = 0;
-   for (unsigned t = 0; t < p.task_count; t++)
-      if (p.tasks[t].enable_mask == 0x1d) { first_conv_op = p.tasks[t].op_idx; break; }
-   /* FC/output op has different op_idx */
-   uint32_t fc_op = 0;
-   for (unsigned t = 0; t < p.task_count; t++)
-      if (p.tasks[t].enable_mask == 0x1d && p.tasks[t].op_idx != first_conv_op)
-         { fc_op = p.tasks[t].op_idx; break; }
-
-   /* Activation BO: RKNN places output data at a specific offset.
-    * For this simple model, the delta is 0xc00 for CONV DST.
-    * Derive from act BO size and tensor structure. */
-   uint32_t act_output_off = 0xc00; /* TODO: derive from metadata */
-
-   /* Derive activation tensor offsets from the model.
-    * For this model: CONV output at act+0xc00, REFORMAT buffer at act+0x8c00.
-    * These come from the memory layout entry (type=6, 64 bytes).
-    * entry[5] offset+16 = 256 = output buffer offset within act BO (0x100)
-    * TODO: derive properly from metadata for general models. */
-   /* Activation BO tensor offsets.
-    * These describe where different tensors are placed within the activation BO:
-    * - act_conv_out: where CONV writes its output (and FC reads from)
-    * - act_reformat: where REFORMAT writes its intermediate output
-    *
-    * Derive from entry[6] type=6 (128 bytes, padded dimensions):
-    * entry[6]+0 = 0x80 = 128 = padded input channels/feature count
-    * For the FC model: input is 3072 bytes padded to 0x80 groups = 128 groups
-    * Each group = 16 bytes (NC1HWC2 C2=16, but for FC: 1x1 spatial)
-    * Intermediate buffer = 128 * some_factor
-    *
-    * For now: derive from the activation BO total size and entry[6] data. */
-   uint32_t act_conv_out = 0;
-   uint32_t act_reformat = 0;
-
-   /* Use entry[6] (padded dims, 128 bytes): first value * spatial_size */
-   for (unsigned i = 0; i < p.n_blob_offsets; i++) {
-      if (p.blob_types[i] == 6 && p.blob_sizes[i] == 128) {
-         uint32_t pad_val;
-         memcpy(&pad_val, p.wt_rc_data + p.blob_offsets[i], 4);
-         /* pad_val = 0x80 = 128 for FC model. CONV output size = pad_val * spatial */
-         /* For 1x1 FC: spatial = 1, output = 128 * 16 bytes (NC1HWC2 tile) = 2048 */
-         /* But runtime uses 0xc00 = 3072. That's input_size (3072 = 32*32*3). */
-         /* Actually: act_conv_out = input_tensor_size in NC1HWC2 format */
-         break;
-      }
-   }
-
-   /* Derive act_conv_out from input: NC1HWC2 of input tensor.
-    * Input is 32x32x3 → NC1HWC2: ceil(3/16)=1 tile, 32*32*16 = 16384? No.
-    * Actually 0xc00 = 3072 = 32*32*3 = raw input size.
-    * And 0x8c00 = 35840 = 0xc00 * 29.3... no clean factor.
-    * 0x8c00 = 0x8000 + 0xc00 = 32768 + 3072 = 35840
-    * Or: 0x8c00 = 35840 / 1024 = 35 pages.
-    *
-    * Let me just compute from the type=6 entry[5] (64 bytes):
-    * offset+32 = 0x10000 = 65536 = activation BO size
-    * The layout: 0..0xc00 = tensor A, 0xc00..0x8c00 = tensor B, 0x8c00.. = tensor C
-    * Size of A = 0xc00 = 3072 = input size
-    * Size of B = 0x8c00 - 0xc00 = 0x8000 = 32768 = input_size rounded to 32K
-    * Size of C = total - 0x8c00 = 65536 - 35840 = 29696
-    *
-    * Simpler: act_conv_out = align(input_size, 1024)
-    * 3072 aligned to 1024 = 3072 = 0xc00 ✓
-    * act_reformat = act_conv_out + align(input_size * some_factor, 8192)
-    * Not clean. Let me just use: act_reformat = act_bo_size / 2 (approx) */
-   /* For the FC model: act_conv_out = 0xc00 (3072 = input_size aligned),
-    * act_reformat = 0x8c00 (35840). Compute from input_size. */
-   act_conv_out = (p.input_size + 1023) & ~1023;
-   /* REFORMAT offset: RKNN uses act_bo_size/2 aligned to page. Verify empirically. */
-   {
-      uint32_t act_size = 0;
-      for (unsigned i = 0; i < p.n_blob_offsets; i++)
-         if (p.blob_types[i] == 6 && p.blob_sizes[i] == 64) {
-            memcpy(&act_size, p.wt_rc_data + p.blob_offsets[i] + 32, 4);
-            break;
-         }
-      /* 0x8c00 = 35840. act_size = 65536. 35840 / 65536 = 0.547.
-       * It's ceil(input_size / 8) * 8 * ceil(channels_padded/16)*16.
-       * Simpler: it's at offset where the second NC1HWC2 tile starts.
-       * For 3072 input (32x32x3): NC1HWC2 = [1, 1, 32, 32, 16] = 16384 per tile.
-       * Two tiles = 32768 = 0x8000. Plus header 0xc00 = 0x8c00! */
-      /* REFORMAT buffer: act_conv_out + H * W * 2 * C2.
-       * For FC model: 0xc00 + 32*32*2*16 = 0xc00 + 0x8000 = 0x8c00.
-       * General: use NC1HWC2 tile size with spatial dims from input. */
-      uint32_t h = 1, w = 1;
-      if (p.input_size > 0) {
-         /* Estimate spatial from input: assume square for now */
-         uint32_t spatial = p.input_size / 3; /* 3 channels */
-         for (h = 1; h * h <= spatial; h++);
-         h--;
-         w = spatial / h;
-      }
-      uint32_t nc1hwc2_size = h * w * 2 * 16; /* 2 channel groups × C2=16 */
-      act_reformat = act_conv_out + nc1hwc2_size;
-      if (act_size > 0 && act_reformat > act_size)
-         act_reformat = act_conv_out + (act_size - act_conv_out) / 2;
-   }
-   fprintf(stderr, "rnpu: act offsets: conv_out=0x%x reformat=0x%x input_size=%u\n",
-           act_conv_out, act_reformat, p.input_size);
-   m->native_output_offset = act_conv_out;
-
-   for (unsigned t = 0; t < p.task_count; t++) {
-      uint32_t rc_off = p.tasks[t].rc_offset;
-      uint32_t rc_amt = p.tasks[t].rc_amount + 4;
-      uint64_t *entries = (uint64_t *)(bo1 + rc_off);
-      uint32_t em = p.tasks[t].enable_mask;
-      uint32_t oi = p.tasks[t].op_idx;
-
-      /* Determine task role:
-       * first_conv_op (op=1): reads input, writes to act
-       * fc_op (op=3): reads activation, does FC, writes to act
-       * REFORMAT (em=0x18, op=2): converts between tiled/linear in act BO
-       * POSTPROC (em=0x60): mask/bias adjustment */
-      int is_input_conv = (em == 0x1d && oi == first_conv_op);
-      int is_fc = (em == 0x1d && oi == fc_op);
-      int is_reformat = (em == 0x18);
-      int is_postproc = (em == 0x60);
-
-      /* REFORMAT task index within group (alternates 0,1 for DST offset) */
-      unsigned reformat_in_group = 0;
-      if (is_reformat) {
-         /* Count how many REFORMATs came before this one in the current group */
-         for (unsigned tt = t; tt > 0 && p.tasks[tt-1].enable_mask == 0x18; tt--)
-            reformat_in_group++;
-         reformat_in_group %= 2;
-      }
-
-      for (unsigned e = 0; e < rc_amt; e++) {
-         uint16_t reg = entries[e] & 0xFFFF;
-         uint32_t val = (entries[e] >> 16) & 0xFFFFFFFF;
-
-         /* Skip if already patched (shared regcmd block — earlier task already set this) */
-         if (val >= 0xfe000000) continue;
-
-         uint32_t new_val = val;
-         int do_patch = 1;
-
-         switch (reg) {
-         case 0x0010: /* Chain pointer → next task's regcmd within wt BO */
-            new_val = val + rc_start + wt_dma;
-            break;
-
-         case 0x1070: /* SRC */
-            if (is_input_conv)
-               new_val = val + inp_dma;
-            else if (is_fc)
-               new_val = val + act_dma; /* FC reads from activation */
-            else
-               new_val = val + act_dma;
-            break;
-
-         case 0x1110: /* Weight addr */
-            if (is_fc)
-               new_val = val + wt_dma; /* FC: raw weights at BO[1] start */
-            else if (is_input_conv)
-               new_val = val + wt_dma + off_mem_layout;
-            else
-               do_patch = 0; /* REFORMAT doesn't use weight */
-            break;
-
-         case 0x4020: /* DST */
-            if (is_input_conv || is_fc)
-               new_val = val + act_dma + act_conv_out;
-            else if (is_reformat) {
-               /* REFORMAT alternates: first writes to act_reformat, second to act+0 */
-               uint32_t dst = (reformat_in_group % 2 == 0) ? act_reformat : 0;
-               new_val = val + act_dma + dst;
-            } else
-               new_val = val + act_dma;
-            break;
-
-         case 0x5018: /* RDMA activation source */
-            if (is_reformat) {
-               /* REFORMAT reads from where CONV/previous REFORMAT wrote */
-               uint32_t src = (reformat_in_group % 2 == 0) ? act_conv_out : act_reformat;
-               new_val = act_dma + src;
-            } else if (val == 0)
-               do_patch = 0;
-            else
-               new_val = val + act_dma;
-            break;
-
-         case 0x5020: /* Bias/metadata */
-            if (is_input_conv)
-               new_val = val + wt_dma + off_padded;
-            else if (is_fc)
-               new_val = val + wt_dma + off_bias;
-            else
-               do_patch = 0; /* REFORMAT/POSTPROC: leave as 0 */
-            break;
-
-         case 0x6070:
-            new_val = val + wt_dma + off_mask1;
-            break;
-         case 0x701c:
-            new_val = val + wt_dma + off_mask2;
-            break;
-
-         case 0x104c: /* CNA config — different per op type */
-            if (is_input_conv)
-               new_val = 0x9;  /* input CONV */
-            /* else leave as template value (0xb for FC) */
-            else do_patch = 0;
-            break;
-         case 0x1180: /* Padding mask — only for input CONV */
-            if (is_input_conv)
-               new_val = 0xfff;
-            else
-               do_patch = 0; /* FC/REFORMAT: leave as template */
-            break;
-
-         default:
-            do_patch = 0;
-            break;
-         }
-
-         if (do_patch) {
-            entries[e] = (entries[e] & 0xFFFF000000000000ULL) |
-                         ((uint64_t)new_val << 16) |
-                         (entries[e] & 0xFFFF);
-            patched++;
-         }
-      }
-
-      (void)reformat_in_group; /* used in switch cases above */
-   }
-
-   /* Patch task BO regcmd_addr: parser already added rc_start to make
-    * them BO-relative offsets. Now add wt_dma to get DMA addresses. */
-   struct __attribute__((packed)) {
-      uint32_t f[8]; uint64_t regcmd_addr;
-   } *te = (void *)p.task_bo_data;
-   for (unsigned t = 0; t < p.task_count; t++)
-      te[t].regcmd_addr += wt_dma;
-
-
-   /* Dump patched BO[1] for debug comparison */
-   {
-      FILE *df = fopen("/tmp/direct_bo1.bin", "wb");
-      if (df) { fwrite(bo1, 1, p.bos[1].size, df); fclose(df); }
-   }
-
-   /* Flush weight+regcmd to device */
-   rnpu_bo_fini(m->fd, &m->weight_bo);
-
-   /* Transfer task and segment data */
-   m->native_task_bo_data = p.task_bo_data;
-   m->native_task_bo_size = p.task_bo_size;
-   p.task_bo_data = NULL;
-
-   m->native_segments = calloc(p.segment_count, sizeof(*m->native_segments));
-   m->native_segment_count = p.segment_count;
-   for (unsigned s = 0; s < p.segment_count; s++) {
-      m->native_segments[s].flags = p.segments[s].flags;
-      m->native_segments[s].sc_start = p.segments[s].sc_start;
-      m->native_segments[s].sc_count = p.segments[s].sc_count;
-      m->native_segments[s].task_number = p.segments[s].task_number;
-   }
-
-   /* Replace TFLite ops with a single native HW op.
-    * Free any existing ops first. */
-   for (unsigned i = 0; i < m->op_count; i++) {
-      free(m->ops[i].tasks);
-      m->ops[i].tasks = NULL;
-   }
-
-   memset(&m->ops[0], 0, sizeof(m->ops[0]));
-   m->ops[0].type = RNPU_OP_CONV;
-   m->ops[0].task_count = p.task_count;
-   m->ops[0].input_tensor = m->graph_input_tensor;
-   if (m->tfl.tensors && m->tfl.graph_inputs) {
-      const struct rnpu_tfl_tensor *it = &m->tfl.tensors[m->tfl.graph_inputs[0]];
-      if (it->shape_len >= 4) {
-         m->ops[0].input_width = it->shape[2];
-         m->ops[0].input_height = it->shape[1];
-         m->ops[0].input_channels = it->shape[3];
-      }
-   }
-   /* Allocate dummy tasks for build_execution_plan (actual submit uses native path) */
-   m->ops[0].tasks = calloc(p.task_count, sizeof(struct rnpu_split_task));
-   for (unsigned t = 0; t < p.task_count; t++) {
-      m->ops[0].tasks[t].regcfg_addr = (uint64_t)m->weight_bo.dma_addr +
-                                         p.tasks[t].rc_offset;
-      m->ops[0].tasks[t].regcfg_amount = p.tasks[t].rc_amount;
-      m->ops[0].tasks[t].enable_mask = p.tasks[t].enable_mask;
-      m->ops[0].tasks[t].native_op_idx = p.tasks[t].op_idx;
-   }
-   m->op_count = 1;
-
-   fprintf(stderr, "rnpu: loaded .rknn direct: %u tasks, %u segments, "
-           "%u DMA patched (wt=0x%x act=0x%x inp=0x%x)\n",
-           p.task_count, p.segment_count, patched,
-           wt_dma, act_dma, inp_dma);
-
-   rknn_parsed_free(&p);
    return 0;
 }
 
@@ -2185,13 +1801,13 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
       }
    }
 
-   /* Try native cache/direct .rknn (RKNPU only) — before allocating TFLite tensors.
-    * Priority: .rknn_cache first (proven working), then .rknn direct (experimental). */
+   /* Allocate activation BO */
+   allocate_tensors(m);
+
+   /* Try native .rknn_cache path first (RKNPU only) */
    bool native_loaded = false;
    if (rnpu_active_driver == RNPU_DRIVER_RKNPU) {
       size_t plen = strlen(tflite_path);
-
-      /* Try .rknn_cache first (legacy intercept-based, most reliable) */
       char *cache_path = malloc(plen + 16);
       strcpy(cache_path, tflite_path);
       char *ext = strrchr(cache_path, '.');
@@ -2205,29 +1821,10 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
          }
       }
       free(cache_path);
-
-      /* Fall back to direct .rknn loading (experimental) */
-      if (!native_loaded) {
-         char *rknn_path = malloc(plen + 16);
-         strcpy(rknn_path, tflite_path);
-         char *ext2 = strrchr(rknn_path, '.');
-         if (ext2) strcpy(ext2, ".rknn");
-         else strcat(rknn_path, ".rknn");
-         if (access(rknn_path, R_OK) == 0) {
-            if (load_rknn_direct(m, rknn_path) == 0) {
-               native_loaded = true;
-               build_execution_plan(m);
-            }
-         }
-         free(rknn_path);
-      }
    }
 
    if (!native_loaded) {
-      /* Standard path: compute tensor sizes and allocate activation BO */
-      allocate_tensors(m);
-
-      /* Compile from TFLite */
+      /* Standard path: compile from TFLite */
       compile_weights_and_biases(m);
 
       /* Try loading sibling .rknn file for BRDMA data override */
@@ -2301,11 +1898,9 @@ rnpu_model_t *rnpu_model_load(int fd, const char *tflite_path)
             m->graph_output_tensors[i] = last_op_out;
          } else if (ti < m->tensor_count && m->tensors[ti].size > 0) {
             m->graph_output_tensors[i] = ti;
-            /* Use native_output_offset if set (from .rknn direct loader).
-             * Otherwise clamp to activation BO bounds. */
-            if (m->native_output_offset > 0) {
-               m->tensors[ti].offset = m->native_output_offset;
-            } else if (m->tensors[ti].offset + m->tensors[ti].size > m->activation_bo.size) {
+            /* Clamp tensor offset to activation BO bounds to prevent segfault.
+             * RKNN's activation BO may be smaller than TFLite's layout. */
+            if (m->tensors[ti].offset + m->tensors[ti].size > m->activation_bo.size) {
                m->tensors[ti].offset = 0;
                fprintf(stderr, "rnpu: native output t%u: offset clamped to 0 "
                        "(exceeds act BO %u)\n", ti, m->activation_bo.size);
@@ -2449,23 +2044,10 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
       for (unsigned i = 0; i < total; i++)
          dst[i] = src[i] - 0x80;
    } else if (m->native_input_bo.handle) {
-      unsigned w = first->input_width, h = first->input_height, c = first->input_channels;
-      size_t inp_sz = w * h * c;
-
-      /* Note: activation BO is NOT zeroed — RKNN doesn't zero it either.
-       * Stale data only affects the first invoke's border padding. */
-
-      /* Check if CONV expects raw uint8 NHWC (ARGB_IN mode) or pre-processed
-       * NC1HWC2 int8 input. If input BO is larger than raw NHWC, RKNN's
-       * rknn_inputs_set converted the input to NC1HWC2 int8 format.
-       * MBv1 uses ARGB_IN=10 → raw uint8 memcpy.
-       * Other models: RKNN preprocesses uint8→int8 + NHWC→NC1HWC2. */
-      /* Write input to native input BO. Always use raw memcpy — the CONV task's
-       * CNA_DATA_FORMAT register determines how the NPU reads the input
-       * (ARGB_IN mode for raw uint8, or pre-tiled for NC1HWC2).
-       * The input BO from the cache was captured AFTER rknn_inputs_set
-       * processed the data, so the same raw format works. */
-      memset(m->native_input_bo.map, 0, m->native_input_bo.size);
+      /* Native cache mode: write raw input directly to separate input BO.
+       * RKNN's first conv uses ARGB_IN=10 mode — it reads raw uint8 NHWC
+       * with hardware CVT (no NPU-format conversion needed). */
+      size_t inp_sz = first->input_width * first->input_height * first->input_channels;
       memcpy(m->native_input_bo.map, input, inp_sz);
       rnpu_bo_fini(m->fd, &m->native_input_bo);
    } else {
@@ -2479,11 +2061,6 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
     * the NPU reads from the separate native_input_bo (already flushed above). */
    if (!m->native_input_bo.handle)
       rnpu_bo_fini(m->fd, &m->activation_bo);
-
-   /* Flush output BOs to ensure clean cache before NPU writes */
-   for (unsigned i = 0; i < m->native_output_bo_count; i++)
-      if (m->native_output_bos[i].handle)
-         rnpu_bo_fini(m->fd, &m->native_output_bos[i]);
 
    /* Debug flags — cached after first invoke to avoid per-invoke getenv */
    static int trace_ops_cached = -1, debug_level_cached = -1, debug_per_op_cached = -1;
@@ -2552,8 +2129,6 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
             rnpu_native_raw_task_bo_size = m->native_task_bo_size;
             rnpu_native_segments = (struct rnpu_native_segment *)m->native_segments;
             rnpu_native_segment_count = m->native_segment_count;
-            rnpu_native_wt_obj_addr = m->weight_bo.obj_addr;
-            rnpu_native_wt_size = m->weight_bo.size;
             int ret = rnpu_submit(m->fd, &m->jobs[hw_job_idx], seg->job_count);
             if (ret) {
                fprintf(stderr, "rnpu: segment submit failed (%u jobs)\n", seg->job_count);
@@ -2710,26 +2285,6 @@ int rnpu_invoke(rnpu_model_t *m, const void *input, size_t input_size)
    return 0;
 }
 
-int rnpu_get_output_raw(rnpu_model_t *m, int idx, void *out, size_t max_size)
-{
-   if (idx < 0 || idx >= (int)m->output_count) return -1;
-   if ((unsigned)idx < m->native_output_bo_count && m->native_output_bos[idx].handle) {
-      rnpu_bo_prep(m->fd, &m->native_output_bos[idx]);
-      size_t sz = m->native_output_bos[idx].size;
-      if (sz > max_size) sz = max_size;
-      memcpy(out, m->native_output_bos[idx].map, sz);
-      return sz;
-   }
-   /* Fallback: read from activation BO at tensor offset */
-   unsigned ti = m->graph_output_tensors[idx];
-   struct rnpu_npu_tensor *t = &m->tensors[ti];
-   size_t sz = t->size;
-   if (sz > max_size) sz = max_size;
-   rnpu_bo_prep(m->fd, &m->activation_bo);
-   memcpy(out, (uint8_t *)m->activation_bo.map + t->offset, sz);
-   return sz;
-}
-
 int rnpu_get_output(rnpu_model_t *m, int idx, void *out, size_t max_size)
 {
    if (idx < 0 || idx >= (int)m->output_count) return -1;
@@ -2744,9 +2299,9 @@ int rnpu_get_output(rnpu_model_t *m, int idx, void *out, size_t max_size)
       rnpu_bo_prep(m->fd, &m->native_output_bos[idx]);
       uint8_t *data = (uint8_t *)m->native_output_bos[idx].map;
       /* RKNN output BOs are in NC1HWC2 tiled format */
-      rnpu_convert_nc1hwc2(out, data, t->width, t->height, t->channels,
-                           m->native_output_w_pad[idx], m->native_output_h_pad[idx],
-                           m->native_output_c2[idx], !t->int8);
+      rnpu_convert_nc1hwc2_8(out, data, t->width, t->height, t->channels,
+                              m->native_output_w_pad[idx], m->native_output_h_pad[idx],
+                              !t->int8);
       return nhwc_size;
    }
 

@@ -127,30 +127,44 @@ void rnpu_convert_output_ex(uint8_t *nhwc, const uint8_t *npu,
    }
 }
 
-void rnpu_convert_nc1hwc2(uint8_t *nhwc, const uint8_t *src,
-                          unsigned w, unsigned h, unsigned c,
-                          unsigned w_pad, unsigned h_pad,
-                          unsigned c2, bool add_offset)
+void rnpu_convert_nc1hwc2_8(uint8_t *nhwc, const uint8_t *src,
+                             unsigned w, unsigned h, unsigned c,
+                             unsigned w_pad, unsigned h_pad,
+                             bool add_offset)
 {
-   /* RKNN NC1HWC2 output BO layout (from librknnrt post-processing.md):
-    *   data[c1][h_pad][w_pad][c2]
-    * where c1 = ceil(C / c2), c2 ∈ {8, 16}
+   /* RKNN NC1HWC2 output BO layout (from librknnrt RE):
+    * [y_block][x][ch_tile][c2_within][y_within_block]
+    * where: C2=16 (int8 tile size), Y_BLOCK=16 (y positions per block)
+    * Last ch_tile may be partial (< 16 channels).
     *
-    * tiled_offset = c1_idx * (h_pad * w_pad * c2)
-    *              + y * (w_pad * c2) + x * c2 + c_within_tile
+    * col_bytes = (n_full_tiles * C2 + last_tile_c) * Y_BLOCK
+    * col_bytes is the stride per x position within a y-block.
     */
-   unsigned c1 = DIV_ROUND_UP(c, c2);
+   const unsigned C2 = 16;
+   const unsigned Y_BLOCK = 16;
+   unsigned c_tiles = DIV_ROUND_UP(c, C2);
+   unsigned last_tile_c = c - (c_tiles - 1) * C2;
+   unsigned col_bytes = (c_tiles - 1) * (C2 * Y_BLOCK) + last_tile_c * Y_BLOCK;
+   unsigned n_yblocks = DIV_ROUND_UP(h, Y_BLOCK);
    uint8_t ofs = add_offset ? 0x80 : 0;
 
-   for (unsigned y = 0; y < h; y++) {
+   typedef uint8_t (*out_t)[w][c];
+   out_t out = (out_t)nhwc;
+
+   for (unsigned yb = 0; yb < n_yblocks; yb++) {
+      unsigned y0 = yb * Y_BLOCK;
+      unsigned y1 = MIN2(y0 + Y_BLOCK, h);
       for (unsigned x = 0; x < w; x++) {
-         unsigned dst_base = (y * w + x) * c;
-         for (unsigned ch = 0; ch < c; ch++) {
-            unsigned tile = ch / c2;
-            unsigned within = ch % c2;
-            unsigned src_off = tile * (h_pad * w_pad * c2)
-                             + y * (w_pad * c2) + x * c2 + within;
-            nhwc[dst_base + ch] = src[src_off] + ofs;
+         const uint8_t *col = src + yb * w * col_bytes + x * col_bytes;
+         for (unsigned ct = 0; ct < c_tiles; ct++) {
+            unsigned c0 = ct * C2;
+            unsigned cn = MIN2(C2, c - c0);
+            const uint8_t *tile = col + ct * (C2 * Y_BLOCK);
+            for (unsigned ci = 0; ci < cn; ci++) {
+               const uint8_t *chan = tile + ci * Y_BLOCK;
+               for (unsigned y = y0; y < y1; y++)
+                  out[y][x][c0 + ci] = chan[y - y0] + ofs;
+            }
          }
       }
    }

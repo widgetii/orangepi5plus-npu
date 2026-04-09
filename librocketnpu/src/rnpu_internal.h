@@ -351,7 +351,6 @@ struct rnpu_model {
    unsigned native_output_bo_count;
    unsigned native_output_w_pad[8];     /* NC1HWC2 padded width per output */
    unsigned native_output_h_pad[8];     /* NC1HWC2 padded height per output */
-   unsigned native_output_c2[8];        /* NC1HWC2 channel tile size per output */
 
    /* Native cache submit segments (RKNN's exact submit pattern) */
    struct {
@@ -361,8 +360,6 @@ struct rnpu_model {
       uint32_t task_number;
    } *native_segments;
    unsigned native_segment_count;
-   uint32_t native_output_offset;  /* activation BO offset of the last CONV output */
-   bool activation_bo_zeroed;      /* true after first invoke zeroes activation BO */
 
    /* Tensors */
    struct rnpu_npu_tensor *tensors;
