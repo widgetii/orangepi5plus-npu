@@ -67,6 +67,12 @@ jobs:
     needs: build-and-test
     runs-on: [self-hosted, orangepi5plus]
     timeout-minutes: 5
+    # Serialize all self-hosted NPU jobs so they don't fight for the
+    # single physical NPU on the board. cancel-in-progress=false queues
+    # rather than cancels.
+    concurrency:
+      group: orangepi5plus-npu
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -106,11 +112,22 @@ jobs:
     needs: openrknn-build
     runs-on: [self-hosted, orangepi5plus]
     timeout-minutes: 15
+    # Same concurrency group as hw-test so they serialize on the single
+    # physical NPU.
+    concurrency:
+      group: orangepi5plus-npu
+      cancel-in-progress: false
     defaults:
       run:
         working-directory: openrknn
     steps:
       - uses: actions/checkout@v4
+
+      - name: Brief NPU cooldown
+        # If the previous self-hosted job left the NPU in a stuck state
+        # (e.g. hw-test submit timeout), give it a moment to recover and
+        # free any stale /dev/dri/* handles before opening the device.
+        run: sleep 3
 
       - name: Run openrknn real-image validation
         run: bash tests/ci_validate.sh
