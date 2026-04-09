@@ -8,6 +8,12 @@ on:
       - 'openrknn/**'
       - '.github/workflows/ci.yml'
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_hw_tests:
+        description: 'Run self-hosted hardware tests (orangepi5plus)'
+        type: boolean
+        default: true
 
 defaults:
   run:
@@ -57,7 +63,7 @@ jobs:
 
   hw-test:
     # Hardware tests on Orange Pi 5 Plus — only on push (not PRs from forks)
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_hw_tests)
     needs: build-and-test
     runs-on: [self-hosted, orangepi5plus]
     timeout-minutes: 5
@@ -96,7 +102,7 @@ jobs:
     # outputs_get) with real test images and semantic post-processing
     # (softmax + top-k, YOLOv5/v8 NMS, DeepLabv3 argmax) against the
     # vendor library baseline.
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_hw_tests)
     needs: openrknn-build
     runs-on: [self-hosted, orangepi5plus]
     timeout-minutes: 15
