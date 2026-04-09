@@ -161,6 +161,16 @@ class RKNNLib:
         for i in range(n_outputs):
             sz = outputs_arr[i].size
             buf = outputs_arr[i].buf
+            if not buf or sz == 0:
+                # openrknn returned an empty buffer for this output (e.g.,
+                # sig search failed to find a valid offset). Return zeros
+                # so the caller can still run post-processing without
+                # segfaulting on a NULL dereference.
+                if want_float:
+                    results.append(np.zeros(sz // 4, dtype=np.float32))
+                else:
+                    results.append(np.zeros(sz, dtype=np.uint8))
+                continue
             if want_float:
                 arr = np.ctypeslib.as_array(
                     (ctypes.c_float * (sz // 4)).from_address(buf)
