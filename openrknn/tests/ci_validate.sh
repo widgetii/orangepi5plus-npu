@@ -128,6 +128,18 @@ run_phase() {
     return 0
 }
 
+# --- Pre-phase: wipe /tmp/rknn_dump ---
+# On a self-hosted runner the intercept dump directory persists between
+# CI runs (symlinked to /root/rknn_dump on eMMC). Stale post{N}_bo_*.bin
+# from a prior run can trip openrknn's sig search — see the hardened
+# _clean_dump_dir() in validate_accuracy.py for the full story. Wipe
+# here as belt-and-suspenders; validate_accuracy.py will also clean
+# before each model when --populate-dumps is set.
+if [ -e /tmp/rknn_dump ]; then
+    find /tmp/rknn_dump -mindepth 1 -delete 2>/dev/null || true
+    sync
+fi
+
 # --- Phase 1: vendor baseline ---
 # Ensures the models + test images produce the expected ground-truth
 # classes. If this fails, the ground_truth.json is wrong or a model is

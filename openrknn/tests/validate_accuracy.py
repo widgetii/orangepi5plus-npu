@@ -360,6 +360,53 @@ def validate_fp16_parse(lib, ctx, config):
 
 # ── Main ─────────────────────────────────────────────────────────────────
 
+DUMP_DIR = "/tmp/rknn_dump"
+
+
+def _clean_dump_dir(path=DUMP_DIR):
+    """Fully clean path so bench_rknn starts with an empty directory.
+
+    Replaces the previous `sh -c "rm -rf /tmp/rknn_dump/* 2>/dev/null"` which
+    had two failure modes: (1) the shell glob doesn't expand if the dir is
+    empty or missing, leaving stale files if the listing is racy, and
+    (2) errors are silently swallowed, so a leftover file from a prior CI
+    run could survive into the next model's intercept dump and mislead
+    openrknn's sig search — the exact cause of the intermittent
+    Phase 2 mobilenet_v1 failure on master CI.
+
+    This version:
+      * Creates the directory if missing (mkdir -p).
+      * Walks the top-level entries with os.scandir, removes each file
+        directly (os.remove) and each sub-tree with shutil.rmtree.
+      * Follows the symlink for path itself (self-hosted runner points
+        /tmp/rknn_dump at /root/rknn_dump to avoid filling tmpfs), but
+        does NOT follow symlinks for entries — removes the link itself.
+      * Forces the filesystem to flush the unlinks with os.sync() so a
+        subsequent bench_rknn + readback on the same dir can't see stale
+        dirents.
+      * Verifies the dir is empty after cleanup and raises if not.
+    """
+    os.makedirs(path, exist_ok=True)
+    import shutil
+    # Resolve symlink so os.scandir walks the real target, not the link.
+    real = os.path.realpath(path)
+    for entry in os.scandir(real):
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.path)
+            else:
+                os.remove(entry.path)
+        except FileNotFoundError:
+            pass
+    os.sync()
+    leftover = os.listdir(real)
+    if leftover:
+        raise RuntimeError(
+            f"_clean_dump_dir: {real} still has {len(leftover)} entries "
+            f"after cleanup (first 5: {leftover[:5]})"
+        )
+
+
 def populate_intercept_dump(model_path, bench_dir):
     """Run bench_rknn under intercept_swap.so to populate /tmp/rknn_dump/.
     Required for openrknn 'own' run path which reads pre-patched regcmd
@@ -371,14 +418,28 @@ def populate_intercept_dump(model_path, bench_dir):
     env = os.environ.copy()
     env["LD_PRELOAD"] = intercept
     env["DUMP_ALL_BOS"] = "1"
-    # Clean dump dir first
-    subprocess.run(["sh", "-c", "rm -rf /tmp/rknn_dump/* 2>/dev/null"],
-                   capture_output=True)
+    # Fully clean /tmp/rknn_dump before regenerating. A previous CI run
+    # may have left a post{N}_bo_*.bin for a different model with a
+    # HIGHER submit index than the current model produces — openrknn
+    # picks post{max} during output discovery and would sig-search
+    # against garbage, false-matching on the wrong BO and returning
+    # stale bytes from our never-written output_bos[].
+    _clean_dump_dir()
     proc = subprocess.run(
         [bench, model_path, "1"],
         env=env, capture_output=True, cwd=bench_dir, timeout=600
     )
-    return proc.returncode == 0
+    if proc.returncode != 0:
+        return False
+    # Sanity check: at least one post*_bo_*.bin exists for this model.
+    # If bench_rknn silently produced no dumps, openrknn would see
+    # whatever was there before (which our clean just wiped, so now
+    # nothing) and fail with a cleaner error than sig-search garbage.
+    posts = [f for f in os.listdir(os.path.realpath(DUMP_DIR))
+             if f.startswith("post") and f.endswith(".bin")]
+    if not posts:
+        return False
+    return True
 
 
 def run_validation(lib_path, models_dir, images_dir, ground_truth,
