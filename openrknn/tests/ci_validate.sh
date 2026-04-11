@@ -1,15 +1,20 @@
 #!/bin/bash
 # openrknn CI validation — runs on the Orange Pi 5 Plus self-hosted runner.
 #
-# Builds openrknn natively, runs the real-image validation suite against
-# both the vendor librknnrt.so (baseline) and our librknn_api.so (OWN path).
+# Phase 2 is the authoritative openrknn test: it runs the OWN path purely
+# from the .rknn FlatBuffer on a freshly wiped /tmp/rknn_dump, with
+# /lib/librknnrt.so not even required. Phases 1, 2.5, and 3 exist for
+# cross-reference against the vendor stack and are skipped gracefully if
+# the vendor library or bench_rknn/intercept_swap.so tooling is absent.
 #
-# Requires:
+# Requires (mandatory):
 #   - /root/npu-research/<model>.rknn for each model in ground_truth.json
-#   - /root/npu-research/librocketnpu/tests/{bench_rknn,intercept_swap.so}
-#     (used by --populate-dumps to seed /tmp/rknn_dump per model)
-#   - /lib/librknnrt.so (vendor lib)
 #   - python3 + PIL (pillow)
+#
+# Optional (enables extra phases):
+#   - /lib/librknnrt.so                                 — Phase 1, 3
+#   - /root/npu-research/librocketnpu/tests/{bench_rknn,
+#     intercept_swap.so}                                — Phase 2.5
 #
 # Exit codes: 0 = all pass, 1 = test failure, 2 = setup error
 set -euo pipefail
@@ -22,17 +27,21 @@ BENCH_DIR="/root/npu-research/librocketnpu/tests"
 IMAGES_DIR="$SCRIPT_DIR/test_images"
 GT="$SCRIPT_DIR/ground_truth.json"
 
+# Capability probes for optional phases. Each is a boolean (true/false).
+HAVE_VENDOR_LIB=false
+HAVE_BENCH_TOOLS=false
+[ -f "/lib/librknnrt.so" ] && HAVE_VENDOR_LIB=true
+[ -x "$BENCH_DIR/bench_rknn" ] && [ -f "$BENCH_DIR/intercept_swap.so" ] \
+    && HAVE_BENCH_TOOLS=true
+
 echo "=== openrknn CI validation ==="
 echo "Host: $(hostname)"
 echo "Kernel: $(uname -r)"
 echo "Repo: $REPO_ROOT"
+echo "Vendor lib:  $HAVE_VENDOR_LIB"
+echo "Bench tools: $HAVE_BENCH_TOOLS"
 
-# --- Setup sanity checks ---
-
-if [ ! -f "/lib/librknnrt.so" ]; then
-    echo "ERROR: /lib/librknnrt.so not found (vendor library required)"
-    exit 2
-fi
+# --- Mandatory setup sanity checks ---
 
 if [ ! -d "$IMAGES_DIR" ] || [ -z "$(ls -A "$IMAGES_DIR" 2>/dev/null)" ]; then
     echo "ERROR: test images missing at $IMAGES_DIR"
@@ -60,12 +69,6 @@ for entry in gt.values():
     print(entry['model'])
 ")
 if [ "$MISSING" -ne 0 ]; then
-    exit 2
-fi
-
-if [ ! -x "$BENCH_DIR/bench_rknn" ] || [ ! -f "$BENCH_DIR/intercept_swap.so" ]; then
-    echo "ERROR: bench_rknn or intercept_swap.so missing at $BENCH_DIR"
-    echo "  (needed for --populate-dumps — the OWN run path reads /tmp/rknn_dump/)"
     exit 2
 fi
 
@@ -128,35 +131,36 @@ run_phase() {
     return 0
 }
 
-# --- Pre-phase: wipe /tmp/rknn_dump ---
-# On a self-hosted runner the intercept dump directory persists between
-# CI runs (symlinked to /root/rknn_dump on eMMC). Stale post{N}_bo_*.bin
-# from a prior run can trip openrknn's sig search — see the hardened
-# _clean_dump_dir() in validate_accuracy.py for the full story. Wipe
-# here as belt-and-suspenders; validate_accuracy.py will also clean
-# before each model when --populate-dumps is set.
+overall_rc=0
+
+# --- Phase 1: vendor baseline ---
+# Ensures the models + test images produce the expected ground-truth
+# classes. If this fails, the ground_truth.json is wrong or a model is
+# corrupt — not an openrknn regression. Optional: skipped when the
+# vendor library isn't installed.
+
+if $HAVE_VENDOR_LIB; then
+    run_phase "Phase 1: vendor librknnrt.so baseline" /lib/librknnrt.so \
+        || overall_rc=1
+else
+    echo ""
+    echo "=== Phase 1: vendor librknnrt.so baseline (SKIPPED — no vendor lib) ==="
+fi
+
+# --- Phase 2: openrknn OWN path (no vendor deps) ---
+# The authoritative openrknn test. Wipes /tmp/rknn_dump first so any
+# accidental dump reads would fail loudly; runs the OWN path purely
+# from the .rknn FlatBuffer. Does NOT invoke bench_rknn or touch the
+# vendor library. Exercises: init, query, inputs_set (UINT8 NHWC →
+# NC1HWC2), run (regcmd rebase + NPU submit), outputs_get (detile +
+# dequantize with want_float=1).
+
 if [ -e /tmp/rknn_dump ]; then
     find /tmp/rknn_dump -mindepth 1 -delete 2>/dev/null || true
     sync
 fi
 
-# --- Phase 1: vendor baseline ---
-# Ensures the models + test images produce the expected ground-truth
-# classes. If this fails, the ground_truth.json is wrong or a model is
-# corrupt — not an openrknn regression.
-
-overall_rc=0
-run_phase "Phase 1: vendor librknnrt.so baseline" /lib/librknnrt.so || overall_rc=1
-
-# --- Phase 2: openrknn OWN path ---
-# Exercises every openrknn code path: init, query, inputs_set (UINT8
-# NHWC → NC1HWC2 with correct c2), run (regcmd rebase + NPU submit),
-# outputs_get (detile + dequantize with want_float=1).
-# --populate-dumps runs bench_rknn first per model to seed /tmp/rknn_dump
-# which openrknn's copy_proxy_regcmd reads.
-
-run_phase "Phase 2: openrknn OWN path (full pipeline)" "$LIB" \
-    --populate-dumps --bench-dir "$BENCH_DIR" \
+run_phase "Phase 2: openrknn OWN path (no vendor deps)" "$LIB" \
     --own init,query,input,run,outputs || overall_rc=1
 
 # --- Phase 2.5: template-patch byte-exact diff vs vendor oracle ---
@@ -182,6 +186,22 @@ is_allowlisted() {
         *) return 1 ;;
     esac
 }
+
+if ! $HAVE_BENCH_TOOLS || ! $HAVE_VENDOR_LIB; then
+    echo ""
+    echo "=== Phase 2.5: template-patch byte-exact diff (SKIPPED) ==="
+    if ! $HAVE_VENDOR_LIB; then
+        echo "  reason: /lib/librknnrt.so not installed"
+    fi
+    if ! $HAVE_BENCH_TOOLS; then
+        echo "  reason: bench_rknn / intercept_swap.so not found in $BENCH_DIR"
+    fi
+    SKIP_PHASE_2_5=true
+else
+    SKIP_PHASE_2_5=false
+fi
+
+if ! $SKIP_PHASE_2_5; then
 
 DIFF_DIR=/tmp/orknn_diff
 mkdir -p "$DIFF_DIR"
@@ -260,12 +280,20 @@ if [ -n "$allowlisted_names" ]; then
     echo "  Template-patch known diffs:$allowlisted_names"
 fi
 
+fi  # SKIP_PHASE_2_5
+
 # --- Phase 3: openrknn proxy-dispatch path ---
 # The default user-facing mode — LD_PRELOAD=./librknn_api.so without
 # any ORKNN_OWN env var. This exercises the proxy delegation path which
-# existing applications use when upgrading to openrknn.
+# existing applications use when upgrading to openrknn. Needs the vendor
+# library since proxy delegation dlopens it.
 
-run_phase "Phase 3: openrknn proxy-dispatch path" "$LIB" || overall_rc=1
+if $HAVE_VENDOR_LIB; then
+    run_phase "Phase 3: openrknn proxy-dispatch path" "$LIB" || overall_rc=1
+else
+    echo ""
+    echo "=== Phase 3: openrknn proxy-dispatch path (SKIPPED — no vendor lib) ==="
+fi
 
 echo ""
 if [ "$overall_rc" -eq 0 ]; then
