@@ -5,9 +5,9 @@ per-task per-register level.
 This is the phase-0 diff oracle for the template-patch development work. It
 reads an "oracle" weight BO (populated by the vendor librknnrt.so via the
 intercept_swap.so dump at /tmp/rknn_dump/sub1_bo_001_*.bin) and a "template"
-weight BO (produced by openrknn with ORKNN_FORCE_TEMPLATE=1 ORKNN_DUMP_BO1=...
-set), walks the task BO to find each task's regcmd slice, decodes every
-(reg, val) pair, and prints the deltas.
+weight BO (produced by openrknn with ORKNN_DUMP_BO1=... set), walks the task
+BO to find each task's regcmd slice, decodes every (reg, val) pair, and
+prints the deltas.
 
 DMA-address registers are expected to differ (the two BOs live at different
 DMA addresses); the tool flags them separately. Any *non-DMA* register

@@ -160,11 +160,10 @@ run_phase "Phase 2: openrknn OWN path (full pipeline)" "$LIB" \
     --own init,query,input,run,outputs || overall_rc=1
 
 # --- Phase 2.5: template-patch byte-exact diff vs vendor oracle ---
-# Runs each model with ORKNN_FORCE_TEMPLATE=1 (skips copy_proxy_regcmd so the
-# template-patch code path runs), dumps the patched weight BO via
-# ORKNN_DUMP_BO1, then diffs it against the vendor-patched BO[1] captured in
-# /tmp/rknn_dump/sub1_bo_001_*.bin. Non-DMA register deltas are real template
-# bugs that drive the phase-1..phase-5 work.
+# Runs each model with ORKNN_DUMP_BO1 set, which dumps the patched weight BO
+# after the first run. diff_regcmd.py then diffs it against the vendor-patched
+# BO[1] captured in /tmp/rknn_dump/sub1_bo_001_*.bin. Non-DMA register deltas
+# are real template-patch bugs.
 #
 # Gating: the phase fails overall_rc if any model OUTSIDE the expected-fail
 # allowlist shows register deltas. Allowlisted models log their diff count
@@ -203,9 +202,9 @@ from validate_accuracy import populate_intercept_dump
 populate_intercept_dump('$MODEL_DIR/$(python3 -c "import json; print(json.load(open('$GT'))['$name']['model'])")', '$BENCH_DIR')
 " 2>/dev/null || { echo "--- $name: dump populate failed (skip) ---"; continue; }
 
-    # Run validate_accuracy on just this model with template-patch forced
-    # and ORKNN_DUMP_BO1 writing per-model output.
-    ORKNN_FORCE_TEMPLATE=1 ORKNN_DUMP_BO1="$bo1_out" \
+    # Run validate_accuracy on just this model with ORKNN_DUMP_BO1 writing
+    # the per-model patched weight BO for diff_regcmd.py to consume.
+    ORKNN_DUMP_BO1="$bo1_out" \
     python3 "$SCRIPT_DIR/validate_accuracy.py" \
         --lib "$LIB" \
         --models-dir "$MODEL_DIR" \
