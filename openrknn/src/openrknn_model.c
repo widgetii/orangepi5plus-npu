@@ -639,22 +639,27 @@ static void parse_fb_operators(const uint8_t *fb, struct orknn_model *m)
                 ops[i].output_tensors[k] = orknn_fb_u32(fb, vec + 4 + k * 4);
         }
 
-        /* f[10] carries per-op task counts; see docs/segmentation_from_fb.md
-         * for the full derivation. Slot 0 is the CONV-only task count, slot
-         * 1 is the total including any activation-LUT pre-task, slot 2 is a
-         * non-zero sub-count for "plain" ops and zero for activation-fused
-         * ones — we use that to disambiguate. */
+        /* f[10] carries per-op per-core task counts. See
+         * docs/segmentation_from_fb.md §multi-core for the full slot
+         * layout:
+         *    [0] = single-core task count (plain ops)
+         *    [1] = dual-core core-0 count (or single-core total for
+         *          activation-LUT ops where [2] == 0)
+         *    [2] = dual-core core-1 count (zero for LUT ops)
+         *    [3] = triple-core core-0 count
+         *    [4] = triple-core core-1 count
+         *    [5] = triple-core core-2 count */
         uint32_t f10 = orknn_fb_field(fb, op, 10);
         if (f10) {
             uint32_t vec = orknn_fb_follow(fb, f10);
             uint32_t vlen = orknn_fb_u32(fb, vec);
+            for (uint32_t k = 0; k < 6 && k < vlen; k++)
+                ops[i].f10[k] = orknn_fb_u32(fb, vec + 4 + k * 4);
             if (vlen >= 3) {
-                uint32_t v0 = orknn_fb_u32(fb, vec + 4);
-                uint32_t v1 = orknn_fb_u32(fb, vec + 8);
-                uint32_t v2 = orknn_fb_u32(fb, vec + 12);
-                ops[i].task_count = (v2 == 0) ? v1 : v0;
+                ops[i].task_count = (ops[i].f10[2] == 0)
+                    ? ops[i].f10[1] : ops[i].f10[0];
             } else if (vlen >= 1) {
-                ops[i].task_count = orknn_fb_u32(fb, vec + 4);
+                ops[i].task_count = ops[i].f10[0];
             }
         }
     }
@@ -1289,6 +1294,158 @@ static int fb_build_segments(struct orknn_model *m)
 }
 
 /* ======================================================================
+ * fb_build_multicore_submits — #60
+ *
+ * Produce the per-cycle submit list for a specific core count N ∈
+ * {2, 3}. The .rknn task BO has pre-compiled per-core-count regions:
+ *   region_start(N) = sum of region sizes for core counts < N
+ * Within region N each active core's work is stacked — core 0 runs
+ * first, then core 1, then core 2. Per-op counts for each core come
+ * from f[10] slots [1..2] for 2-core and [3..5] for 3-core.
+ *
+ * Submit boundaries (same rule as single-core fb_build_segments):
+ *   - when (kind, flags) changes, where "kind" = multi if all active
+ *     cores have non-zero counts, else single (core 0 only)
+ *   - when we hit an IO op
+ *
+ * The resulting submits can be issued in order to produce a complete
+ * rknn_run at the requested core count. See
+ * docs/segmentation_from_fb.md §multi-core for the full derivation.
+ * ====================================================================== */
+
+static uint32_t op_per_core_count(const struct orknn_op_info *op,
+                                  int core_count, int core_idx)
+{
+    /* Slot mapping from the f[10] hypothesis verified on all 5 models. */
+    int slot;
+    if (core_count == 2) {
+        slot = 1 + core_idx;  /* slots 1, 2 */
+    } else {
+        slot = 3 + core_idx;  /* slots 3, 4, 5 */
+    }
+    return (slot < 6) ? op->f10[slot] : 0;
+}
+
+static int fb_build_multicore_submits(struct orknn_model *m, int core_count,
+                                      uint32_t region_start,
+                                      struct orknn_multicore_submit **out_list,
+                                      uint32_t *out_count)
+{
+    if (core_count != 2 && core_count != 3) return -1;
+    if (!m->ops || m->op_count == 0) return -1;
+
+    /* Compute per-core totals within this region so we can lay out
+     * each core's starting cursor. Core 0 starts at region_start +
+     * IO prologue (some models emit a per-region input-reformat task
+     * at the head of each region — see deeplabv3 where task 435 and
+     * 1191 are op_idx=0 em=0x18 reformats). Skip past those. */
+    uint32_t io_prologue = 0;
+    for (uint32_t i = 0; i < m->op_count; i++) {
+        struct orknn_op_info *op = &m->ops[i];
+        if (!op_type_is_io(op->type)) continue;
+        for (int c = 0; c < core_count; c++)
+            io_prologue += op_per_core_count(op, core_count, c);
+    }
+
+    uint32_t core_totals[3] = {0, 0, 0};
+    for (uint32_t i = 0; i < m->op_count; i++) {
+        struct orknn_op_info *op = &m->ops[i];
+        if (op_type_is_io(op->type)) continue;
+        for (int c = 0; c < core_count; c++)
+            core_totals[c] += op_per_core_count(op, core_count, c);
+    }
+    uint32_t core_starts[3];
+    core_starts[0] = region_start + io_prologue;
+    for (int c = 1; c < core_count; c++)
+        core_starts[c] = core_starts[c - 1] + core_totals[c - 1];
+
+    /* Upper-bound allocation: at most one submit per op transition + 2
+     * slots of slop. In practice this is way too much for yolov8 but
+     * whatever. */
+    uint32_t max_subs = m->op_count * 2 + 4;
+    struct orknn_multicore_submit *subs = calloc(max_subs, sizeof(*subs));
+    if (!subs) return -1;
+
+    uint32_t n_subs = 0;
+    uint32_t cursors[3];
+    for (int c = 0; c < core_count; c++) cursors[c] = core_starts[c];
+
+    int cur_kind = -1;   /* 0 = multi, 1 = single, -1 = empty */
+    int cur_flags = -1;
+    uint32_t cur_starts[3] = {0, 0, 0};
+    uint32_t cur_counts[3] = {0, 0, 0};
+
+    #define FLUSH() do { \
+        uint32_t total = 0; \
+        for (int _c = 0; _c < core_count; _c++) total += cur_counts[_c]; \
+        if (total > 0) { \
+            uint32_t mask = (cur_kind == 0) \
+                ? ((core_count == 3) ? 0x7u : 0x3u) \
+                : 0x1u; \
+            subs[n_subs].mask = mask; \
+            subs[n_subs].flags = (uint32_t)cur_flags; \
+            subs[n_subs].n_cores = (cur_kind == 0) ? core_count : 1; \
+            for (int _c = 0; _c < core_count; _c++) { \
+                subs[n_subs].subcore[_c].sc_start = cur_starts[_c]; \
+                subs[n_subs].subcore[_c].sc_count = cur_counts[_c]; \
+            } \
+            n_subs++; \
+        } \
+        for (int _c = 0; _c < core_count; _c++) cur_counts[_c] = 0; \
+        cur_kind = -1; \
+        cur_flags = -1; \
+    } while (0)
+
+    for (uint32_t i = 0; i < m->op_count; i++) {
+        struct orknn_op_info *op = &m->ops[i];
+        if (op_type_is_io(op->type)) {
+            /* Multi-core regions don't include IO tasks — IO tasks live
+             * only in the single-core region (task 0 for deeplabv3).
+             * Just flush the current accumulator. */
+            FLUSH();
+            continue;
+        }
+
+        uint32_t c_counts[3] = {0, 0, 0};
+        uint32_t total_op = 0;
+        for (int c = 0; c < core_count; c++) {
+            c_counts[c] = op_per_core_count(op, core_count, c);
+            total_op += c_counts[c];
+        }
+        if (total_op == 0) continue;
+
+        int is_lut = op_type_is_lut(op->type);
+        int flags = is_lut ? 0x1 : 0x5;
+        /* kind = multi if every active core has work; else single */
+        int all_cores_have_work = 1;
+        for (int c = 0; c < core_count; c++)
+            if (c_counts[c] == 0) { all_cores_have_work = 0; break; }
+        int kind = all_cores_have_work ? 0 : 1;
+
+        if (kind != cur_kind || flags != cur_flags) {
+            FLUSH();
+            cur_kind = kind;
+            cur_flags = flags;
+            for (int c = 0; c < core_count; c++)
+                cur_starts[c] = cursors[c];
+        }
+        for (int c = 0; c < core_count; c++) {
+            cur_counts[c] += c_counts[c];
+            cursors[c] += c_counts[c];
+        }
+    }
+    FLUSH();
+    #undef FLUSH
+
+    *out_list = subs;
+    *out_count = n_subs;
+    orknn_log(1, "model: %u %d-core submits (region [%u..%u])",
+              n_subs, core_count, region_start,
+              core_starts[core_count - 1] + core_totals[core_count - 1]);
+    return 0;
+}
+
+/* ======================================================================
  * Weight/task extraction from FlatBuffer
  * ====================================================================== */
 
@@ -1688,6 +1845,56 @@ int orknn_own_init(struct orknn_context *ctx, void *model_buf, uint32_t size,
         if (fb_build_segments(m) != 0) {
             orknn_log(0, "model: fb_build_segments failed — run path unusable");
         }
+    }
+
+    /* #60: build the per-core-count submit lists for 2-core and
+     * 3-core modes. Multi-core regions in the task BO come after the
+     * single-core region. For each model the offset where core_count=N
+     * starts equals the sum of region sizes for all preceding core
+     * counts; each region size equals the sum of f[10] slot[1..N-1]
+     * counts across all non-IO ops.
+     *
+     * If the model's f[10] vector has slot[1]==0 across all ops
+     * (e.g. yolov8n, which has no multi-core layout baked in by the
+     * RKNN toolkit), the resulting multi-core region size is 0 and
+     * we skip building the list — orknn_own_run will fall back to
+     * single-core submission. */
+    if (ret == 0 && m->ops && m->op_count > 0) {
+        uint32_t region_1core = m->segment_count > 0
+            ? (m->segments[m->segment_count - 1].sc_start
+               + m->segments[m->segment_count - 1].sc_count)
+            : 0;
+
+        /* Include IO ops in region sizing: models like deeplabv3 emit
+         * a per-region input-reformat task at the start of each
+         * per-core-count region (op_idx=0, em=0x18). InputOperator's
+         * f[10] encodes 1 task per region_count for those models. */
+        uint32_t region_2_size = 0;
+        uint32_t region_3_size = 0;
+        for (uint32_t i = 0; i < m->op_count; i++) {
+            region_2_size += m->ops[i].f10[1] + m->ops[i].f10[2];
+            region_3_size += m->ops[i].f10[3] + m->ops[i].f10[4]
+                           + m->ops[i].f10[5];
+        }
+
+        uint32_t region_2_start = region_1core;
+        uint32_t region_3_start = region_2_start + region_2_size;
+
+        if (region_2_size > 0) {
+            fb_build_multicore_submits(m, 2, region_2_start,
+                                       &m->submits_2core,
+                                       &m->n_submits_2core);
+        }
+        if (region_3_size > 0) {
+            fb_build_multicore_submits(m, 3, region_3_start,
+                                       &m->submits_3core,
+                                       &m->n_submits_3core);
+        }
+
+        orknn_log(1, "model: multi-core submits: 2c=%u, 3c=%u "
+                     "(region starts 2c=%u 3c=%u)",
+                  m->n_submits_2core, m->n_submits_3core,
+                  region_2_start, region_3_start);
     }
 
     /* Phase 3b: parse the header `attrs` string for input pre-processing

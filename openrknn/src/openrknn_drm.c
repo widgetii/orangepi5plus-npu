@@ -264,33 +264,24 @@ int orknn_npu_submit(int fd, struct orknn_bo *task_bo,
 {
     /* Normalise the user-requested core mask.
      *
-     * RKNN_NPU_CORE_0 = 0x1 (core 0 only)
-     * RKNN_NPU_CORE_1 = 0x2 (core 1 only)
-     * RKNN_NPU_CORE_2 = 0x4 (core 2 only)
-     * RKNN_NPU_CORE_0_1   = 0x3, 0_2 = 0x5, 1_2 = 0x6
-     * RKNN_NPU_CORE_0_1_2 = 0x7 (all 3 cores)
-     * RKNN_NPU_CORE_AUTO  = 0x0 (kernel picks core 0 by default for us)
-     *
-     * Multi-core (popcount > 1) requires per-core-count pre-compiled
-     * task BO layouts that openrknn doesn't yet parse from the .rknn
-     * — each core needs its own {sc_start, sc_count} region in
-     * subcore_task[2..4], and those regions live at task BO offsets
-     * that differ from our single-core fb_build_segments output. See
-     * issue #60 for the full scope. For now we fall back to single
-     * core 0 when the user asks for multi-core, with a one-time
-     * warning, unless ORKNN_ALLOW_MULTICORE=1 is set (experimental).
+     * Multi-core submission goes through orknn_npu_submit_multicore()
+     * which is called from orknn_own_run when the model has a
+     * pre-compiled multi-core plan. This path is the "single-core
+     * only" version — if the caller lands here with mask > single
+     * core it means either the model has no multi-core plan (e.g.
+     * yolov8n where the RKNN toolkit didn't bake in per-core
+     * layouts) or the run path explicitly chose single-core. Drop
+     * back to core 0 with a one-time warning so correctness holds.
      */
     uint32_t effective = core_mask & 0x7;
     int popcount = __builtin_popcount(effective);
-    if (popcount > 1 && !getenv("ORKNN_ALLOW_MULTICORE")) {
+    if (popcount > 1) {
         static int warned = 0;
         if (!warned) {
-            orknn_log(0, "drm: core_mask=0x%x (multi-core) not yet "
-                         "supported in OWN mode — falling back to "
-                         "core 0 only. See issue #60. Set "
-                         "ORKNN_ALLOW_MULTICORE=1 to force submit "
-                         "anyway (may hang or produce wrong output).",
-                      effective);
+            orknn_log(1, "drm: single-core submit path entered with "
+                         "mask=0x%x — this model has no multi-core "
+                         "task-BO layout compiled in, falling back "
+                         "to core 0 only.", effective);
             warned = 1;
         }
         effective = 0x1;
@@ -336,6 +327,78 @@ int orknn_npu_submit(int fd, struct orknn_bo *task_bo,
     if (ret)
         orknn_log(0, "drm: SUBMIT failed: %s (tasks=%u sc={%u,%u})",
                   strerror(errno), seg->task_number, seg->sc_start, seg->sc_count);
+
+    return ret;
+}
+
+/* Multi-core submit path (#60). The caller has already produced a
+ * per-submit descriptor with per-core (sc_start, sc_count) values
+ * derived from the pre-compiled multi-core task BO regions. We fill
+ * the ioctl subcore_task[] slots according to the kernel's routing:
+ *
+ *   1-core submit (mask popcount == 1): kernel reads subcore_task[0]
+ *   2-core submit (mask popcount == 2): kernel reads subcore_task[0..1]
+ *   3-core submit (mask popcount == 3): kernel reads subcore_task[2..4]
+ *
+ * task_number is the sum of all active cores' sc_count. task_start
+ * is the min sc_start (matches vendor convention). */
+int orknn_npu_submit_multicore(int fd, struct orknn_bo *task_bo,
+                               const struct orknn_multicore_submit *msub)
+{
+    struct rknpu_submit sub = {
+        .flags = msub->flags | RKNPU_JOB_BLOCK,
+        .timeout = 6000,
+        .task_obj_addr = task_bo->obj_addr,
+        .core_mask = msub->mask,
+        .fence_fd = -1,
+    };
+
+    int popcount = __builtin_popcount(msub->mask & 0x7);
+    uint32_t task_total = 0;
+    uint32_t task_min_start = UINT32_MAX;
+    for (int c = 0; c < (int)msub->n_cores; c++) {
+        task_total += msub->subcore[c].sc_count;
+        if (msub->subcore[c].sc_count > 0 &&
+            msub->subcore[c].sc_start < task_min_start)
+            task_min_start = msub->subcore[c].sc_start;
+    }
+    sub.task_number = task_total;
+    sub.task_start = (task_min_start == UINT32_MAX) ? 0 : task_min_start;
+
+    /* Zero all slots so unused ones don't leak old stack data. */
+    memset(sub.subcore_task, 0, sizeof(sub.subcore_task));
+
+    if (popcount == 1) {
+        /* Single-core fallback within a multi-core region. Put the
+         * task range in slot[0]; other slots stay 0. */
+        sub.subcore_task[0].task_start = msub->subcore[0].sc_start;
+        sub.subcore_task[0].task_number = msub->subcore[0].sc_count;
+    } else if (popcount == 2) {
+        /* Dual-core: slots [0..1] per kernel rknpu_job.c:320-330. */
+        sub.subcore_task[0].task_start = msub->subcore[0].sc_start;
+        sub.subcore_task[0].task_number = msub->subcore[0].sc_count;
+        sub.subcore_task[1].task_start = msub->subcore[1].sc_start;
+        sub.subcore_task[1].task_number = msub->subcore[1].sc_count;
+    } else if (popcount == 3) {
+        /* Triple-core: slots [2..4] per kernel rknpu_job.c:320-330
+         * (`subcore_task[core_index + 2]` branch). */
+        sub.subcore_task[2].task_start = msub->subcore[0].sc_start;
+        sub.subcore_task[2].task_number = msub->subcore[0].sc_count;
+        sub.subcore_task[3].task_start = msub->subcore[1].sc_start;
+        sub.subcore_task[3].task_number = msub->subcore[1].sc_count;
+        sub.subcore_task[4].task_start = msub->subcore[2].sc_start;
+        sub.subcore_task[4].task_number = msub->subcore[2].sc_count;
+    }
+
+    int ret;
+    do {
+        ret = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub);
+    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+
+    if (ret)
+        orknn_log(0, "drm: MULTICORE SUBMIT failed: %s "
+                     "(mask=0x%x tasks=%u)", strerror(errno),
+                  msub->mask, task_total);
 
     return ret;
 }
