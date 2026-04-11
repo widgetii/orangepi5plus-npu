@@ -8,11 +8,14 @@ Latency comparison between openrknn's OWN mode and the vendor
 - **Single-core: parity with vendor on all 5 runtime models** (within
   noise, −0.2% to −1.5% on average latency). openrknn's from-scratch
   submit path doesn't add any measurable per-run overhead.
-- **Multi-core: openrknn loses 1.31×–1.87× on 4/5 models** because
-  `orknn_npu_submit` in `openrknn_drm.c` hardcodes `core_mask=0x0` and
-  silently ignores whatever the user sets via `rknn_set_core_mask`. The
-  mask is stored in `ctx->core_mask` but never plumbed into the
-  ioctl descriptor. Tracked by [#60][i60].
+- **`rknn_set_core_mask` is now honoured for single-core values.**
+  Users can pick Core 0 (0x1), Core 1 (0x2), or Core 2 (0x4)
+  explicitly for load balancing across concurrent processes.
+- **Multi-core values (0x3 / 0x5 / 0x6 / 0x7) fall back to Core 0
+  with a warning.** True multi-core parallelism requires parsing
+  the .rknn's pre-compiled per-core-count task BO layouts, which
+  openrknn doesn't yet do — see [#60][i60] and the "Multi-core
+  roadmap" section below.
 
 [i60]: https://github.com/widgetii/orangepi5plus-npu/issues/60
 
@@ -74,36 +77,73 @@ limitation of openrknn today. Any application that calls
 `rknn_set_core_mask(RKNN_NPU_CORE_0_1_2)` is silently getting
 single-core execution.
 
-## Why openrknn ignores the user's core_mask
+## Multi-core roadmap
 
-`rknn_set_core_mask` stores the requested mask in `ctx->core_mask`
-(see `openrknn_api.c:322`), but `orknn_npu_submit` in
-`openrknn_drm.c:270` hardcodes the ioctl descriptor's `core_mask`
-field to `0x0`:
+### Phase 1: honour single-core masks *(landed, this file)*
 
-```c
-struct rknpu_submit sub = {
-    .flags = seg->flags | RKNPU_JOB_BLOCK,
-    .task_start = seg->sc_start,
-    .task_number = seg->task_number,
-    .task_obj_addr = task_bo->obj_addr,
-    .core_mask = 0x0,   /* <-- ignores ctx->core_mask */
-    .subcore_task = {
-        { seg->sc_start, seg->sc_count },
-        { seg->sc_start, seg->sc_count },
-        { seg->sc_start, seg->sc_count },
-        { seg->sc_start, seg->sc_count },
-        { seg->sc_start, seg->sc_count },
-    },
-};
-```
+`rknn_set_core_mask` now works for `RKNN_NPU_CORE_0` (0x1),
+`RKNN_NPU_CORE_1` (0x2), and `RKNN_NPU_CORE_2` (0x4). The kernel
+reads `subcore_task[core_index]` to find the task range for the
+active core, and we populate slots [0..2] with the same
+`(sc_start, sc_count)` so any of the three works. Hardware verified
+via `/sys/kernel/debug/rknpu/load` — mask=0x2 lights up Core 1 at
+93-99%, Core 0/2 at 0%, etc.
 
-Wiring `ctx->core_mask` through to the submit isn't enough on its own:
-for a real multi-core speedup the segment needs `task_number =
-sc_count × active_cores` (the cross-core replica count) and each of
-the 5 `subcore_task` entries needs a core-specific `(task_start,
-task_count)` slice. The .rknn task BO already contains those replicas
-— we just need to map them. See [#60][i60] for the full design sketch.
+Multi-core masks (0x3, 0x5, 0x6, 0x7) log a one-time warning and
+fall back to Core 0. Set `ORKNN_ALLOW_MULTICORE=1` to force the
+submit through anyway — expect hangs or wrong outputs.
+
+### Phase 2: honest multi-core parallelism *(#60 — not landed)*
+
+The hard scope. Investigation during the bench work revealed that
+the RKNN toolkit pre-compiles **separate per-core-count task BO
+regions** into the .rknn file. For mobilenet_v1 the layout is:
+
+| Region | Size | Purpose |
+|--------|------|---------|
+| tasks 0–50    | 51 tasks | single-core execution |
+| tasks 51–131  | 81 tasks | dual-core execution (core 0 at 51–82, core 1 at 99–130, + cleanup) |
+| tasks 133–236 | 104 tasks | triple-core execution (core 0 at 133–160, core 1 at 177–204, core 2 at 207–234, + cleanup) |
+| tasks 237–306 | 70 tasks | second-cycle warmup/iter replicas |
+
+Each region has its own pre-computed regcmds with different
+task_start offsets per core. The vendor reads `subcore_task[core_index + 2]`
+for 3-core mode (slots [2..4]) and `subcore_task[core_index]` for 1/2-core
+(slots [0..2]) — this is verified in the kernel driver at
+`rknpu-driver/rknpu_job.c:320-330` (`rknpu_get_task_number` +
+`rknpu_core_index` functions).
+
+openrknn's `fb_build_segments` derives only the single-core region
+from the FB operator graph. Adding multi-core support requires:
+
+1. Reverse-engineering how the RKNN toolkit encodes per-core-count
+   regions in the task BO (or in an auxiliary FB field we don't
+   yet parse)
+2. Extending `parse_fb_operators` / `fb_build_segments` to produce
+   N segment lists, one per supported core count
+3. Runtime dispatch in `orknn_own_run` that picks the right segment
+   list based on `ctx->core_mask` at submit time
+
+Issue [#60][i60] tracks this; reproduction of the vendor's exact
+submit pattern is captured in the task 10.1 artifacts at the end of
+this PR's commit message.
+
+### Gap that remains
+
+Until Phase 2 lands, openrknn gives up **1.31×–1.87× on 4 of 5
+runtime models** when the caller asks for multi-core:
+
+| Model      | vendor 1c | vendor 3c | openrknn (1c fallback) | gap    |
+|------------|----------:|----------:|-----------------------:|-------:|
+| MBv1       |  1.98 ms  |  1.04 ms  |                1.95 ms | +87%   |
+| ResNet50   |  9.13 ms  |  6.91 ms  |                9.08 ms | +31%   |
+| YOLOv5     | 18.61 ms  | 12.58 ms  |               18.47 ms | +47%   |
+| YOLOv8     | 16.29 ms  | 16.35 ms  |               16.09 ms |  −1%   |
+| DeepLabv3  | 28.85 ms  | 18.95 ms  |               28.79 ms | +52%   |
+
+YOLOv8 is the only model where even the vendor sees no benefit from
+multi-core (its compiled pattern doesn't parallelise), so openrknn's
+fallback is already at parity.
 
 ## How to reproduce
 

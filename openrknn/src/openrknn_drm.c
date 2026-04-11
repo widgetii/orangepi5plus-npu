@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -259,22 +260,71 @@ int orknn_bo_sync_from_device(int fd, struct orknn_bo *bo)
  * ====================================================================== */
 
 int orknn_npu_submit(int fd, struct orknn_bo *task_bo,
-                     struct orknn_segment *seg)
+                     struct orknn_segment *seg, uint32_t core_mask)
 {
+    /* Normalise the user-requested core mask.
+     *
+     * RKNN_NPU_CORE_0 = 0x1 (core 0 only)
+     * RKNN_NPU_CORE_1 = 0x2 (core 1 only)
+     * RKNN_NPU_CORE_2 = 0x4 (core 2 only)
+     * RKNN_NPU_CORE_0_1   = 0x3, 0_2 = 0x5, 1_2 = 0x6
+     * RKNN_NPU_CORE_0_1_2 = 0x7 (all 3 cores)
+     * RKNN_NPU_CORE_AUTO  = 0x0 (kernel picks core 0 by default for us)
+     *
+     * Multi-core (popcount > 1) requires per-core-count pre-compiled
+     * task BO layouts that openrknn doesn't yet parse from the .rknn
+     * — each core needs its own {sc_start, sc_count} region in
+     * subcore_task[2..4], and those regions live at task BO offsets
+     * that differ from our single-core fb_build_segments output. See
+     * issue #60 for the full scope. For now we fall back to single
+     * core 0 when the user asks for multi-core, with a one-time
+     * warning, unless ORKNN_ALLOW_MULTICORE=1 is set (experimental).
+     */
+    uint32_t effective = core_mask & 0x7;
+    int popcount = __builtin_popcount(effective);
+    if (popcount > 1 && !getenv("ORKNN_ALLOW_MULTICORE")) {
+        static int warned = 0;
+        if (!warned) {
+            orknn_log(0, "drm: core_mask=0x%x (multi-core) not yet "
+                         "supported in OWN mode — falling back to "
+                         "core 0 only. See issue #60. Set "
+                         "ORKNN_ALLOW_MULTICORE=1 to force submit "
+                         "anyway (may hang or produce wrong output).",
+                      effective);
+            warned = 1;
+        }
+        effective = 0x1;
+        popcount = 1;
+    }
+    if (effective == 0)
+        effective = 0x1;  /* AUTO → core 0 */
+
     struct rknpu_submit sub = {
         .flags = seg->flags | RKNPU_JOB_BLOCK,
         .timeout = 6000,
         .task_start = seg->sc_start,
         .task_number = seg->task_number,
         .task_obj_addr = task_bo->obj_addr,
-        .core_mask = 0x0, /* auto — matches proxy */
+        .core_mask = effective,
         .fence_fd = -1,
         .subcore_task = {
-            { seg->sc_start, seg->sc_count },
-            { seg->sc_start, seg->sc_count },
-            { seg->sc_start, seg->sc_count },
-            { seg->sc_start, seg->sc_count },
-            { seg->sc_start, seg->sc_count },
+            /* Single-core: kernel reads subcore_task[core_index] where
+             * core_index is the bit position of the active core. We
+             * populate all 3 single-core slots with the same range so
+             * mask=0x1, 0x2, 0x4 all work.
+             *
+             * Multi-core (experimental): slots [2..4] would need to
+             * carry per-core task regions from a multi-core task BO
+             * layout we don't yet parse. Filled with the same
+             * single-core range; kernel will either run all 3 cores
+             * on redundant work (wasteful + incorrect output) or
+             * error out. */
+            { seg->sc_start, seg->sc_count },  /* [0] mask=0x1 → core 0 */
+            { seg->sc_start, seg->sc_count },  /* [1] mask=0x2 → core 1 */
+            { seg->sc_start, seg->sc_count },  /* [2] mask=0x4 → core 2
+                                                *     (and 3-core: core 0) */
+            { seg->sc_start, seg->sc_count },  /* [3] 3-core: core 1 */
+            { seg->sc_start, seg->sc_count },  /* [4] 3-core: core 2 */
         },
     };
 
