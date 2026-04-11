@@ -159,6 +159,77 @@ run_phase "Phase 2: openrknn OWN path (full pipeline)" "$LIB" \
     --populate-dumps --bench-dir "$BENCH_DIR" \
     --own init,query,input,run,outputs || overall_rc=1
 
+# --- Phase 2.5: template-patch byte-exact diff vs vendor oracle ---
+# Runs each model with ORKNN_FORCE_TEMPLATE=1 (skips copy_proxy_regcmd so the
+# template-patch code path runs), dumps the patched weight BO via
+# ORKNN_DUMP_BO1, then diffs it against the vendor-patched BO[1] captured in
+# /tmp/rknn_dump/sub1_bo_001_*.bin. Non-DMA register deltas are real template
+# bugs that drive the phase-1..phase-5 work.
+#
+# This phase is advisory: it does NOT block overall_rc until the template
+# path reaches byte-exact parity on all models (tracked in plan phase 9).
+# Failures print the diff summary so the engineer can see progress.
+
+DIFF_DIR=/tmp/orknn_diff
+mkdir -p "$DIFF_DIR"
+echo ""
+echo "=== Phase 2.5: template-patch byte-exact diff (advisory) ==="
+n_clean=0; n_dirty=0; dirty_names=""
+for name in $MODELS; do
+    bo1_out="$DIFF_DIR/${name}_bo1.bin"
+    rm -f "$bo1_out"
+
+    # Repopulate the vendor dump for this model (Phase 2 wiped it between
+    # models for isolation). We need both sub1_bo_001 (oracle) and
+    # sub1_bo_000 (task BO) for the diff.
+    python3 -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR')
+from validate_accuracy import populate_intercept_dump
+populate_intercept_dump('$MODEL_DIR/$(python3 -c "import json; print(json.load(open('$GT'))['$name']['model'])")', '$BENCH_DIR')
+" 2>/dev/null || { echo "--- $name: dump populate failed (skip) ---"; continue; }
+
+    # Run validate_accuracy on just this model with template-patch forced
+    # and ORKNN_DUMP_BO1 writing per-model output.
+    ORKNN_FORCE_TEMPLATE=1 ORKNN_DUMP_BO1="$bo1_out" \
+    python3 "$SCRIPT_DIR/validate_accuracy.py" \
+        --lib "$LIB" \
+        --models-dir "$MODEL_DIR" \
+        --images-dir "$IMAGES_DIR" \
+        --ground-truth "$GT" \
+        --only "$name" \
+        --own init,query,input,run,outputs >/dev/null 2>&1 || true
+
+    if [ ! -s "$bo1_out" ]; then
+        echo "--- $name: template run produced no BO1 dump (skip) ---"
+        continue
+    fi
+
+    oracle_bo1=$(ls /tmp/rknn_dump/sub1_bo_001_*.bin 2>/dev/null | head -1)
+    task_bo=$(ls /tmp/rknn_dump/sub1_bo_000_*.bin 2>/dev/null | head -1)
+    if [ -z "$oracle_bo1" ] || [ -z "$task_bo" ]; then
+        echo "--- $name: vendor dump missing (skip) ---"
+        continue
+    fi
+
+    echo ""
+    echo "--- $name ---"
+    if python3 "$SCRIPT_DIR/diff_regcmd.py" \
+        --oracle "$oracle_bo1" \
+        --template "$bo1_out" \
+        --task-bo "$task_bo" 2>&1 | tail -30; then
+        n_clean=$((n_clean + 1))
+        echo "  $name: BYTE-EXACT (non-DMA)"
+    else
+        n_dirty=$((n_dirty + 1))
+        dirty_names="$dirty_names $name"
+    fi
+done
+echo ""
+echo "  Phase 2.5 result: $n_clean clean, $n_dirty with non-DMA deltas"
+if [ -n "$dirty_names" ]; then
+    echo "  Template-patch deltas remaining for:$dirty_names"
+fi
+
 # --- Phase 3: openrknn proxy-dispatch path ---
 # The default user-facing mode — LD_PRELOAD=./librknn_api.so without
 # any ORKNN_OWN env var. This exercises the proxy delegation path which

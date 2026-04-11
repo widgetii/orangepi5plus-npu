@@ -570,6 +570,463 @@ static void extract_fb_tensor_info(const uint8_t *fb, uint32_t tensor_table_fpos
     ti->size_with_stride = (ti->n_dims >= 4) ? ti->native_size : ti->size;
 }
 
+/* ======================================================================
+ * Per-operator graph extraction (phase 3)
+ *
+ * Subgraph field 1 is a vector of operator tables. Operator table fields
+ * (discovered empirically via tests/probe_fb_schema.py across the 5
+ * ground_truth models):
+ *   f[1]: op type string ("Conv", "ConvRelu", "ConvClip", "ConvExSwish",
+ *         "BatchNormalization", "InputOperator", ...)
+ *   f[2]: op instance name string (may be empty)
+ *   f[4]: input tensor indices (uint32[]); for Conv: [data, weight, bias]
+ *   f[5]: output tensor indices (uint32[])
+ *   f[8]: 16-element uint32 param vector (header/metadata)
+ *   f[10]: 6-element op params (stride/dilation/etc.)
+ *   f[11]: 6-element padding
+ *   f[12]: 9-element sizes (inputs/outputs/scratch)
+ *
+ * Phase 3 extracts just f[1], f[4], f[5] into struct orknn_op_info. The
+ * other fields are left for a follow-on once we know which ones drive the
+ * CVT register values for op=1 (the phase-1 blocker).
+ * ====================================================================== */
+static void parse_fb_operators(const uint8_t *fb, struct orknn_model *m)
+{
+    uint32_t root = orknn_fb_u32(fb, 0);
+    uint32_t f2_root = orknn_fb_field(fb, root, 2);
+    if (!f2_root) return;
+    uint32_t sg = orknn_fb_vec_at(fb, f2_root, 0);
+    if (!sg) return;
+    uint32_t ops_fpos = orknn_fb_field(fb, sg, 1);
+    if (!ops_fpos) return;
+
+    uint32_t n_ops = orknn_fb_vec_len(fb, ops_fpos);
+    if (n_ops == 0 || n_ops > 4096) return;
+
+    struct orknn_op_info *ops = calloc(n_ops, sizeof(*ops));
+    if (!ops) return;
+
+    for (uint32_t i = 0; i < n_ops; i++) {
+        ops[i].implicit_wt_tidx = UINT32_MAX;
+        ops[i].implicit_bs_tidx = UINT32_MAX;
+    }
+
+    for (uint32_t i = 0; i < n_ops; i++) {
+        uint32_t op = orknn_fb_vec_at(fb, ops_fpos, i);
+        if (!op) continue;
+
+        uint32_t f1 = orknn_fb_field(fb, op, 1);
+        if (f1) orknn_fb_string(fb, f1, ops[i].type, sizeof(ops[i].type));
+
+        uint32_t f4 = orknn_fb_field(fb, op, 4);
+        if (f4) {
+            uint32_t vec = orknn_fb_follow(fb, f4);
+            uint32_t count = orknn_fb_u32(fb, vec);
+            if (count > ORKNN_MAX_OP_INPUTS) count = ORKNN_MAX_OP_INPUTS;
+            ops[i].input_count = count;
+            for (uint32_t k = 0; k < count; k++)
+                ops[i].input_tensors[k] = orknn_fb_u32(fb, vec + 4 + k * 4);
+        }
+
+        uint32_t f5 = orknn_fb_field(fb, op, 5);
+        if (f5) {
+            uint32_t vec = orknn_fb_follow(fb, f5);
+            uint32_t count = orknn_fb_u32(fb, vec);
+            if (count > ORKNN_MAX_OP_OUTPUTS) count = ORKNN_MAX_OP_OUTPUTS;
+            ops[i].output_count = count;
+            for (uint32_t k = 0; k < count; k++)
+                ops[i].output_tensors[k] = orknn_fb_u32(fb, vec + 4 + k * 4);
+        }
+    }
+
+    /* Resolve implicit weight/bias tensors for ops like Resize that
+     * reference compiler-generated blobs via name prefix matching (not
+     * via input_tensors[]). See the comment on struct orknn_op_info's
+     * implicit_wt_tidx / implicit_bs_tidx fields for the rationale. */
+    uint32_t tensors_fpos = orknn_fb_field(fb, sg, 0);
+    if (tensors_fpos) {
+        uint32_t n_tensors = orknn_fb_vec_len(fb, tensors_fpos);
+        for (uint32_t i = 0; i < n_ops; i++) {
+            if (strcmp(ops[i].type, "Resize") != 0) continue;
+            if (ops[i].input_count == 0) continue;
+            uint32_t in0 = ops[i].input_tensors[0];
+            if (in0 >= n_tensors) continue;
+            uint32_t in0_tbl = orknn_fb_vec_at(fb, tensors_fpos, in0);
+            if (!in0_tbl) continue;
+            uint32_t in0_name_f = orknn_fb_field(fb, in0_tbl, 5);
+            if (!in0_name_f) continue;
+            char in0_name[128];
+            orknn_fb_string(fb, in0_name_f, in0_name, sizeof(in0_name));
+            size_t prefix_len = strlen(in0_name);
+            if (prefix_len == 0) continue;
+            for (uint32_t t = 0; t < n_tensors; t++) {
+                uint32_t tbl = orknn_fb_vec_at(fb, tensors_fpos, t);
+                if (!tbl) continue;
+                uint32_t name_f = orknn_fb_field(fb, tbl, 5);
+                if (!name_f) continue;
+                char name[128];
+                orknn_fb_string(fb, name_f, name, sizeof(name));
+                if (strncmp(name, in0_name, prefix_len) != 0) continue;
+                if (name[prefix_len] != '_') continue;
+                const char *suffix = name + prefix_len + 1;
+                /* Match `_weight...` and `_bias...` variants. The
+                 * compiler appends dtype/shape tags (e.g.
+                 * `_weight_1int8_64_1_1_1`). */
+                if (strncmp(suffix, "weight", 6) == 0 &&
+                    ops[i].implicit_wt_tidx == UINT32_MAX) {
+                    ops[i].implicit_wt_tidx = t;
+                } else if (strncmp(suffix, "bias", 4) == 0 &&
+                           ops[i].implicit_bs_tidx == UINT32_MAX) {
+                    ops[i].implicit_bs_tidx = t;
+                }
+                if (ops[i].implicit_wt_tidx != UINT32_MAX &&
+                    ops[i].implicit_bs_tidx != UINT32_MAX)
+                    break;
+            }
+            if (ops[i].implicit_wt_tidx != UINT32_MAX ||
+                ops[i].implicit_bs_tidx != UINT32_MAX) {
+                orknn_log(2, "model: op[%u] %s implicit wt=%u bs=%u "
+                             "(matched `%s_*`)", i, ops[i].type,
+                          ops[i].implicit_wt_tidx,
+                          ops[i].implicit_bs_tidx, in0_name);
+            }
+        }
+    }
+
+    m->ops = ops;
+    m->op_count = n_ops;
+
+    orknn_log(1, "model: parsed %u operators from subgraph", n_ops);
+    for (uint32_t i = 0; i < n_ops && i < 8; i++) {
+        orknn_log(2, "model: op[%u] type=%s in=[%u,%u,%u] out=[%u]",
+                  i, ops[i].type,
+                  ops[i].input_count > 0 ? ops[i].input_tensors[0] : 0,
+                  ops[i].input_count > 1 ? ops[i].input_tensors[1] : 0,
+                  ops[i].input_count > 2 ? ops[i].input_tensors[2] : 0,
+                  ops[i].output_count > 0 ? ops[i].output_tensors[0] : 0);
+    }
+}
+
+/* ======================================================================
+ * Phase 4b: parse the tensor memory plan from FB tensor.f[13].
+ *
+ * Each tensor that has a location in the activation BO stores its byte
+ * offset in field 13 of the tensor table. Tensors without f[13] (weights,
+ * constants, or input/output tensors not in the activation BO) have offset
+ * 0. The memory plan is what the vendor runtime uses to resolve per-task
+ * activation DMA addresses — specifically SRC_BASE, DST_BASE, and RDMA_ACT
+ * register values of the form `act_base + tensor_offset + intra_tile_off`.
+ *
+ * Discovered via the librknnrt decompile: sub_2ABEF0 ("Tensor buffer
+ * allocation info") extracts field 13 (`v4[15]` in the decompiled code,
+ * which indexes past the 2-uint16 vtable header) — see
+ * ~/projects/ida/librknnrt/docs/rknn-model-format.md §8.2 which lists the
+ * function as "Tensor buffer allocation info".
+ * ====================================================================== */
+static void parse_fb_tensor_offsets(const uint8_t *fb, struct orknn_model *m)
+{
+    uint32_t root = orknn_fb_u32(fb, 0);
+    uint32_t f2_root = orknn_fb_field(fb, root, 2);
+    if (!f2_root) return;
+    uint32_t sg = orknn_fb_vec_at(fb, f2_root, 0);
+    if (!sg) return;
+    uint32_t tensors_fpos = orknn_fb_field(fb, sg, 0);
+    if (!tensors_fpos) return;
+    uint32_t n_tensors = orknn_fb_vec_len(fb, tensors_fpos);
+    if (n_tensors == 0 || n_tensors > 8192) return;
+
+    uint32_t *offsets = calloc(n_tensors, sizeof(uint32_t));
+    uint32_t *weight_blob = calloc(n_tensors, sizeof(uint32_t));
+    if (!offsets || !weight_blob) {
+        free(offsets);
+        free(weight_blob);
+        return;
+    }
+    for (uint32_t i = 0; i < n_tensors; i++)
+        weight_blob[i] = 0xFFFFFFFFu; /* sentinel: not a weight */
+
+    uint32_t nonzero_off = 0, have_blob = 0;
+    for (uint32_t i = 0; i < n_tensors; i++) {
+        uint32_t t = orknn_fb_vec_at(fb, tensors_fpos, i);
+        if (!t) continue;
+        uint32_t f13 = orknn_fb_field(fb, t, 13);
+        if (f13) {
+            uint32_t v = orknn_fb_u32(fb, f13);
+            offsets[i] = v;
+            if (v) nonzero_off++;
+        }
+        /* f[18] = weight_data blob index for weight/bias tensors.
+         * Present and non-zero only for tensors whose data is stored as
+         * a blob in the weight section. Looked up via blob_offsets[] in
+         * openrknn_run.c to translate into a byte offset in BO[1]. */
+        uint32_t f18 = orknn_fb_field(fb, t, 18);
+        if (f18) {
+            uint32_t v = orknn_fb_u32(fb, f18);
+            /* Index 0 is the task BO blob which is never a weight, so
+             * treat 0 as "no weight" too. The sentinel UINT32_MAX lets
+             * downstream code distinguish "not parsed" from "explicitly
+             * zero". */
+            if (v != 0) {
+                weight_blob[i] = v;
+                have_blob++;
+            }
+        }
+    }
+
+    m->tensor_offsets = offsets;
+    m->tensor_weight_blob = weight_blob;
+    m->tensor_count = n_tensors;
+
+    /* Flag tensors that are subgraph outputs. These land in output BOs
+     * rather than the activation BO, so REFORMAT tasks targeting them
+     * use `out_base` rather than `act_base + tensor_off`. */
+    uint32_t outputs_fpos = orknn_fb_field(fb, sg, 3);
+    if (outputs_fpos) {
+        uint32_t vec = orknn_fb_follow(fb, outputs_fpos);
+        uint32_t n_out = orknn_fb_u32(fb, vec);
+        uint8_t *is_out = calloc(n_tensors, 1);
+        uint32_t *out_tidx = calloc(n_out > 0 ? n_out : 1, sizeof(uint32_t));
+        if (is_out && out_tidx) {
+            for (uint32_t i = 0; i < n_out; i++) {
+                uint32_t tidx = orknn_fb_u32(fb, vec + 4 + i * 4);
+                out_tidx[i] = tidx;
+                if (tidx < n_tensors)
+                    is_out[tidx] = 1;
+            }
+            m->tensor_is_sg_output = is_out;
+            m->sg_output_tensor_idx = out_tidx;
+        } else {
+            free(is_out);
+            free(out_tidx);
+        }
+    }
+
+    /* Build wt_blob_offsets[] — per-weight_data-index byte offset into
+     * BO[1]. We iterate the full weight_data vector in FB order, matching
+     * extract_npu_data's traversal exactly (so layout is identical to the
+     * bo1_data buffer we end up writing to the weight BO). */
+    int wt_field = (m->version > 5) ? 20 : 4;
+    uint32_t wt_fpos = orknn_fb_field(fb, root, wt_field);
+    if (wt_fpos) {
+        uint32_t n_wt = orknn_fb_vec_len(fb, wt_fpos);
+        if (n_wt > 0 && n_wt < 8192) {
+            uint32_t *wt_off = calloc(n_wt, sizeof(uint32_t));
+            if (wt_off) {
+                uint32_t bo1_off = 0;
+                for (uint32_t i = 0; i < n_wt; i++) {
+                    uint32_t entry = orknn_fb_vec_at(fb, wt_fpos, i);
+                    uint32_t fo0 = entry ? orknn_fb_field(fb, entry, 0) : 0;
+                    /* Even empty entries get an offset (the offset where
+                     * the next entry would start); they contribute 0
+                     * bytes to bo1. Matches how extract_npu_data skips
+                     * empties — bo1_off only advances for non-empty. */
+                    bo1_off = (bo1_off + 63u) & ~63u;
+                    wt_off[i] = bo1_off;
+                    if (fo0) {
+                        uint32_t blen = 0;
+                        orknn_fb_bytes(fb, fo0, &blen);
+                        bo1_off += blen;
+                    }
+                }
+                m->wt_blob_offsets = wt_off;
+                m->wt_blob_count = n_wt;
+            }
+        }
+    }
+
+    orknn_log(1, "model: parsed memory plan: %u tensors (%u act offsets, "
+              "%u weight blobs), %u wt_blob_offsets entries",
+              n_tensors, nonzero_off, have_blob, m->wt_blob_count);
+}
+
+/* ======================================================================
+ * Phase 3b: parse the header `attrs` Python-dict-like string.
+ *
+ * Each .rknn file contains a plain-text pre-processing config embedded in
+ * the header (before the FlatBuffer root), shaped roughly like:
+ *   {'attrs': {
+ *       '<input name>': {
+ *           'idx': 0, 'shape': [...], 'layout': 'nchw', 'range': [0, 1],
+ *           'dtype': 'uint8' | 'int8' | 'float32',
+ *           'mean': [m_r, m_g, m_b],
+ *           'std':  [s_r, s_g, s_b],
+ *           'rgb2bgr': False,
+ *           ...
+ *       },
+ *       ...
+ *   }, 'quant_tab': { ... }, ...}
+ *
+ * This is what the vendor RKNN runtime uses to compute the input CONV's
+ * CNA_CVT_CON* registers (empirically validated on all 5 runtime models
+ * in tests/ground_truth.json). The `attrs` dict is per-input but we only
+ * parse the first input today.
+ *
+ * The parser is deliberately minimal — no full Python expression support.
+ * We scan for the literal prefix "{'attrs':", then find the first input
+ * object, then extract 'dtype', 'mean' and 'std' via simple substring
+ * search. Good enough for Rockchip's compiler output format.
+ * ====================================================================== */
+static const char *find_key(const char *s, const char *end, const char *key)
+{
+    size_t kl = strlen(key);
+    while (s + kl < end) {
+        const char *hit = memchr(s, key[0], end - s - kl);
+        if (!hit) return NULL;
+        if (memcmp(hit, key, kl) == 0)
+            return hit;
+        s = hit + 1;
+    }
+    return NULL;
+}
+
+static int parse_float_list(const char *p, const char *end, float *out, int max_n)
+{
+    while (p < end && *p != '[') p++;
+    if (p >= end) return 0;
+    p++;
+    int n = 0;
+    while (p < end && *p != ']' && n < max_n) {
+        while (p < end && (*p == ' ' || *p == ',')) p++;
+        if (*p == ']') break;
+        char *endp = NULL;
+        float v = strtof(p, &endp);
+        if (endp == p) break;
+        out[n++] = v;
+        p = endp;
+    }
+    return n;
+}
+
+static int parse_quoted_string(const char *p, const char *end,
+                               char *out, int max_len)
+{
+    while (p < end && *p != '\'' && *p != '"') p++;
+    if (p >= end) return 0;
+    char q = *p++;
+    int n = 0;
+    while (p < end && *p != q && n < max_len - 1)
+        out[n++] = *p++;
+    out[n] = '\0';
+    return n;
+}
+
+static void parse_fb_attrs(struct orknn_model *m)
+{
+    const char *data = (const char *)m->file_data;
+    size_t data_len = m->file_size;
+    const char *marker = "{'attrs':";
+    const char *hit = NULL;
+    /* Scan header (first 8KB is plenty). */
+    size_t scan_len = data_len < 8192 ? data_len : 8192;
+    for (size_t i = 0; i + strlen(marker) < scan_len; i++) {
+        if (memcmp(data + i, marker, strlen(marker)) == 0) {
+            hit = data + i;
+            break;
+        }
+    }
+    if (!hit) {
+        orknn_log(2, "model: no attrs string in header — CVT will stay template");
+        return;
+    }
+
+    /* End of attrs: stop at first non-printable/non-whitespace byte.
+     * The attrs blob is pure ASCII in RKNN's output. */
+    const char *end = hit;
+    while (end < data + data_len &&
+           ((*end >= 0x20 && *end < 0x7f) || *end == '\n' || *end == '\t' || *end == '\r'))
+        end++;
+
+    /* Within attrs, find the first nested dict (input tensor entry).
+     * The structure is {'attrs': {'<name>': { ... }, ...}}, so we skip the
+     * outer '{' pair, find the next "'<name>': {", and parse fields inside. */
+    const char *p = hit + strlen(marker);
+    /* Skip whitespace + outer '{' of the attrs dict */
+    while (p < end && (*p == ' ' || *p == '{')) p++;
+    /* Skip over the first key '<name>': */
+    if (p < end && *p == '\'') {
+        p++;
+        while (p < end && *p != '\'') p++;
+        if (p < end) p++;  /* closing quote */
+        while (p < end && (*p == ' ' || *p == ':')) p++;
+    }
+    /* p now points at the opening '{' of the input object */
+    if (p >= end || *p != '{') {
+        orknn_log(1, "model: attrs parse: input object not found");
+        return;
+    }
+    /* Find the matching closing brace */
+    const char *obj_end = p + 1;
+    int depth = 1;
+    while (obj_end < end && depth > 0) {
+        if (*obj_end == '{') depth++;
+        else if (*obj_end == '}') depth--;
+        obj_end++;
+    }
+    if (depth != 0) {
+        orknn_log(1, "model: attrs parse: unterminated input object");
+        return;
+    }
+
+    /* Now scan inside [p, obj_end) for 'dtype', 'mean', 'std'. */
+    const char *dtype_key = find_key(p, obj_end, "'dtype'");
+    if (dtype_key) {
+        const char *colon = memchr(dtype_key, ':', obj_end - dtype_key);
+        if (colon)
+            parse_quoted_string(colon + 1, obj_end,
+                                m->input_attr_dtype, sizeof(m->input_attr_dtype));
+    }
+    const char *mean_key = find_key(p, obj_end, "'mean'");
+    if (mean_key) {
+        const char *colon = memchr(mean_key, ':', obj_end - mean_key);
+        if (colon)
+            parse_float_list(colon + 1, obj_end, m->input_attr_mean, 4);
+    }
+    const char *std_key = find_key(p, obj_end, "'std'");
+    if (std_key) {
+        const char *colon = memchr(std_key, ':', obj_end - std_key);
+        if (colon)
+            parse_float_list(colon + 1, obj_end, m->input_attr_std, 4);
+    }
+
+    if (m->input_attr_dtype[0])
+        m->input_attr_valid = 1;
+
+    orknn_log(1, "model: attrs: dtype=%s mean=[%.3f,%.3f,%.3f] std=[%.3f,%.3f,%.3f]",
+              m->input_attr_dtype,
+              m->input_attr_mean[0], m->input_attr_mean[1], m->input_attr_mean[2],
+              m->input_attr_std[0],  m->input_attr_std[1],  m->input_attr_std[2]);
+}
+
+/* Find which operator (by op_idx as stored in the task BO) reads the
+ * subgraph's input tensor as its primary data input. Assumes parse_fb_operators
+ * and extract_fb_tensors have already run. The return value is the operator's
+ * index in model->ops[], which equals the op_idx the task BO uses. */
+static void find_input_consuming_op(const uint8_t *fb, struct orknn_model *m)
+{
+    m->input_consuming_op_idx = 0;
+    uint32_t root = orknn_fb_u32(fb, 0);
+    uint32_t f2_root = orknn_fb_field(fb, root, 2);
+    if (!f2_root) return;
+    uint32_t sg = orknn_fb_vec_at(fb, f2_root, 0);
+    if (!sg) return;
+    uint32_t inputs_fpos = orknn_fb_field(fb, sg, 2);
+    if (!inputs_fpos) return;
+    uint32_t vec = orknn_fb_follow(fb, inputs_fpos);
+    if (orknn_fb_u32(fb, vec) == 0) return;
+    uint32_t sg_input = orknn_fb_u32(fb, vec + 4);
+
+    for (uint32_t i = 0; i < m->op_count; i++) {
+        if (m->ops[i].input_count > 0 &&
+            m->ops[i].input_tensors[0] == sg_input) {
+            m->input_consuming_op_idx = i;
+            orknn_log(1, "model: input-consuming op is ops[%u] type=%s "
+                      "(sg input tensor=%u)", i, m->ops[i].type, sg_input);
+            return;
+        }
+    }
+    orknn_log(1, "model: no op consumes subgraph input %u", sg_input);
+}
+
 /* Extract tensor metadata from FlatBuffer subgraph for input/output tensors */
 static void extract_fb_tensors(const uint8_t *fb, uint32_t fb_size,
                                struct orknn_model *m)
@@ -1067,16 +1524,15 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
         }
     }
 
-    /* Extract activation BO size from metadata blobs */
+    /* Phase 2: total_internal_size is NOT reliably stored in the .rknn
+     * FlatBuffer. The `type=6 len=64 u32@32` pattern we used to match
+     * happens to hit blobs that hold unrelated data (0x10000 on ResNet50,
+     * 0x01010101 on DeepLabv3, missing on MBv1/YOLO), so the extracted
+     * value is always either wrong or coincidentally safe. The activation
+     * BO sizing fallback in openrknn_memory.c derives its bound from a
+     * regcmd scan plus a conservative multiplier instead; we leave this
+     * field zero so the memory sizing code doesn't try to trust it. */
     model->total_internal_size = 0;
-    for (unsigned i = 0; i < n_blobs; i++) {
-        if (blobs[i].type == 6 && blobs[i].len == 64) {
-            model->total_internal_size = orknn_fb_u32(blobs[i].data, 32);
-            break;
-        }
-    }
-    if (model->total_internal_size == 0)
-        model->total_internal_size = 65536;
 
     free(blob_offsets);
     return 0;
@@ -1289,6 +1745,22 @@ int orknn_own_init(struct orknn_context *ctx, void *model_buf, uint32_t size,
     /* Extract tensor metadata from FlatBuffer (scale, zp, format, native shape).
      * This overrides/augments the JSON-derived values with authoritative FB data. */
     extract_fb_tensors(fb, fb_size, m);
+
+    /* Parse the operator graph: per-op type + input/output tensor indices.
+     * Phase 3 foundation — unblocks future work that needs per-op metadata
+     * (CVT computation, FC detection, per-channel ops). */
+    parse_fb_operators(fb, m);
+
+    /* Phase 3b: parse the header `attrs` string for input pre-processing
+     * (mean/std/dtype), then find which op_idx consumes the model input.
+     * Used by patch_regcmd_addresses to fix up the CVT registers for that
+     * first conv, which the vendor runtime populates from the same data. */
+    parse_fb_attrs(m);
+    find_input_consuming_op(fb, m);
+
+    /* Phase 4b: parse the per-tensor memory plan so patch_regcmd_addresses
+     * can resolve activation-BO offsets for non-input-consuming tasks. */
+    parse_fb_tensor_offsets(fb, m);
 
     /* Open RKNPU device and allocate DMA buffer objects */
     if (ctx->own_flags & (ORKNN_OWN_RUN | ORKNN_OWN_INPUTS_SET)) {

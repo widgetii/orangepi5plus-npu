@@ -67,39 +67,100 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
               task_size, (unsigned long)ctx->task_bo.dma_addr);
 
     /* Activation BO (intermediate tensors).
-     * Try to read the proxy's actual size from the intercept dump.
-     * Fall back to heuristic if not available. */
-    uint32_t act_size = 0;
+     *
+     * Preferred: read the vendor's actual size from /tmp/rknn_dump/submit_1.txt
+     * bo[2]. This guarantees parity with the vendor allocation and is what
+     * the copy_proxy_regcmd path assumes.
+     *
+     * Fallback (used when /tmp/rknn_dump is absent — the eventual steady
+     * state after phase 9): derive from the template regcmd.
+     *
+     *   fb_act_size = max(
+     *       scan * 4 + largest_io * 2,   // empirical safety margin
+     *       1 MB floor)
+     *
+     * where `scan` is the highest byte offset written to any activation-
+     * targeting DMA register in the template (0x4020, 0x1070, 0x5018,
+     * 0x4110, 0x5038) excluding sentinel values >= 256MB, and `largest_io`
+     * is the biggest input/output tensor native_size. The 4x multiplier
+     * was derived empirically from the 5 runtime models in ground_truth
+     * (mobilenet_v1, resnet50, yolov5, yolov8, deeplabv3): across all of
+     * them, `dump / (scan + largest_io)` is at most 2.95, so 4x gives a
+     * safety margin while over-allocating by at most ~2x on the larger
+     * models. The ~2x waste is acceptable while we don't have per-op FB
+     * metadata that would let us compute the exact compiler budget.
+     *
+     * Note: m->total_internal_size is deliberately NOT used. The blob
+     * extraction that populated it is unreliable (see openrknn_model.c).
+     */
+    uint32_t dump_act_size = 0;
     {
         FILE *sf = fopen("/tmp/rknn_dump/submit_1.txt", "r");
         if (sf) {
             char line[256];
             while (fgets(line, sizeof(line), sf)) {
-                uint32_t bi, sz;
-                if (sscanf(line, "bo[2] handle=%*u dma=%*s obj=%*s size=%u", &sz) == 1)
-                    act_size = sz;
-                /* Also parse: bo[2] ... size=N */
                 if (strstr(line, "bo[2]")) {
                     char *sp = strstr(line, "size=");
-                    if (sp) act_size = (uint32_t)strtoul(sp + 5, NULL, 10);
+                    if (sp) dump_act_size = (uint32_t)strtoul(sp + 5, NULL, 10);
                 }
             }
             fclose(sf);
         }
     }
-    if (act_size == 0) {
-        /* Heuristic fallback */
-        for (uint32_t i = 0; i < m->n_inputs; i++)
-            act_size += m->inputs[i].native_size;
-        for (uint32_t i = 0; i < m->n_outputs; i++)
-            act_size += m->outputs[i].native_size;
-        act_size *= 4;
-        if (m->total_internal_size > act_size)
-            act_size = m->total_internal_size;
-        if (act_size < 131072)
-            act_size = 131072;
+
+    /* Template regcmd scan: collect the highest offset touched by any
+     * activation-targeting DMA register. Plain uint32_t values near
+     * UINT32_MAX (e.g. 0xFFFFC000) appear as compiler sentinels or
+     * register-field-pack artifacts — hard-ignore anything above
+     * ACT_OFF_SANITY_MAX (256MB). Real activation BOs on RK3588 top out
+     * around tens of MB for the largest models we see. */
+    #define ACT_OFF_SANITY_MAX 0x10000000u
+    uint32_t max_act_off = 0;
+    uint32_t scan_sentinels = 0;
+    if (m->regcmd_data && m->regcmd_size >= 8) {
+        const uint64_t *rc = (const uint64_t *)m->regcmd_data;
+        uint32_t n_entries = m->regcmd_size / 8;
+        for (uint32_t i = 0; i < n_entries; i++) {
+            uint16_t reg = rc[i] & 0xFFFF;
+            uint32_t val = (rc[i] >> 16) & 0xFFFFFFFF;
+            if (val == 0) continue;
+            /* Activation-targeting DMA registers:
+             *   0x1070 CNA_FEATURE_DATA_ADDR
+             *   0x4020 DPU_DST_BASE_ADDR
+             *   0x5018 DPU_RDMA_SRC_BASE_ADDR
+             *   0x5038 DPU_RDMA_EW_BASE_ADDR
+             * Note 0x4110 is DPU_LUT_LE_START (a LUT value), not DMA. */
+            if (reg != 0x4020 && reg != 0x1070 && reg != 0x5018 &&
+                reg != 0x5038)
+                continue;
+            if (val >= ACT_OFF_SANITY_MAX) {
+                scan_sentinels++;
+                continue;
+            }
+            if (val > max_act_off) max_act_off = val;
+        }
     }
+    uint32_t largest_io = 0;
+    for (uint32_t i = 0; i < m->n_inputs; i++)
+        if (m->inputs[i].native_size > largest_io)
+            largest_io = m->inputs[i].native_size;
+    for (uint32_t i = 0; i < m->n_outputs; i++)
+        if (m->outputs[i].native_size > largest_io)
+            largest_io = m->outputs[i].native_size;
+
+    /* FB-derived size: scan*4 + largest_io*2. Validated on all 5 runtime
+     * models in ground_truth.json; worst-case over-allocation ~2.2x for
+     * YOLO/DeepLabv3, but always covers the vendor allocation. Floor at
+     * 1MB so tiny test models still get a usable buffer. */
+    uint32_t fb_act_size = max_act_off * 4 + largest_io * 2;
+    if (fb_act_size < 1048576) fb_act_size = 1048576;
+
+    uint32_t act_size = dump_act_size ? dump_act_size : fb_act_size;
     act_size = ALIGN_UP(act_size, 4096);
+    orknn_log(1, "memory: activation size: dump=%u fb=(scan=%u+%u "
+                 "sentinels=%u -> %u) -> %u (%s)",
+              dump_act_size, max_act_off, largest_io, scan_sentinels,
+              fb_act_size, act_size, dump_act_size ? "dump" : "fb");
     if (orknn_bo_create(fd, act_size, &ctx->activation_bo)) {
         orknn_log(0, "memory: failed to allocate activation BO (%u bytes)", act_size);
         return -1;

@@ -117,6 +117,44 @@ struct orknn_segment {
 };
 
 /* ======================================================================
+ * Per-operator metadata extracted from the .rknn FlatBuffer operator graph
+ * (subgraph field 1). Populated by parse_fb_operators() in openrknn_model.c.
+ *
+ * For Conv/ConvRelu/ConvClip/ConvExSwish/ConvSwish etc.:
+ *   input_tensors[0] = feature data tensor index
+ *   input_tensors[1] = weight tensor index
+ *   input_tensors[2] = bias tensor index
+ *   output_tensors[0] = output tensor index
+ *
+ * Non-conv ops (BatchNormalization, InputOperator, etc.) have different
+ * tensor layouts; `type` is the authoritative string to dispatch on.
+ * ====================================================================== */
+
+#define ORKNN_MAX_OP_INPUTS  8
+#define ORKNN_MAX_OP_OUTPUTS 4
+#define ORKNN_OP_TYPE_LEN    32
+
+struct orknn_op_info {
+    char     type[ORKNN_OP_TYPE_LEN];
+    uint32_t input_count;
+    uint32_t input_tensors[ORKNN_MAX_OP_INPUTS];
+    uint32_t output_count;
+    uint32_t output_tensors[ORKNN_MAX_OP_OUTPUTS];
+    /* Implicit weight/bias tensor indices. Some ops (e.g. DeepLabv3's
+     * Resize which lowers to a 1x1 requantization conv) reference
+     * compiler-generated weight and bias blobs that are NOT listed in
+     * the op's explicit input_tensors[]. The compiler leaves them as
+     * top-level tensors whose names start with `{input[0].name}_` and
+     * end in `_weight_*` or `_bias_*`. We resolve those by scanning
+     * the tensor vector for a name-prefix match during
+     * parse_fb_operators and store the tensor indices here.
+     *
+     * Both fields default to UINT32_MAX (no match found). */
+    uint32_t implicit_wt_tidx;
+    uint32_t implicit_bs_tidx;
+};
+
+/* ======================================================================
  * Parsed .rknn model
  * ====================================================================== */
 
@@ -142,6 +180,47 @@ struct orknn_model {
     uint32_t  segment_count;
     uint32_t  total_weight_size;
     uint32_t  total_internal_size;
+    /* Per-operator metadata (phase 3). NULL until parse_fb_operators()
+     * runs. op_count is the length of ops[]. */
+    struct orknn_op_info *ops;
+    uint32_t  op_count;
+    /* Phase 4b: tensor memory plan — per-tensor byte offset in the
+     * activation BO, parsed from FB tensor.f[13]. Indexed by tensor
+     * index as stored in ops[i].input_tensors / output_tensors. Weight
+     * and constant tensors have offset 0 here and are not referenced
+     * in activation BO reads. NULL until parse_fb_tensor_offsets runs. */
+    uint32_t *tensor_offsets;
+    /* Per-tensor weight-data blob index (FB tensor.f[18]). Non-zero
+     * only for tensors whose data is stored in the weight BO.
+     * 0xFFFFFFFF = no weight blob index (activation/intermediate tensor).
+     * Resolved to a weight-BO byte offset via wt_blob_offsets[]. */
+    uint32_t *tensor_weight_blob;
+    uint32_t  tensor_count;
+    /* Per-weight_data-index offset into BO[1]. Built alongside the
+     * tensor memory plan by iterating the FB weight_data vector in the
+     * same order extract_npu_data does, with 64-byte alignment between
+     * non-empty entries. wt_blob_count is the full weight_data vector
+     * length (not compacted), so a lookup tensor_weight_blob[i] indexes
+     * directly into wt_blob_offsets[]. */
+    uint32_t *wt_blob_offsets;
+    uint32_t  wt_blob_count;
+    /* Subgraph output tensor indices — the tensors whose data lands in
+     * output BOs rather than the activation BO. Used to decide whether
+     * a REFORMAT task's DPU_DST_BASE should point at `out_base` or at
+     * `act_base + tensor_off`. Parallel to tensor_offsets[], indexed
+     * by tensor index: 1 if this tensor is a subgraph output. */
+    uint8_t  *tensor_is_sg_output;
+    /* Per-subgraph-output-index: which tensor each output maps to and
+     * its corresponding output BO index. m->n_outputs entries. */
+    uint32_t *sg_output_tensor_idx;
+    /* Phase 3b: pre-processing config parsed from the header `attrs`
+     * Python-dict string. Used to compute CVT register values for the
+     * first conv op that reads raw user input. */
+    char     input_attr_dtype[16];          /* "uint8", "int8", "float32" */
+    float    input_attr_mean[4];            /* up to 4 channels */
+    float    input_attr_std[4];
+    int      input_attr_valid;              /* 1 = attrs parsed OK */
+    uint32_t input_consuming_op_idx;        /* op_idx whose input[0] == sg input */
 };
 
 /* ======================================================================

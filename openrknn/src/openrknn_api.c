@@ -148,6 +148,12 @@ int rknn_destroy(rknn_context context)
     free(ctx->model.wt_data);
     free(ctx->model.task_data);
     free(ctx->model.segments);
+    free(ctx->model.ops);
+    free(ctx->model.tensor_offsets);
+    free(ctx->model.tensor_weight_blob);
+    free(ctx->model.wt_blob_offsets);
+    free(ctx->model.tensor_is_sg_output);
+    free(ctx->model.sg_output_tensor_idx);
     free(ctx->input_bos);
     free(ctx->output_bos);
 

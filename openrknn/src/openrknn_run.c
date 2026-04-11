@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 /* Scan FB weight_data entries to build a map of blob offsets within BO[1].
  * Returns offsets for each type=0 blob (weight/bias data) and type=4/6 blobs. */
@@ -29,7 +30,12 @@ static int scan_blob_offsets(struct orknn_model *m, struct bo1_blob_info *blobs,
     uint32_t bo1_off = 0;
     int count = 0;
 
-    for (uint32_t i = 1; i < n_entries && count < max_blobs; i++) {
+    /* Iterate from i=0 so bo1_off tracks the real BO[1] layout produced
+     * by extract_npu_data, which also starts from weight_data[0]. An
+     * earlier version started at i=1 which left scan_blob_offsets's
+     * offsets shifted vs what's actually in the weight BO, breaking
+     * lookups like "blob ending at rc_off". */
+    for (uint32_t i = 0; i < n_entries && count < max_blobs; i++) {
         uint32_t entry = orknn_fb_vec_at(fb, wt_fpos, i);
         if (!entry) continue;
         uint8_t ttype = fb[entry + 66];
@@ -684,8 +690,11 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
 static void patch_regcmd_addresses(struct orknn_context *ctx)
 {
     /* Try to use proxy's fully-patched regcmd first.
-     * This handles FC layers and complex operations correctly. */
-    if (copy_proxy_regcmd(ctx) == 0) return;
+     * This handles FC layers and complex operations correctly.
+     * ORKNN_FORCE_TEMPLATE=1 skips the proxy path so the template-patch
+     * code below runs unconditionally — used by the phase-0 diff oracle
+     * to surface per-register discrepancies against the vendor BO[1]. */
+    if (!getenv("ORKNN_FORCE_TEMPLATE") && copy_proxy_regcmd(ctx) == 0) return;
 
     struct orknn_model *m = &ctx->model;
     uint32_t rc_off = (uint32_t)(m->regcmd_data - m->wt_data);
@@ -696,8 +705,12 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
     uint32_t out_base = ctx->output_bos ? (uint32_t)ctx->output_bos[0].dma_addr : 0;
 
     /* Scan blob offsets to find weight, bias, and other data sections */
-    struct bo1_blob_info blobs[128];
-    int n_blobs = scan_blob_offsets(m, blobs, 128);
+    /* ResNet50 has 190 weight_data entries and the PC LUT blobs sit
+     * near the end (indices 186/187), so a 128-entry cap used to cut
+     * them off. Use a dynamic allocation sized to the model's actual
+     * entry count, with 1024 as a safe upper limit. */
+    struct bo1_blob_info blobs[1024];
+    int n_blobs = scan_blob_offsets(m, blobs, 1024);
 
     /* Build per-operation weight/bias offset table.
      *
@@ -718,16 +731,77 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
      * Type=0 blobs are weight data, coming in pairs (weight, bias).
      * For models with additional operations beyond the type=0 pairs,
      * type=6 small blobs (not regcmd/task) serve as weight/bias for those ops. */
-    /* PC2/PC3 blobs for em=0x60 tasks — detect early so we can skip them in pairing */
+    /* PC2/PC3 blobs for em=0x60 tasks.
+     *
+     * Empirical pattern from ResNet50 (verified via diff oracle): the
+     * two shared per-channel correction LUTs are a pair of 1024-byte
+     * type=6 blobs whose second blob ends exactly at rc_off (the start
+     * of the regcmd blob). PC2 = first of the pair, PC3 = second.
+     *
+     * For pool-style em=0x60 tasks (MaxPool / AveragePool) the target
+     * isn't a weight-BO LUT but an activation tensor — those are
+     * handled per-task in the register patch loop using the memory plan,
+     * not via these globals. */
+    /* Find the PC2/PC3 per-channel LUT pair. In every model we've
+     * observed (mobilenet_v1, resnet50, yolov5, yolov8, deeplabv3) the
+     * pair is two 1024-byte type=6 blobs sitting near the regcmd blob
+     * at the tail of the weight BO.
+     *
+     * Assignment rule (verified byte-exact against the phase-0 diff
+     * oracle on all 4 runtime models that use em=0x60 tasks):
+     *
+     *   1. Find the TWO 1024-byte type=6 blobs closest to rc_off
+     *      (searching backwards from the regcmd blob). Call them
+     *      closer (smallest (rc_off - blob_end)) and farther.
+     *   2. If closer's end lies within 64 bytes of rc_off (YOLOv5,
+     *      YOLOv8, ResNet50: the pair is packed immediately before the
+     *      regcmd), then closer = PC3 and farther = PC2.
+     *   3. Otherwise (DeepLabv3: the compiler inserted small
+     *      per-channel metadata blobs between the PC pair and rc_off),
+     *      closer = PC2 and farther = PC3.
+     *
+     * Semantically PC3 is the per-channel read source and PC2 is the
+     * write destination; when the two are packed tight against the
+     * regcmd the write-side slot (PC2) comes first and the read-side
+     * slot (PC3) is the one abutting rc_off. DeepLabv3 inverts this
+     * because the intermediate metadata blobs get allocated after the
+     * PC2 write slot but before rc_off. */
     uint32_t pc2_off = 0, pc3_off = 0;
-    for (int i = 0; i < n_blobs; i++) {
-        if (blobs[i].type == 4 && blobs[i].size <= 4096 && !pc2_off)
-            pc2_off = blobs[i].offset;
-        if (blobs[i].type == 6 && blobs[i].size <= 4096 &&
-            blobs[i].offset != rc_off &&
-            blobs[i].size != m->task_data_size && !pc3_off)
-            pc3_off = blobs[i].offset;
+    {
+        int best_closer = -1, best_farther = -1;
+        uint32_t best_closer_end = 0;
+        for (int i = 0; i < n_blobs; i++) {
+            if (blobs[i].type != 6 || blobs[i].size != 1024) continue;
+            if (blobs[i].size == m->task_data_size) continue;
+            uint32_t end = blobs[i].offset + blobs[i].size;
+            if (end > rc_off) continue;
+            if (best_closer < 0 || end > best_closer_end) {
+                best_farther = best_closer;
+                best_closer = i;
+                best_closer_end = end;
+            } else if (best_farther < 0 ||
+                       (blobs[i].offset + 1024) >
+                       blobs[best_farther].offset + 1024) {
+                best_farther = i;
+            }
+        }
+        if (best_closer >= 0 && best_farther >= 0) {
+            uint32_t closer_off = blobs[best_closer].offset;
+            uint32_t farther_off = blobs[best_farther].offset;
+            uint32_t closer_end = closer_off + 1024;
+            if (rc_off - closer_end < 64) {
+                /* Closer blob ends right at rc_off → it's PC3. */
+                pc3_off = closer_off;
+                pc2_off = farther_off;
+            } else {
+                /* Gap between closer and rc_off → closer is PC2. */
+                pc2_off = closer_off;
+                pc3_off = farther_off;
+            }
+        }
     }
+    orknn_log(1, "run: PC LUT blobs: pc2=0x%x pc3=0x%x rc_off=0x%x",
+              pc2_off, pc3_off, rc_off);
 
     struct { uint32_t wt_off; uint32_t bs_off; } pairs[16];
     int n_pairs = 0;
@@ -801,14 +875,89 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
 
     /* Track which regcmd offsets we've already patched to avoid
      * double-patching shared regcmd sections (multi-core tasks share regcmd). */
-    uint32_t patched_offsets[256];
+    /* Dedup tracking for unique regcmd sections. Sized to cover the
+     * largest model in our suite (DeepLabv3 = 1858 unique sections).
+     * If this ever overflows we'd re-patch sections multiple times,
+     * producing garbage values — see the log warning below. */
+    #define MAX_PATCHED_OFFSETS 4096
+    uint32_t *patched_offsets = calloc(MAX_PATCHED_OFFSETS, sizeof(uint32_t));
     int n_patched_offsets = 0;
 
-    for (uint32_t t = 0; t < m->task_count; t++) {
+    /* Build a list of task-BO sources to iterate. The primary source is
+     * ctx->task_bo.map (derived from m->task_data by orknn_alloc_model_bos,
+     * already rebased so regcmd_addr is in our weight BO's DMA range).
+     * Per-segment per-cycle task BO snapshots in m->segments[s].task_bo_data[c]
+     * are VENDOR-addressed and need runtime rebasing. Without including
+     * them, CVT patching only covers op_idx tasks in segment 0, and
+     * later segments' input-consuming conv tasks stay on template
+     * placeholders (breaks MBv1 multi-cycle etc.).
+     *
+     * For segment sources we read the vendor weight-BO base from
+     * /tmp/rknn_dump/submit_1.txt. That's a dump dependency that phase 9
+     * will eventually remove along with the per-cycle task BO snapshots. */
+    struct task_entry { uint32_t f[8]; uint64_t regcmd_addr; }
+        __attribute__((packed));
+    const struct task_entry *task_srcs[32];
+    uint32_t task_src_counts[32];
+    uint64_t task_src_wt_base[32]; /* per-source DMA base for rebasing */
+    int n_task_srcs = 0;
+    task_srcs[0] = (const struct task_entry *)ctx->task_bo.map;
+    task_src_counts[0] = m->task_count;
+    task_src_wt_base[0] = ctx->weight_bo.dma_addr;
+    n_task_srcs = 1;
+
+    /* Read vendor weight BO base for segment sources. */
+    uint64_t vendor_wt_base = 0;
+    {
+        FILE *mf = fopen("/tmp/rknn_dump/submit_1.txt", "r");
+        if (mf) {
+            char line[256];
+            while (fgets(line, sizeof(line), mf)) {
+                if (strncmp(line, "bo[1]", 5) == 0) {
+                    char *dp = strstr(line, "dma=0x");
+                    if (dp) vendor_wt_base = strtoull(dp + 6, NULL, 16);
+                    break;
+                }
+            }
+            fclose(mf);
+        }
+    }
+
+    for (uint32_t s = 0; s < m->segment_count && n_task_srcs < 32; s++) {
+        for (uint32_t c = 0; c < m->segments[s].n_cycles && n_task_srcs < 32; c++) {
+            uint8_t *td = m->segments[s].task_bo_data[c];
+            uint32_t tsz = m->segments[s].task_bo_size[c];
+            if (td && tsz >= 40 && vendor_wt_base) {
+                task_srcs[n_task_srcs] = (const struct task_entry *)td;
+                task_src_counts[n_task_srcs] = tsz / 40;
+                task_src_wt_base[n_task_srcs] = vendor_wt_base;
+                n_task_srcs++;
+            }
+        }
+    }
+
+    for (int src = 0; src < n_task_srcs; src++) {
+    const struct task_entry *tasks = task_srcs[src];
+    uint32_t src_count = task_src_counts[src];
+    uint64_t src_wt_base = task_src_wt_base[src];
+    /* Per-source sub-task counter: for consecutive REFORMAT tasks with the
+     * same op_idx, this counts 0,1,2,... and maps each REFORMAT to a
+     * distinct input tensor of the op. Multi-input Concat ops lower to N
+     * consecutive REFORMAT tasks where sub-task k reads input_tensors[k]
+     * and writes at a running offset within the output tensor. The
+     * counter resets whenever op_idx changes (end of the op's REFORMAT
+     * group) or the task is not a REFORMAT. */
+    uint32_t prev_op_for_sub = UINT32_MAX;
+    int prev_em_for_sub = -1;
+    uint32_t reformat_sub_idx = 0;
+    for (uint32_t t = 0; t < src_count; t++) {
         uint32_t amt = tasks[t].f[6];
         uint32_t enable_mask = tasks[t].f[2];
         uint64_t addr = tasks[t].regcmd_addr;
-        uint32_t bo_off = (uint32_t)(addr - ctx->weight_bo.dma_addr);
+        /* Translate vendor-addressed regcmd to an offset within our
+         * weight BO. For the primary source this is a no-op (both bases
+         * are ctx->weight_bo.dma_addr). */
+        uint32_t bo_off = (uint32_t)(addr - src_wt_base);
 
         /* Skip if we already patched this regcmd section */
         int already_done = 0;
@@ -816,7 +965,20 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
             if (patched_offsets[j] == bo_off) { already_done = 1; break; }
         }
         if (already_done) continue;
-        if (n_patched_offsets < 256) patched_offsets[n_patched_offsets++] = bo_off;
+        if (n_patched_offsets < MAX_PATCHED_OFFSETS) {
+            patched_offsets[n_patched_offsets++] = bo_off;
+        } else {
+            /* Overflow: we can't dedupe anymore. Any previously-patched
+             * section that reappears here will be re-patched and produce
+             * garbage. Log loudly so this doesn't silently corrupt. */
+            static int warned = 0;
+            if (!warned) {
+                orknn_log(0, "run: patched_offsets overflow (>%u unique "
+                             "regcmd sections) — results may be wrong",
+                          MAX_PATCHED_OFFSETS);
+                warned = 1;
+            }
+        }
 
         uint64_t *entries = (uint64_t *)((uint8_t *)ctx->weight_bo.map + bo_off);
         uint32_t total = amt + 4;
@@ -824,6 +986,17 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         int is_conv = (enable_mask == 0x1d);
         int is_reformat = (enable_mask == 0x18);
         uint32_t op = tasks[t].f[1]; /* op_idx */
+
+        /* Update the REFORMAT sub-task counter (see the declaration
+         * above the task loop for the rationale). */
+        if (is_reformat && (int)enable_mask == prev_em_for_sub &&
+            op == prev_op_for_sub) {
+            reformat_sub_idx++;
+        } else {
+            reformat_sub_idx = 0;
+        }
+        prev_op_for_sub = op;
+        prev_em_for_sub = enable_mask;
 
         /* Find this task's WT/BS offsets from per-op table */
         uint32_t task_wt_off = 0, task_bs_off = 0;
@@ -835,14 +1008,365 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
             }
         }
 
-        /* CNA input conversion parameters */
-        int32_t input_zp = 0;
-        if (m->n_inputs > 0) input_zp = m->inputs[0].zp;
-        uint16_t cvt_offset = (uint16_t)(input_zp & 0xFFFF);
-        uint16_t cvt_scale = 0x4000;
-        uint32_t cvt_con0 = 0x000e38e0;
-        uint32_t cvt_con1 = ((uint32_t)cvt_scale << 16) | cvt_offset;
-        uint32_t cvt_con5 = 0x00000fff;
+        /* Phase 4b: resolve per-op tensor offsets from the FB memory
+         * plan. Sources:
+         *   src_tensor_off   = tensor_offsets[ops[op].input_tensors[0]]
+         *                      (primary activation input, in the act BO)
+         *   dst_tensor_off   = tensor_offsets[ops[op].output_tensors[0]]
+         *                      (activation output)
+         *   rdma_tensor_off  = tensor_offsets[ops[op].input_tensors[3]]
+         *                      (residual add operand for ConvAdd etc.,
+         *                      falls back to dst for plain conv)
+         *   wt_bo_off        = wt_blob_offsets[tensor_weight_blob[
+         *                                     ops[op].input_tensors[1]]]
+         *                      (weight data in BO[1], via f[18] lookup)
+         *   bs_bo_off        = same for input_tensors[2] (bias)
+         *
+         * For input-consuming tasks the template SRC_BASE points at the
+         * input BO, not the activation BO — user supplies raw bytes there. */
+        uint32_t src_tensor_off = 0;
+        uint32_t dst_tensor_off = 0;
+        uint32_t rdma_tensor_off = 0;
+        uint32_t ew_tensor_off = 0;
+        uint32_t op_wt_bo_off = 0;
+        uint32_t op_bs_bo_off = 0;
+        /* op_in0_bo_off: weight-BO offset of the op's input_tensors[0]
+         * blob, if it has one. Used by the InputOperator REFORMAT path
+         * whose BS_BASE points at the op's mask blob (input[0]) rather
+         * than the conventional bias slot (input[2]). */
+        uint32_t op_in0_bo_off = 0;
+        int have_op_wt = 0, have_op_bs = 0, have_op_in0 = 0;
+        /* Non-zero if the op's output tensor is a subgraph output. When
+         * set, REFORMAT tasks target the corresponding output BO rather
+         * than the activation BO. sg_out_bo_idx is the index into
+         * ctx->output_bos[] for the matching tensor. */
+        int dst_is_sg_output = 0;
+        int sg_out_bo_idx = -1;
+        /* Source tensor: where this op reads its primary input from.
+         * Also capture whether that tensor lives in a subgraph output
+         * BO (YOLOv8 heads share intermediate feature tensors with the
+         * subgraph output list, and subsequent convs need to read from
+         * the corresponding output BO rather than the activation BO). */
+        int src_is_sg_output = 0;
+        int src_sg_bo_idx = -1;
+        if (m->ops && op < m->op_count && m->tensor_offsets) {
+            const struct orknn_op_info *oi = &m->ops[op];
+            if (oi->input_count > 0) {
+                /* Concat lowers to one REFORMAT task per input tensor;
+                 * the sub-task counter selects which input this task
+                 * reads from. All other ops (Conv, Resize, BatchNorm,
+                 * etc.) always read from input_tensors[0] regardless
+                 * of how many REFORMATs the lowering emits.
+                 *
+                 * Transpose lowers to a chain of REFORMAT tasks that
+                 * stages data through input_tensors[1] as a scratch
+                 * tensor: the first sub-task reads from input[0] (real
+                 * data) and writes to input[1], and subsequent tasks
+                 * read from and write to input[1] repeatedly until the
+                 * final task copies the transposed result to the op's
+                 * real output. So SRC = input[0] on sub_idx==0 and
+                 * input[1] from sub_idx>=1. */
+                uint32_t sub = 0;
+                if (is_reformat) {
+                    if (strcmp(oi->type, "Concat") == 0 &&
+                        reformat_sub_idx < oi->input_count) {
+                        /* Concat: one sub-task per input tensor. */
+                        sub = reformat_sub_idx;
+                    } else if (strcmp(oi->type, "Transpose") == 0 &&
+                               oi->input_count >= 2 &&
+                               reformat_sub_idx > 0) {
+                        /* Transpose: sub-task 0 reads input[0], all
+                         * subsequent sub-tasks read from the scratch
+                         * tensor at input[1] regardless of how many
+                         * tasks the lowering emits. */
+                        sub = 1;
+                    }
+                }
+                uint32_t tidx = oi->input_tensors[sub];
+                if (tidx < m->tensor_count) {
+                    src_tensor_off = m->tensor_offsets[tidx];
+                    if (m->tensor_is_sg_output &&
+                        m->tensor_is_sg_output[tidx]) {
+                        src_is_sg_output = 1;
+                        if (m->sg_output_tensor_idx) {
+                            for (uint32_t oi2 = 0; oi2 < m->n_outputs;
+                                 oi2++) {
+                                if (m->sg_output_tensor_idx[oi2] == tidx) {
+                                    src_sg_bo_idx = (int)oi2;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (oi->output_count > 0) {
+                /* Split lowers to one REFORMAT task per output tensor;
+                 * the sub-task counter selects which output this task
+                 * writes to. Mirrors the Concat rule on the src side. */
+                int use_sub_dst = is_reformat &&
+                                  strcmp(oi->type, "Split") == 0 &&
+                                  reformat_sub_idx < oi->output_count;
+                uint32_t dsub = use_sub_dst ? reformat_sub_idx : 0;
+                uint32_t tidx = oi->output_tensors[dsub];
+                if (tidx < m->tensor_count) {
+                    dst_tensor_off = m->tensor_offsets[tidx];
+                    if (m->tensor_is_sg_output &&
+                        m->tensor_is_sg_output[tidx]) {
+                        dst_is_sg_output = 1;
+                        if (m->sg_output_tensor_idx) {
+                            for (uint32_t oi2 = 0; oi2 < m->n_outputs; oi2++) {
+                                if (m->sg_output_tensor_idx[oi2] == tidx) {
+                                    sg_out_bo_idx = (int)oi2;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            /* Transpose DST override: intermediate REFORMATs stage data
+             * through input_tensors[1] in the activation BO, not the
+             * op's real output tensor. Only the FINAL task in the
+             * Transpose chain writes to the real output (handled in
+             * the 0x4020 case via the pre-patch val == 0 marker). */
+            if (is_reformat && strcmp(oi->type, "Transpose") == 0 &&
+                oi->input_count >= 2) {
+                uint32_t tidx = oi->input_tensors[1];
+                if (tidx < m->tensor_count)
+                    dst_tensor_off = m->tensor_offsets[tidx];
+            }
+            if (oi->input_count > 3) {
+                uint32_t tidx = oi->input_tensors[3];
+                if (tidx < m->tensor_count)
+                    rdma_tensor_off = m->tensor_offsets[tidx];
+            } else {
+                rdma_tensor_off = dst_tensor_off;
+            }
+            /* ElementWise operand: the last input tensor of the op,
+             * used as the source for the DPU_RDMA_EW_BASE register in
+             * REFORMAT tasks staging data for element-wise Add/Mul/Sub
+             * ops (input_count == 2, EW = input[1]) and in conv tasks
+             * with a fused residual (input_count == 4, EW = input[3]). */
+            if (oi->input_count >= 2) {
+                uint32_t tidx = oi->input_tensors[oi->input_count - 1];
+                if (tidx < m->tensor_count)
+                    ew_tensor_off = m->tensor_offsets[tidx];
+            }
+            /* input_tensors[0] weight-BO offset: only set if input[0]
+             * has a weight blob (InputOperator's mask tensor). Most
+             * ops have a data tensor at input[0] with no weight blob,
+             * in which case this stays at 0. */
+            if (oi->input_count > 0 && m->tensor_weight_blob &&
+                m->wt_blob_offsets) {
+                uint32_t in0_tidx = oi->input_tensors[0];
+                if (in0_tidx < m->tensor_count) {
+                    uint32_t blob_idx = m->tensor_weight_blob[in0_tidx];
+                    if (blob_idx < m->wt_blob_count) {
+                        op_in0_bo_off = m->wt_blob_offsets[blob_idx];
+                        have_op_in0 = 1;
+                    }
+                }
+            }
+            /* Weight / bias: look up via tensor_weight_blob (FB f[18]).
+             * For ops like Resize that reference compiler-generated
+             * weight/bias blobs via name-prefix matching, prefer the
+             * implicit_{wt,bs}_tidx resolved at parse time over
+             * input_tensors[1]/[2] (those slots hold roi/scales tensors
+             * for Resize and aren't weight blobs). */
+            uint32_t wt_tidx_resolved = UINT32_MAX;
+            uint32_t bs_tidx_resolved = UINT32_MAX;
+            if (oi->implicit_wt_tidx != UINT32_MAX)
+                wt_tidx_resolved = oi->implicit_wt_tidx;
+            else if (oi->input_count > 1)
+                wt_tidx_resolved = oi->input_tensors[1];
+            if (oi->implicit_bs_tidx != UINT32_MAX)
+                bs_tidx_resolved = oi->implicit_bs_tidx;
+            else if (oi->input_count > 2)
+                bs_tidx_resolved = oi->input_tensors[2];
+            if (wt_tidx_resolved != UINT32_MAX &&
+                m->tensor_weight_blob && m->wt_blob_offsets &&
+                wt_tidx_resolved < m->tensor_count) {
+                uint32_t blob_idx = m->tensor_weight_blob[wt_tidx_resolved];
+                if (blob_idx < m->wt_blob_count) {
+                    op_wt_bo_off = m->wt_blob_offsets[blob_idx];
+                    have_op_wt = 1;
+                }
+            }
+            if (bs_tidx_resolved != UINT32_MAX &&
+                m->tensor_weight_blob && m->wt_blob_offsets &&
+                bs_tidx_resolved < m->tensor_count) {
+                uint32_t blob_idx = m->tensor_weight_blob[bs_tidx_resolved];
+                if (blob_idx < m->wt_blob_count) {
+                    op_bs_bo_off = m->wt_blob_offsets[blob_idx];
+                    have_op_bs = 1;
+                }
+            }
+        }
+        int is_input_consuming_task_for_src =
+            (op == m->input_consuming_op_idx);
+
+        /* Phase 1 CVT patching. The template leaves CVT registers as
+         * placeholders for the first conv that reads raw user input;
+         * the vendor runtime computes them from mean/std/dtype/scale/zp
+         * at rknn_run time. We mirror that computation here using the
+         * attrs block parsed in openrknn_model.c:parse_fb_attrs().
+         *
+         * Gate: a task is "input-consuming" iff its op_idx (f[1]) matches
+         * model->input_consuming_op_idx, the first op in the FB graph
+         * whose primary input tensor is the subgraph input. SRC_BASE==0
+         * is NOT a reliable gate — many tasks have that in the template
+         * without actually reading user input, and patching them
+         * corrupts values the vendor deliberately leaves as placeholders.
+         *
+         * Formula (validated byte-exact on 4/5 runtime models):
+         *   trunc = 14 if trivial pre-processing else 15
+         *   scale_hw[c] = round(2^trunc / (std[c] * tensor_scale))
+         *   off_hw[c]   = round(-mean[c] * scale_hw[c]/2^trunc + tensor_zp)
+         *
+         * Special case: dtype=uint8 with trivial mean/std collapses to
+         * identity rescale (16384) with offset=-128, centering uint8
+         * pixels to int8. YOLOv5 (dtype=int8) is currently unsupported
+         * and its tasks stay on the template values. */
+        int is_input_consuming = is_conv && m->input_attr_valid
+                                 && op == m->input_consuming_op_idx;
+        uint32_t cvt_con0 = 0, cvt_con5 = 0;
+        uint32_t cvt_con[4] = {0};
+        if (is_input_consuming) {
+            const float *mean = m->input_attr_mean;
+            const float *std  = m->input_attr_std;
+            const char  *dt   = m->input_attr_dtype;
+            float scale = m->n_inputs > 0 ? m->inputs[0].scale : 0.0078125f;
+            int32_t zp  = m->n_inputs > 0 ? m->inputs[0].zp    : 0;
+
+            int trivial_mean_std =
+                mean[0] == 0.0f && mean[1] == 0.0f && mean[2] == 0.0f &&
+                std[0]  == 1.0f && std[1]  == 1.0f && std[2]  == 1.0f;
+            int uniform_mean_zero_std =
+                mean[0] == 0.0f && mean[1] == 0.0f && mean[2] == 0.0f &&
+                std[0] == std[1] && std[1] == std[2] && std[0] > 0.0f;
+            int symmetric_ms =
+                mean[0] == mean[1] && mean[1] == mean[2] &&
+                std[0]  == std[1]  && std[1]  == std[2]  &&
+                mean[0] == std[0];
+
+            int trunc = 14;
+            int is_int8_trivial = (strcmp(dt, "int8") == 0 && trivial_mean_std);
+            int is_uint8_like_trivial =
+                !is_int8_trivial &&
+                ((strcmp(dt, "uint8") == 0 && trivial_mean_std) ||
+                 uniform_mean_zero_std || symmetric_ms);
+            int is_float32 = (strcmp(dt, "float32") == 0);
+
+            if (is_int8_trivial) {
+                /* int8 user input with trivial mean/std (YOLOv5 case).
+                 * The compiler derives the CVT scale from a rational
+                 * approximation of the tensor scale:
+                 *
+                 *   inv_s  = 1 / tensor_scale
+                 *   r_inv  = round(inv_s)
+                 *   factor = inv_s / r_inv              (≈ 1.0 for clean
+                 *                                        fractions)
+                 *   scale_hw = round(2^trunc * factor)
+                 *   trunc    = 15
+                 *   offset   = 0
+                 *
+                 * For YOLOv5 (scale=0.01865845, zp=-14):
+                 *   inv_s = 53.595, r_inv = 54, factor = 0.9925
+                 *   scale_hw = round(32768 * 0.9925) = 32522 = 0x7f0a
+                 *
+                 * For scales that divide cleanly (e.g. 1/128, 1/255),
+                 * r_inv equals inv_s so factor = 1 and scale_hw = 32768.
+                 * The YOLOv5 0.9925 is the fractional remainder when the
+                 * compiler picked an imperfect integer step count. */
+                trunc = 15;
+                float inv_s = 1.0f / scale;
+                float r_inv = roundf(inv_s);
+                if (r_inv == 0.0f) r_inv = 1.0f;
+                float factor = inv_s / r_inv;
+                int32_t sh = (int32_t)roundf((float)(1 << trunc) * factor);
+                if (sh > 32767)  sh = 32767;
+                if (sh < -32768) sh = -32768;
+                uint32_t packed = ((uint32_t)(sh & 0xFFFF) << 16) | 0;
+                for (int c = 0; c < 3; c++) cvt_con[c] = packed;
+            } else if (is_uint8_like_trivial) {
+                trunc = 14;
+                uint16_t off = (uint16_t)((int16_t)-128);
+                uint32_t packed = ((uint32_t)16384 << 16) | off;
+                for (int c = 0; c < 4; c++) cvt_con[c] = packed;
+            } else if (is_float32) {
+                trunc = 15;
+                int shift = 1 << trunc;
+                for (int c = 0; c < 3; c++) {
+                    float denom = std[c] * scale;
+                    if (denom == 0.0f) denom = 1.0f;
+                    /* Use roundf() (round-half-away-from-zero) not the
+                     * `+ 0.5f; cast` trick — the latter is wrong for
+                     * negative numbers and causes off-by-one errors in
+                     * ResNet50's CVT offsets. */
+                    int32_t sh = (int32_t)roundf((float)shift / denom);
+                    int32_t oh_i = (int32_t)roundf(
+                        -mean[c] * (float)sh / (float)shift + (float)zp);
+                    if (oh_i < -32768) oh_i = -32768;
+                    if (oh_i > 32767)  oh_i = 32767;
+                    cvt_con[c] = ((uint32_t)(sh & 0xFFFF) << 16) |
+                                 (uint32_t)(oh_i & 0xFFFF);
+                }
+            } else {
+                is_input_consuming = 0;
+            }
+            if (is_input_consuming) {
+                cvt_con0 = ((uint32_t)(trunc & 0x3f) << 4) |
+                           ((uint32_t)(trunc & 0x3f) << 10) |
+                           ((uint32_t)(trunc & 0x3f) << 16);
+                cvt_con5 = 0x00000fff;
+            }
+        }
+
+        /* W-alignment padding (DeepLabv3 W=513 → W_pad=528).
+         *
+         * The .rknn template holds the unpadded input width in:
+         *   0x1020 CNA_DATA_SIZE0.DATAIN_WIDTH  (bits 16-26)
+         *   0x107c CNA_DMA_CON1.LINE_STRIDE     (bits 0-27)
+         *   0x1080 CNA_DMA_CON2.SURF_STRIDE     (bits 0-27, = W * H_factor)
+         *
+         * The NPU requires W aligned to 16, so for non-16-aligned inputs
+         * (e.g. 513) the vendor runtime patches these three registers to
+         * the padded width (528) before submit. We mirror that here, but
+         * only for tasks belonging to the input-consuming op — subsequent
+         * layers work on already-padded activation data so their DATA_SIZE
+         * values are independent of the input W alignment. */
+        uint32_t input_w = 0, input_w_pad = 0;
+        int do_wpad = 0;
+        if (is_input_consuming && m->n_inputs > 0 &&
+            m->inputs[0].n_dims == 4) {
+            input_w = m->inputs[0].dims[2];
+            input_w_pad = (input_w + 15) & ~15u;
+            if (input_w_pad != input_w && input_w > 0)
+                do_wpad = 1;
+        }
+
+        /* Transpose final-task detection: the multi-REFORMAT lowering
+         * for Transpose writes intermediate data into input_tensors[1]
+         * (a scratch tensor) and only the last REFORMAT of the group
+         * copies the result to the op's real output. Flag this task as
+         * "final" iff the next task in the source belongs to a
+         * different op or enable mask (i.e. we are the tail of a
+         * contiguous same-op REFORMAT run). */
+        int is_transpose = 0;
+        int is_transpose_final = 0;
+        if (is_reformat && m->ops && op < m->op_count &&
+            strcmp(m->ops[op].type, "Transpose") == 0) {
+            is_transpose = 1;
+            if (t + 1 < src_count) {
+                uint32_t next_op = tasks[t + 1].f[1];
+                uint32_t next_em = tasks[t + 1].f[2];
+                if (next_op != op || next_em != enable_mask)
+                    is_transpose_final = 1;
+            } else {
+                is_transpose_final = 1;
+            }
+        }
 
         for (uint32_t e = 0; e < total; e++) {
             uint16_t reg = entries[e] & 0xFFFF;
@@ -851,51 +1375,161 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
             int do_patch = 0;
 
             switch (reg) {
-            case 0x1070: /* SRC_BASE */
-                /* CONV tasks read from input BO (val=0 means input start).
-                 * Non-zero val = activation offset. */
-                if (val == 0 && is_conv)
-                    new_val = in_base;
-                else if (val != 0)
+            case 0x1070: /* SRC_BASE — main data input */
+                if (is_input_consuming_task_for_src) {
+                    /* First conv reads raw user input from input BO.
+                     * Template val is the intra-tile offset within the
+                     * input BO (usually 0 for the first tile). */
+                    new_val = in_base + val;
+                    do_patch = 1;
+                } else if (is_conv && src_is_sg_output &&
+                           src_sg_bo_idx >= 0 &&
+                           (uint32_t)src_sg_bo_idx < m->n_outputs) {
+                    /* Head conv reads from a tensor that's also a
+                     * subgraph output (YOLOv8 detect head). Data is in
+                     * the corresponding output BO. */
+                    new_val = (uint32_t)ctx->output_bos[src_sg_bo_idx]
+                                  .dma_addr + val;
+                    do_patch = 1;
+                } else if (is_conv) {
+                    /* Subsequent convs read from the activation BO at the
+                     * op's primary input tensor offset. */
+                    new_val = act_base + src_tensor_off + val;
+                    do_patch = 1;
+                } else if (val != 0) {
                     new_val = act_base + val;
-                do_patch = (new_val != val);
+                    do_patch = 1;
+                }
                 break;
 
             case 0x1110: /* WT_BASE */
-                new_val = wt_base + (val ? val : task_wt_off);
+                /* Prefer the per-op weight offset from the FB memory
+                 * plan (tensor.f[18] → wt_blob_offsets[]). Fall back to
+                 * the old blob-pairing heuristic if the FB lookup didn't
+                 * resolve (0 == val uses the fallback value). The
+                 * template val is the intra-kernel offset within the
+                 * weight blob (always 0 for start-of-kernel reads). */
+                if (have_op_wt)
+                    new_val = wt_base + op_wt_bo_off + val;
+                else
+                    new_val = wt_base + (val ? val : task_wt_off);
                 do_patch = 1;
                 break;
 
-            case 0x4020: /* DST_BASE */
-                if (is_reformat) {
-                    /* REFORMAT tasks write to output BO */
-                    new_val = out_base + val;
-                } else if (val == 0) {
-                    new_val = act_base + act_dst_off;
+            case 0x4020: /* DST_BASE — output write */
+                if (is_reformat && m->ops && op < m->op_count &&
+                    strcmp(m->ops[op].type, "InputOperator") == 0) {
+                    /* InputOperator REFORMATs pre-process the raw input
+                     * buffer in place — both src and dst live in the
+                     * input BO (DeepLabv3 task 0 writes at in+0x600). */
+                    new_val = in_base + val;
+                    do_patch = 1;
+                } else if (is_reformat && amt >= 1000) {
+                    /* "Sentinel" REFORMAT tasks (amt ~1097, seen in
+                     * YOLOv5/v8): large-metadata tasks whose DMA regs
+                     * point to wt_base + rc_off (start of the regcmd
+                     * blob). These don't perform real DMA writes — the
+                     * hardware treats them as chain/marker tasks. */
+                    new_val = wt_base + rc_off;
+                    do_patch = 1;
+                } else if (is_transpose && !is_transpose_final) {
+                    /* Intermediate Transpose REFORMAT: write to the
+                     * scratch tensor (input[1]) in the activation BO,
+                     * ignoring dst_is_sg_output. Only the final task in
+                     * the chain writes to the real output. */
+                    new_val = act_base + dst_tensor_off + val;
+                    do_patch = 1;
+                } else if (dst_is_sg_output && sg_out_bo_idx >= 0 &&
+                    (uint32_t)sg_out_bo_idx < m->n_outputs) {
+                    /* Writing to a subgraph output tensor: target the
+                     * corresponding output BO directly. */
+                    new_val = (uint32_t)ctx->output_bos[sg_out_bo_idx]
+                                  .dma_addr + val;
+                    do_patch = 1;
+                } else if (is_reformat) {
+                    /* Non-output REFORMAT: writes to an intermediate
+                     * activation tensor in act BO. Use memory plan. */
+                    new_val = act_base + dst_tensor_off + val;
+                    do_patch = 1;
                 } else {
-                    new_val = act_base + val;
+                    /* Conv tasks write to the output tensor's allocation
+                     * in the activation BO. Template val = intra-tile off. */
+                    new_val = act_base + dst_tensor_off + val;
+                    do_patch = 1;
                 }
-                do_patch = 1;
                 break;
 
-            case 0x5018: /* RDMA_ACT — reads activation */
-                if (val == 0 && !is_conv) {
-                    /* REFORMAT reads from where CONV wrote: act + act_dst_off */
-                    new_val = act_base + act_dst_off;
+            case 0x5018: /* RDMA_ACT — reads activation for fused
+                          * residuals (ConvAdd etc.) or as REFORMAT src */
+                if (is_reformat && m->ops && op < m->op_count &&
+                    strcmp(m->ops[op].type, "InputOperator") == 0) {
+                    new_val = in_base + val;
+                    do_patch = 1;
+                } else if (is_reformat && amt >= 1000) {
+                    /* Sentinel REFORMAT task — see DST_BASE comment. */
+                    new_val = wt_base + rc_off;
+                    do_patch = 1;
+                } else if (is_conv) {
+                    /* Only patch if this conv has a fused residual
+                     * operand (ConvAdd / ConvReluAdd — input_count >= 4)
+                     * OR if the template val is non-zero (explicit
+                     * per-task read). Plain Conv leaves RDMA_ACT at 0 in
+                     * the template, and the vendor leaves it at 0 too. */
+                    if (m->ops && op < m->op_count &&
+                        m->ops[op].input_count > 3) {
+                        new_val = act_base + rdma_tensor_off + val;
+                        do_patch = 1;
+                    } else if (val != 0) {
+                        new_val = act_base + rdma_tensor_off + val;
+                        do_patch = 1;
+                    }
+                } else if (is_reformat) {
+                    new_val = act_base + src_tensor_off + val;
                     do_patch = 1;
                 } else if (val != 0) {
-                    /* Non-zero offset: add to act_dst_off (the base where
-                     * CONV output starts) for REFORMAT tasks */
-                    if (is_reformat)
-                        new_val = act_base + act_dst_off + val;
-                    else
-                        new_val = act_base + val;
+                    new_val = act_base + val;
                     do_patch = 1;
                 }
                 break;
 
-            case 0x5020: /* BS_BASE */
-                if (val == 0 && is_conv) {
+            case 0x5020: /* BS_BASE (bias) */
+                if (is_reformat) {
+                    /* Only BatchNormalization REFORMATs emit a real
+                     * BS_BASE pointer. Everything else — sentinel
+                     * lowering, Concat, Conv/ConvEx* REFORMATs —
+                     * leaves this at 0; only the corresponding CONV
+                     * tasks write the bias pointer.
+                     *
+                     * For BatchNormalization, BS_BASE points at the
+                     * gamma (scale) blob at wt_blob_offsets[input[1]]
+                     * — which is `op_wt_bo_off` in our naming (not
+                     * `op_bs_bo_off`, which points at beta and feeds
+                     * into BN_BASE / 0x502c). Verified byte-exact on
+                     * ResNet50 via the phase-0 diff oracle. */
+                    if (m->ops && op < m->op_count && have_op_wt &&
+                        strncmp(m->ops[op].type, "BatchNormalization",
+                                18) == 0) {
+                        new_val = wt_base + op_wt_bo_off + val;
+                        do_patch = 1;
+                    } else if (m->ops && op < m->op_count && have_op_in0 &&
+                               strcmp(m->ops[op].type,
+                                      "InputOperator") == 0) {
+                        /* InputOperator's REFORMAT task stages the raw
+                         * input buffer; BS_BASE points at a mask blob
+                         * that input_tensors[0] references (DeepLabv3
+                         * `sub_7:0_fill_stride_mask`). BN_BASE uses
+                         * input[1] which my existing `op_wt_bo_off`
+                         * already resolves. */
+                        new_val = wt_base + op_in0_bo_off + val;
+                        do_patch = 1;
+                    } else {
+                        new_val = 0;
+                        do_patch = 1;
+                    }
+                } else if (have_op_bs) {
+                    new_val = wt_base + op_bs_bo_off + val;
+                    do_patch = 1;
+                } else if (val == 0 && is_conv) {
                     new_val = wt_base + task_bs_off;
                     do_patch = 1;
                 } else if (val != 0) {
@@ -911,8 +1545,22 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 }
                 break;
 
-            case 0x6070: /* PC2 — points to per-channel data in BO[1] */
-                if (val != 0) {
+            /* em=0x60 tasks emit PPU DMA to either a shared per-channel
+             * LUT in the weight BO (for fused Conv ops whose template
+             * regcmd emits PC2/PC3 as part of the per-channel correction
+             * pass) or to activation tensors (MaxPool / AveragePool).
+             * The discriminator is the op type string:
+             *   - "MaxPool" / "AveragePool" / "GlobalAveragePool" →
+             *     act_base + dst/src_tensor_off + val (val = intra-slice
+             *     offset baked into the template, e.g. 0xa0 / 0x80).
+             *   - Everything else (including Conv fused paths and "Add" /
+             *     "Sub" / "Mul") → wt_base + pc2/pc3_off (shared LUT). */
+            case 0x6070: /* PC2 — PPU_DST_BASE_ADDR */
+                if (enable_mask == 0x60 && m->ops && op < m->op_count &&
+                    (strstr(m->ops[op].type, "Pool") != NULL)) {
+                    new_val = act_base + dst_tensor_off + val;
+                    do_patch = 1;
+                } else if (val != 0) {
                     new_val = wt_base + val;
                     do_patch = 1;
                 } else if (enable_mask == 0x60 && pc2_off) {
@@ -921,8 +1569,12 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 }
                 break;
 
-            case 0x701c: /* PC3 — points to per-channel data in BO[1] */
-                if (val != 0) {
+            case 0x701c: /* PC3 — PPU_RDMA_SRC_BASE_ADDR */
+                if (enable_mask == 0x60 && m->ops && op < m->op_count &&
+                    (strstr(m->ops[op].type, "Pool") != NULL)) {
+                    new_val = act_base + src_tensor_off + val;
+                    do_patch = 1;
+                } else if (val != 0) {
                     new_val = wt_base + val;
                     do_patch = 1;
                 } else if (enable_mask == 0x60 && pc3_off) {
@@ -931,25 +1583,126 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 }
                 break;
 
-            case 0x4110: /* WDMA_BASE */
-            case 0x5038: /* RDMA related */
-                if (val != 0) {
-                    new_val = act_base + val;
+            /* 0x4110 is REG_DPU_LUT_LE_START (a 32-bit LUT threshold
+             * value, not a DMA address). It's left as the template
+             * emitted it. Previously mis-patched here as "WDMA_BASE",
+             * which corrupted YOLOv8's sigmoid LUT config. */
+
+            case 0x502c: /* DPU_RDMA_BN_BASE_ADDR — batch-norm beta
+                          * (offset) table pointer, emitted for REFORMAT
+                          * tasks of BatchNormalization ops. All other
+                          * REFORMATs (Conv*, Concat, sentinel) leave
+                          * this at 0. Points at wt_blob_offsets[input[2]]
+                          * which is `op_bs_bo_off` in our naming — the
+                          * beta/bias blob. Paired with BS_BASE (0x5020)
+                          * which points at gamma. */
+                if (is_reformat && m->ops && op < m->op_count &&
+                    strncmp(m->ops[op].type, "BatchNormalization",
+                            18) == 0 && have_op_bs) {
+                    new_val = wt_base + op_bs_bo_off + val;
+                    do_patch = 1;
+                } else if (is_reformat && m->ops && op < m->op_count &&
+                           have_op_wt &&
+                           strcmp(m->ops[op].type,
+                                  "InputOperator") == 0) {
+                    /* InputOperator's BN_BASE points at the stride/bias
+                     * blob referenced by input_tensors[1]. */
+                    new_val = wt_base + op_wt_bo_off + val;
+                    do_patch = 1;
+                } else if (is_reformat) {
+                    new_val = 0;
                     do_patch = 1;
                 }
                 break;
 
-            /* CNA input conversion registers — runtime-computed from quant params */
+            case 0x5038: /* RDMA_EW_BASE — ElementWise secondary read.
+                          * For element-wise binary REFORMATs (Add/Mul/Sub
+                          * lowered as a single REFORMAT task with both
+                          * operands fed via RDMA_SRC and RDMA_EW) or for
+                          * conv tasks with a fused residual, point at the
+                          * op's last input tensor in the activation BO.
+                          * Concat REFORMATs leave this register at 0
+                          * because Concat doesn't have a second operand. */
+                if (is_reformat && amt >= 1000) {
+                    /* Sentinel REFORMAT: vendor leaves EW at 0. */
+                    new_val = 0;
+                    do_patch = 1;
+                } else if (is_conv && m->ops && op < m->op_count &&
+                    m->ops[op].input_count > 3) {
+                    new_val = act_base + rdma_tensor_off + val;
+                    do_patch = 1;
+                } else if (is_reformat && m->ops && op < m->op_count &&
+                           ew_tensor_off &&
+                           (strcmp(m->ops[op].type, "Add") == 0 ||
+                            strcmp(m->ops[op].type, "Sub") == 0 ||
+                            strcmp(m->ops[op].type, "Mul") == 0 ||
+                            strcmp(m->ops[op].type, "Div") == 0 ||
+                            strcmp(m->ops[op].type, "Min") == 0 ||
+                            strcmp(m->ops[op].type, "Max") == 0)) {
+                    new_val = act_base + ew_tensor_off + val;
+                    do_patch = 1;
+                } else if (val != 0) {
+                    new_val = act_base + rdma_tensor_off + val;
+                    do_patch = 1;
+                }
+                break;
+
+            /* CNA CVT registers — only patched when this task belongs to
+             * the input-consuming op (see comment + gate above the entry
+             * loop). Values are computed once per task using the parsed
+             * attrs block. */
             case 0x104c: /* CNA_CVT_CON0 */
-                if (is_conv) { new_val = cvt_con0; do_patch = 1; }
+                if (is_input_consuming) { new_val = cvt_con0; do_patch = 1; }
                 break;
-            case 0x1050: /* CNA_CVT_CON1 */
-            case 0x1054: /* CNA_CVT_CON2 */
-            case 0x1058: /* CNA_CVT_CON3 */
-                if (is_conv) { new_val = cvt_con1; do_patch = 1; }
+            case 0x1050: /* CNA_CVT_CON1 (channel 0) */
+                if (is_input_consuming) { new_val = cvt_con[0]; do_patch = 1; }
                 break;
+            case 0x1054: /* CNA_CVT_CON2 (channel 1) */
+                if (is_input_consuming) { new_val = cvt_con[1]; do_patch = 1; }
+                break;
+            case 0x1058: /* CNA_CVT_CON3 (channel 2) */
+                if (is_input_consuming) { new_val = cvt_con[2]; do_patch = 1; }
+                break;
+            /* CNA_CVT_CON4 (0x105c, channel 3) is NOT patched — RGB models
+             * leave it as the template placeholder and the vendor runtime
+             * doesn't touch it either. */
             case 0x1180: /* CNA_CVT_CON5 */
-                if (is_conv) { new_val = cvt_con5; do_patch = 1; }
+                if (is_input_consuming) { new_val = cvt_con5; do_patch = 1; }
+                break;
+
+            /* W-alignment padding registers — only patched for the
+             * input-consuming op when W isn't 16-aligned (DeepLabv3). */
+            case 0x1020: /* CNA_DATA_SIZE0 */
+                if (do_wpad) {
+                    /* Replace DATAIN_WIDTH field (bits 16-26, 11 bits),
+                     * preserve the lower 16 bits which hold
+                     * DATAIN_HEIGHT + reserved. */
+                    uint32_t height_bits = val & 0xFFFF;
+                    new_val = height_bits |
+                              ((input_w_pad & 0x7FF) << 16);
+                    do_patch = (new_val != val);
+                }
+                break;
+            case 0x107c: /* CNA_DMA_CON1 LINE_STRIDE (bits 0-27) */
+                if (do_wpad) {
+                    new_val = (val & 0xF0000000) | (input_w_pad & 0x0FFFFFFF);
+                    do_patch = (new_val != val);
+                }
+                break;
+            case 0x1080: /* CNA_DMA_CON2 SURF_STRIDE (bits 0-27) */
+                if (do_wpad && input_w > 0) {
+                    /* SURF_STRIDE = LINE_STRIDE * H_factor, so scale by
+                     * W_pad/W. Use integer math that avoids precision
+                     * loss when the ratio is exact. */
+                    uint32_t stride = val & 0x0FFFFFFF;
+                    if (stride % input_w == 0) {
+                        uint32_t h_factor = stride / input_w;
+                        uint32_t new_stride = input_w_pad * h_factor;
+                        new_val = (val & 0xF0000000) |
+                                  (new_stride & 0x0FFFFFFF);
+                        do_patch = (new_val != val);
+                    }
+                }
                 break;
             }
 
@@ -960,22 +1713,26 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 patched++;
             }
         }
-    }
+    }  /* end task loop */
+    }  /* end task-source loop */
 
-    orknn_log(1, "run: patched %u entries across %u tasks", patched, m->task_count);
+    orknn_log(1, "run: patched %u entries across %u tasks and %d sources",
+              patched, m->task_count, n_task_srcs);
 
     /* Dump patched regcmd for debugging */
     const char *dump_path = getenv("ORKNN_DUMP_REGCMD");
     if (dump_path) {
+        const struct task_entry *dbg_tasks =
+            (const struct task_entry *)ctx->task_bo.map;
         FILE *df = fopen(dump_path, "w");
         if (df) {
             for (uint32_t t = 0; t < m->task_count && t < 10; t++) {
-                uint32_t amt = tasks[t].f[6];
-                uint64_t addr = tasks[t].regcmd_addr;
+                uint32_t amt = dbg_tasks[t].f[6];
+                uint64_t addr = dbg_tasks[t].regcmd_addr;
                 uint32_t bo_off2 = (uint32_t)(addr - ctx->weight_bo.dma_addr);
                 uint64_t *ent = (uint64_t *)((uint8_t *)ctx->weight_bo.map + bo_off2);
                 fprintf(df, "=== TASK[%u] addr=0x%lx bo_off=%u amt=%u em=0x%x ===\n",
-                        t, (unsigned long)addr, bo_off2, amt, tasks[t].f[2]);
+                        t, (unsigned long)addr, bo_off2, amt, dbg_tasks[t].f[2]);
                 for (uint32_t e2 = 0; e2 < amt + 4; e2++) {
                     uint16_t reg2 = ent[e2] & 0xFFFF;
                     uint32_t val2 = (ent[e2] >> 16) & 0xFFFFFFFF;
@@ -986,6 +1743,49 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
             }
             fclose(df);
             orknn_log(1, "run: dumped regcmd to %s", dump_path);
+        }
+    }
+
+    /* Dump the entire weight BO after patching, for byte-exact diff
+     * against the vendor dump at /tmp/rknn_dump/sub1_bo_001_*.bin.
+     * Used by tests/diff_regcmd.py to surface per-register template-vs-oracle
+     * discrepancies during template-patch development. A companion ".meta"
+     * file holds BO DMA bases so the diff tool can rebase DMA-class register
+     * values without a manual --template-wt-base flag. */
+    const char *bo1_dump = getenv("ORKNN_DUMP_BO1");
+    if (bo1_dump) {
+        FILE *bf = fopen(bo1_dump, "wb");
+        if (bf) {
+            fwrite(ctx->weight_bo.map, 1, ctx->weight_bo.size, bf);
+            fclose(bf);
+            orknn_log(1, "run: dumped weight BO (%u bytes) to %s",
+                      ctx->weight_bo.size, bo1_dump);
+        } else {
+            orknn_log(0, "run: failed to open %s for writing", bo1_dump);
+        }
+        char meta_path[512];
+        snprintf(meta_path, sizeof(meta_path), "%s.meta", bo1_dump);
+        FILE *mf = fopen(meta_path, "w");
+        if (mf) {
+            fprintf(mf, "weight_bo_dma=0x%lx\n",
+                    (unsigned long)ctx->weight_bo.dma_addr);
+            fprintf(mf, "weight_bo_size=%u\n", ctx->weight_bo.size);
+            fprintf(mf, "task_bo_dma=0x%lx\n",
+                    (unsigned long)ctx->task_bo.dma_addr);
+            fprintf(mf, "activation_bo_dma=0x%lx\n",
+                    (unsigned long)ctx->activation_bo.dma_addr);
+            fprintf(mf, "activation_bo_size=%u\n", ctx->activation_bo.size);
+            for (uint32_t i = 0; i < m->n_inputs; i++) {
+                fprintf(mf, "input_bo[%u]_dma=0x%lx size=%u\n", i,
+                        (unsigned long)ctx->input_bos[i].dma_addr,
+                        ctx->input_bos[i].size);
+            }
+            for (uint32_t i = 0; i < m->n_outputs; i++) {
+                fprintf(mf, "output_bo[%u]_dma=0x%lx size=%u\n", i,
+                        (unsigned long)ctx->output_bos[i].dma_addr,
+                        ctx->output_bos[i].size);
+            }
+            fclose(mf);
         }
     }
 
@@ -1002,6 +1802,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
     }
 
     orknn_bo_sync_to_device(ctx->npu_fd, &ctx->weight_bo);
+    free(patched_offsets);
 }
 
 int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)

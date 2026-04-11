@@ -134,7 +134,12 @@ int orknn_own_inputs_set(struct orknn_context *ctx, uint32_t n_inputs,
              * our NC1HWC2 write didn't touch (padding slot), copy it
              * into our BO. This restores DeepLabv3's 0x80 W-padding
              * (mean/std-derived) without corrupting user data positions.
-             * For MBv1/YOLOv5 the cache is all zeros so this is a no-op. */
+             * For MBv1/YOLOv5 the cache is all zeros so this is a no-op.
+             *
+             * Phase 7 plan: replace with `memset(dst, (uint8_t)ti->zp, ...)`
+             * once diff-oracle confirms zp matches the cached pad byte for
+             * all dump-present models. Rolled back from that eager change
+             * to keep copy_proxy_regcmd path byte-exact. */
             if (i == 0 && ctx->proxy_input_cache &&
                 ctx->proxy_input_cache_size > 0) {
                 const uint8_t *cache = ctx->proxy_input_cache;
