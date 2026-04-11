@@ -59,9 +59,32 @@ int orknn_own_inputs_set(struct orknn_context *ctx, uint32_t n_inputs,
             const uint8_t *src = inputs[i].buf;
             uint8_t *dst = bo->map;
 
-            /* Pad with zero for padded channels.
-             * CNA_CVT handles zp offset, so we use raw 0 as pad. */
-            memset(dst, 0, bo->size);
+            /* Padding byte for the unused W-pad columns (and the C1
+             * padding beyond the real channel count). The CNA_CVT
+             * hardware applies (pixel * scale_hw - mean[c]*scale_hw +
+             * offset) per channel, so a pad byte equal to mean[c]
+             * produces zero contribution to the conv sum. We pick
+             * mean[0] because pad is written as a single flat byte
+             * across all channels; all models we see in the wild use
+             * the same mean per channel (ImageNet RGB uses three but
+             * DeepLabv3's [127.5,127.5,127.5] and YOLO's [0,0,0] are
+             * both channel-uniform). Previously we snapshotted this
+             * from the vendor's pre-run BO[3] via proxy_input_cache;
+             * computing it from mean[] removes the last /tmp/rknn_dump
+             * read from the inputs_set path.
+             *
+             * For models without W-padding (MBv1/ResNet50/YOLO: W
+             * already 16-aligned) this memset is overwritten entirely
+             * by the per-pixel copy below and the pad_byte choice
+             * doesn't matter. */
+            uint8_t pad_byte = 0;
+            if (m->input_attr_valid) {
+                float m0 = m->input_attr_mean[0];
+                if (m0 < 0.0f) m0 = 0.0f;
+                if (m0 > 255.0f) m0 = 255.0f;
+                pad_byte = (uint8_t)(int)(m0 + 0.5f);
+            }
+            memset(dst, pad_byte, bo->size);
 
             if (inputs[i].type == ti->type ||
                 (inputs[i].type == RKNN_TENSOR_UINT8 && ti->type == RKNN_TENSOR_INT8) ||
@@ -129,22 +152,10 @@ int orknn_own_inputs_set(struct orknn_context *ctx, uint32_t n_inputs,
                 return RKNN_ERR_INPUT_INVALID;
             }
 
-            /* Restore proxy's W-padding bytes from the cached BO[3].
-             * For each byte where the cache holds a NON-ZERO value that
-             * our NC1HWC2 write didn't touch (padding slot), copy it
-             * into our BO. This restores DeepLabv3's 0x80 W-padding
-             * (mean/std-derived) without corrupting user data positions.
-             * For MBv1/YOLOv5 the cache is all zeros so this is a no-op. */
-            if (i == 0 && ctx->proxy_input_cache &&
-                ctx->proxy_input_cache_size > 0) {
-                const uint8_t *cache = ctx->proxy_input_cache;
-                uint32_t lim = ctx->proxy_input_cache_size;
-                if (lim > bo->size) lim = bo->size;
-                for (uint32_t k = 0; k < lim; k++) {
-                    if (cache[k] != 0)
-                        dst[k] = cache[k];
-                }
-            }
+            /* W-pad bytes are now set via the memset(pad_byte) above
+             * derived from input_attr_mean. Previously we snapshotted
+             * them from the vendor's dump via proxy_input_cache; that
+             * code path is gone. */
         } else {
             /* Non-4D or non-NHWC: direct copy */
             uint32_t copy_size = inputs[i].size;

@@ -99,21 +99,70 @@ struct orknn_bo {
  * Submit segment (from .rknn model)
  * ====================================================================== */
 
-#define ORKNN_MAX_CYCLES 4
-
 struct orknn_segment {
     uint32_t flags;
     uint32_t sc_start;
     uint32_t sc_count;
     uint32_t task_number;
-    /* Per-cycle task BO snapshots. The proxy patches task BO data
-     * differently between iterations (MBv1 iter 1 writes output BO
-     * while warmup doesn't). cycle[0] = warmup/first iter, cycle[1] =
-     * second iter, etc. We pick cycle[min(run_count, n-1)] on each
-     * orknn_own_run call. n_cycles=0 means no snapshots available. */
-    uint8_t *task_bo_data[ORKNN_MAX_CYCLES];
-    uint32_t task_bo_size[ORKNN_MAX_CYCLES];
-    uint32_t n_cycles;
+};
+
+/* ======================================================================
+ * Per-operator metadata extracted from the .rknn FlatBuffer operator graph
+ * (subgraph field 1). Populated by parse_fb_operators() in openrknn_model.c.
+ *
+ * For Conv/ConvRelu/ConvClip/ConvExSwish/ConvSwish etc.:
+ *   input_tensors[0] = feature data tensor index
+ *   input_tensors[1] = weight tensor index
+ *   input_tensors[2] = bias tensor index
+ *   output_tensors[0] = output tensor index
+ *
+ * Non-conv ops (BatchNormalization, InputOperator, etc.) have different
+ * tensor layouts; `type` is the authoritative string to dispatch on.
+ * ====================================================================== */
+
+#define ORKNN_MAX_OP_INPUTS  8
+#define ORKNN_MAX_OP_OUTPUTS 4
+#define ORKNN_OP_TYPE_LEN    32
+
+struct orknn_op_info {
+    char     type[ORKNN_OP_TYPE_LEN];
+    uint32_t input_count;
+    uint32_t input_tensors[ORKNN_MAX_OP_INPUTS];
+    uint32_t output_count;
+    uint32_t output_tensors[ORKNN_MAX_OP_OUTPUTS];
+    /* Implicit weight/bias tensor indices. Some ops (e.g. DeepLabv3's
+     * Resize which lowers to a 1x1 requantization conv) reference
+     * compiler-generated weight and bias blobs that are NOT listed in
+     * the op's explicit input_tensors[]. The compiler leaves them as
+     * top-level tensors whose names start with `{input[0].name}_` and
+     * end in `_weight_*` or `_bias_*`. We resolve those by scanning
+     * the tensor vector for a name-prefix match during
+     * parse_fb_operators and store the tensor indices here.
+     *
+     * Both fields default to UINT32_MAX (no match found). */
+    uint32_t implicit_wt_tidx;
+    uint32_t implicit_bs_tidx;
+
+    /* Per-stage weight tensor indices for exSoftmax13 ops. The softmax
+     * lowering emits three em=0x0d tasks (ReduceMax -> rescale -> ReduceSum)
+     * and each reads CNA_WT from a distinct compile-time blob. Two of
+     * the blobs (_ReduceMax_output_weight and _reducesum_output_weight)
+     * are top-level tensors that aren't in input_tensors[] and we
+     * resolve them via name-suffix matching against the output tensor's
+     * name. The rescale blob IS in input_tensors[2] so it doesn't need
+     * its own slot.
+     *
+     * Both fields default to UINT32_MAX (no match found). */
+    uint32_t softmax_rmax_tidx;
+    uint32_t softmax_rsum_tidx;
+
+    /* Number of NPU task slots this op reserves in the task BO.
+     * Extracted from FB field 10 (see docs/segmentation_from_fb.md):
+     *    f[10][2] == 0  → task_count = f[10][1]  (activation-LUT ops)
+     *    f[10][2] != 0  → task_count = f[10][0]  (everything else)
+     * Used by fb_build_segments() to compute per-cycle task ranges
+     * without reading /tmp/rknn_dump/submit_*.txt. */
+    uint32_t task_count;
 };
 
 /* ======================================================================
@@ -142,6 +191,47 @@ struct orknn_model {
     uint32_t  segment_count;
     uint32_t  total_weight_size;
     uint32_t  total_internal_size;
+    /* Per-operator metadata (phase 3). NULL until parse_fb_operators()
+     * runs. op_count is the length of ops[]. */
+    struct orknn_op_info *ops;
+    uint32_t  op_count;
+    /* Phase 4b: tensor memory plan — per-tensor byte offset in the
+     * activation BO, parsed from FB tensor.f[13]. Indexed by tensor
+     * index as stored in ops[i].input_tensors / output_tensors. Weight
+     * and constant tensors have offset 0 here and are not referenced
+     * in activation BO reads. NULL until parse_fb_tensor_offsets runs. */
+    uint32_t *tensor_offsets;
+    /* Per-tensor weight-data blob index (FB tensor.f[18]). Non-zero
+     * only for tensors whose data is stored in the weight BO.
+     * 0xFFFFFFFF = no weight blob index (activation/intermediate tensor).
+     * Resolved to a weight-BO byte offset via wt_blob_offsets[]. */
+    uint32_t *tensor_weight_blob;
+    uint32_t  tensor_count;
+    /* Per-weight_data-index offset into BO[1]. Built alongside the
+     * tensor memory plan by iterating the FB weight_data vector in the
+     * same order extract_npu_data does, with 64-byte alignment between
+     * non-empty entries. wt_blob_count is the full weight_data vector
+     * length (not compacted), so a lookup tensor_weight_blob[i] indexes
+     * directly into wt_blob_offsets[]. */
+    uint32_t *wt_blob_offsets;
+    uint32_t  wt_blob_count;
+    /* Subgraph output tensor indices — the tensors whose data lands in
+     * output BOs rather than the activation BO. Used to decide whether
+     * a REFORMAT task's DPU_DST_BASE should point at `out_base` or at
+     * `act_base + tensor_off`. Parallel to tensor_offsets[], indexed
+     * by tensor index: 1 if this tensor is a subgraph output. */
+    uint8_t  *tensor_is_sg_output;
+    /* Per-subgraph-output-index: which tensor each output maps to and
+     * its corresponding output BO index. m->n_outputs entries. */
+    uint32_t *sg_output_tensor_idx;
+    /* Phase 3b: pre-processing config parsed from the header `attrs`
+     * Python-dict string. Used to compute CVT register values for the
+     * first conv op that reads raw user input. */
+    char     input_attr_dtype[16];          /* "uint8", "int8", "float32" */
+    float    input_attr_mean[4];            /* up to 4 channels */
+    float    input_attr_std[4];
+    int      input_attr_valid;              /* 1 = attrs parsed OK */
+    uint32_t input_consuming_op_idx;        /* op_idx whose input[0] == sg input */
 };
 
 /* ======================================================================
@@ -185,13 +275,6 @@ struct orknn_context {
      * 1 = NCHW (c-major: dst[c*H*W + h*W + w])
      * Detected during sig search by trying both interpretations. */
     uint8_t  act_output_src_order[16];
-    /* Cached proxy BO[3] content for input padding. Read once at run
-     * setup from the intercept dump. For models with W not 16-aligned
-     * (e.g. DeepLabv3: W=513 → 528), this holds the quantized
-     * normalized-input-zero (mean/std-derived, e.g. 0x80) in the
-     * W-padding slots. inputs_set() applies it after writing data. */
-    uint8_t *proxy_input_cache;
-    uint32_t proxy_input_cache_size;
     /* Logging */
     int log_level;
 };

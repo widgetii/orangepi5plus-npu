@@ -46,18 +46,11 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
     }
     if (!have_npu_data) goto alloc_io_bos;
 
-    /* Task BO — needs KERNEL_MAPPING (0x8) flag so RKNPU driver can read it.
-     * Must be large enough to fit the proxy's per-segment task BO snapshots
-     * (which may be larger than our own FB-derived task data). */
+    /* Task BO — needs KERNEL_MAPPING (0x8) flag so RKNPU driver can read
+     * it. Sized from the raw task data we parsed out of the .rknn
+     * FlatBuffer (cross-core replicas included); the segment sc_count
+     * values carve single-core slices out of this BO at submit time. */
     uint32_t task_size = ALIGN_UP(m->task_data_size, 4096);
-    for (uint32_t s = 0; s < m->segment_count; s++) {
-        for (uint32_t c = 0; c < m->segments[s].n_cycles; c++) {
-            if (m->segments[s].task_bo_size[c] > 0) {
-                uint32_t need = ALIGN_UP(m->segments[s].task_bo_size[c], 4096);
-                if (need > task_size) task_size = need;
-            }
-        }
-    }
     if (task_size < 4096) task_size = 4096;
     if (orknn_bo_create_flags(fd, task_size, 0x40b, &ctx->task_bo)) {
         orknn_log(0, "memory: failed to allocate task BO (%u bytes)", task_size);
@@ -67,39 +60,78 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
               task_size, (unsigned long)ctx->task_bo.dma_addr);
 
     /* Activation BO (intermediate tensors).
-     * Try to read the proxy's actual size from the intercept dump.
-     * Fall back to heuristic if not available. */
-    uint32_t act_size = 0;
-    {
-        FILE *sf = fopen("/tmp/rknn_dump/submit_1.txt", "r");
-        if (sf) {
-            char line[256];
-            while (fgets(line, sizeof(line), sf)) {
-                uint32_t bi, sz;
-                if (sscanf(line, "bo[2] handle=%*u dma=%*s obj=%*s size=%u", &sz) == 1)
-                    act_size = sz;
-                /* Also parse: bo[2] ... size=N */
-                if (strstr(line, "bo[2]")) {
-                    char *sp = strstr(line, "size=");
-                    if (sp) act_size = (uint32_t)strtoul(sp + 5, NULL, 10);
-                }
+     *
+     * Sized from a scan of the template regcmd plus one largest-IO tensor's
+     * worth of slack. For the five runtime models this over-allocates by
+     * 1.2x–2.1x compared to the vendor's compile-time-optimal size; the
+     * overhead is acceptable (a few MB) and the bound always covers the
+     * vendor's allocation.
+     *
+     *   fb_act_size = max(
+     *       scan * 4 + largest_io * 2,
+     *       1 MB floor)
+     *
+     * where `scan` is the highest byte offset written to any activation-
+     * targeting DMA register in the template (0x4020, 0x1070, 0x5018,
+     * 0x5038) excluding sentinel values >= 256MB, and `largest_io` is the
+     * biggest input/output tensor native_size. The 4x multiplier was
+     * derived empirically: across the runtime models `vendor_bo2 / (scan
+     * + largest_io)` is at most 2.95, so 4x gives safety margin.
+     *
+     * Note: m->total_internal_size is deliberately NOT used. The blob
+     * extraction that populated it is unreliable (see openrknn_model.c).
+     */
+
+    /* Template regcmd scan: collect the highest offset touched by any
+     * activation-targeting DMA register. Plain uint32_t values near
+     * UINT32_MAX (e.g. 0xFFFFC000) appear as compiler sentinels or
+     * register-field-pack artifacts — hard-ignore anything above
+     * ACT_OFF_SANITY_MAX (256MB). Real activation BOs on RK3588 top out
+     * around tens of MB for the largest models we see. */
+    #define ACT_OFF_SANITY_MAX 0x10000000u
+    uint32_t max_act_off = 0;
+    uint32_t scan_sentinels = 0;
+    if (m->regcmd_data && m->regcmd_size >= 8) {
+        const uint64_t *rc = (const uint64_t *)m->regcmd_data;
+        uint32_t n_entries = m->regcmd_size / 8;
+        for (uint32_t i = 0; i < n_entries; i++) {
+            uint16_t reg = rc[i] & 0xFFFF;
+            uint32_t val = (rc[i] >> 16) & 0xFFFFFFFF;
+            if (val == 0) continue;
+            /* Activation-targeting DMA registers:
+             *   0x1070 CNA_FEATURE_DATA_ADDR
+             *   0x4020 DPU_DST_BASE_ADDR
+             *   0x5018 DPU_RDMA_SRC_BASE_ADDR
+             *   0x5038 DPU_RDMA_EW_BASE_ADDR
+             * Note 0x4110 is DPU_LUT_LE_START (a LUT value), not DMA. */
+            if (reg != 0x4020 && reg != 0x1070 && reg != 0x5018 &&
+                reg != 0x5038)
+                continue;
+            if (val >= ACT_OFF_SANITY_MAX) {
+                scan_sentinels++;
+                continue;
             }
-            fclose(sf);
+            if (val > max_act_off) max_act_off = val;
         }
     }
-    if (act_size == 0) {
-        /* Heuristic fallback */
-        for (uint32_t i = 0; i < m->n_inputs; i++)
-            act_size += m->inputs[i].native_size;
-        for (uint32_t i = 0; i < m->n_outputs; i++)
-            act_size += m->outputs[i].native_size;
-        act_size *= 4;
-        if (m->total_internal_size > act_size)
-            act_size = m->total_internal_size;
-        if (act_size < 131072)
-            act_size = 131072;
-    }
+    uint32_t largest_io = 0;
+    for (uint32_t i = 0; i < m->n_inputs; i++)
+        if (m->inputs[i].native_size > largest_io)
+            largest_io = m->inputs[i].native_size;
+    for (uint32_t i = 0; i < m->n_outputs; i++)
+        if (m->outputs[i].native_size > largest_io)
+            largest_io = m->outputs[i].native_size;
+
+    /* FB-derived size: scan*4 + largest_io*2. Validated on all 5 runtime
+     * models in ground_truth.json; worst-case over-allocation ~2.2x for
+     * YOLO/DeepLabv3, but always covers the vendor allocation. Floor at
+     * 1MB so tiny test models still get a usable buffer. */
+    uint32_t act_size = max_act_off * 4 + largest_io * 2;
+    if (act_size < 1048576) act_size = 1048576;
     act_size = ALIGN_UP(act_size, 4096);
+    orknn_log(1, "memory: activation size: scan=%u+largest_io=%u "
+                 "sentinels=%u -> %u",
+              max_act_off, largest_io, scan_sentinels, act_size);
     if (orknn_bo_create(fd, act_size, &ctx->activation_bo)) {
         orknn_log(0, "memory: failed to allocate activation BO (%u bytes)", act_size);
         return -1;
@@ -134,30 +166,11 @@ alloc_io_bos:
                   i, in_size, (unsigned long)ctx->input_bos[i].dma_addr);
     }
 
-    /* Read proxy output BO sizes from dump if available */
-    uint32_t proxy_out_sizes[16] = {0};
-    {
-        FILE *sf2 = fopen("/tmp/rknn_dump/submit_1.txt", "r");
-        if (sf2) {
-            char line[256];
-            while (fgets(line, sizeof(line), sf2)) {
-                uint32_t bi, sz;
-                if (sscanf(line, "bo[%u] handle=%*u dma=%*s obj=%*s size=%u", &bi, &sz) == 2) {
-                    if (bi >= 4 && bi < 20)
-                        proxy_out_sizes[bi - 4] = sz;
-                }
-            }
-            fclose(sf2);
-        }
-    }
-
-    /* Output BOs */
+    /* Output BOs — sized from each output tensor's FB-declared
+     * native_size, with a 4KB floor for tiny test models. */
     ctx->output_bos = calloc(m->n_outputs, sizeof(struct orknn_bo));
     for (uint32_t i = 0; i < m->n_outputs; i++) {
         uint32_t out_size = ALIGN_UP(m->outputs[i].native_size, 4096);
-        /* Use proxy's output BO size if larger */
-        if (i < 16 && proxy_out_sizes[i] > out_size)
-            out_size = ALIGN_UP(proxy_out_sizes[i], 4096);
         if (out_size < 4096) out_size = 4096;
         if (orknn_bo_create(fd, out_size, &ctx->output_bos[i])) {
             orknn_log(0, "memory: failed to allocate output BO[%u] (%u bytes)", i, out_size);
