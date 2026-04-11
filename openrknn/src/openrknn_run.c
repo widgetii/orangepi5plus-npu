@@ -54,56 +54,6 @@ static int scan_blob_offsets(struct orknn_model *m, struct bo1_blob_info *blobs,
     return count;
 }
 
-/* Load the proxy/vendor's input-BO cache from /tmp/rknn_dump. This is
- * the last remaining dump dependency: DeepLabv3's CVT hardware expects
- * an 0x80 pad byte in the 15 unused columns of its 513→528 W-padded
- * input, which we currently snapshot from the vendor's pre-run BO[3]
- * rather than synthesise from mean/std/zp. Phase 9's next step is to
- * derive the pad byte directly from the input attrs, at which point
- * this whole function goes away along with the ctx->real_ctx /
- * proxy->rknn_init hookup.
- *
- * All the other things this function used to do — copying the
- * vendor's weight BO, rebasing DMA addresses, and sig-searching the
- * post-run activation BO for per-output offsets — are now handled by
- * patch_regcmd_addresses (template-patch) and discover_outputs_from_fb
- * (FB-derived output discovery). */
-static int load_proxy_input_cache(struct orknn_context *ctx)
-{
-    if (ctx->proxy_input_cache) return 0;
-
-    /* Read submit_1.txt to find BO[3]'s size, which becomes the
-     * sub1_bo_003 dump filename suffix. */
-    FILE *mf = fopen("/tmp/rknn_dump/submit_1.txt", "r");
-    if (!mf) return -1;
-    uint32_t bo3_size = 0;
-    char line[256];
-    while (fgets(line, sizeof(line), mf)) {
-        uint32_t bi, dma, sz;
-        if (sscanf(line, "bo[%u] handle=%*u dma=0x%x obj=%*s size=%u",
-                   &bi, &dma, &sz) == 3 && bi == 3) {
-            bo3_size = sz;
-            break;
-        }
-    }
-    fclose(mf);
-    if (bo3_size == 0) return -1;
-
-    char ipath[128];
-    snprintf(ipath, sizeof(ipath), "/tmp/rknn_dump/sub1_bo_003_%uB.bin",
-             bo3_size);
-    FILE *f3 = fopen(ipath, "rb");
-    if (!f3) return -1;
-    ctx->proxy_input_cache = malloc(bo3_size);
-    if (!ctx->proxy_input_cache) { fclose(f3); return -1; }
-    ctx->proxy_input_cache_size =
-        (uint32_t)fread(ctx->proxy_input_cache, 1, bo3_size, f3);
-    fclose(f3);
-    orknn_log(1, "run: cached proxy BO[3] (%u bytes)",
-              ctx->proxy_input_cache_size);
-    return 0;
-}
-
 /* Derive act_output_offsets / act_output_valid / act_output_layout
  * from FB metadata alone — no /tmp/rknn_dump reads, no sig-search.
  *
@@ -214,12 +164,6 @@ static void discover_outputs_from_fb(struct orknn_context *ctx)
 
 static void patch_regcmd_addresses(struct orknn_context *ctx)
 {
-    /* Read the proxy's input-BO cache for DeepLabv3 W-padding bytes.
-     * Non-fatal: if the dump is missing, DeepLabv3's input staging
-     * will write zeros in the padding columns instead of the 0x80
-     * pad byte the CVT hardware expects. Other models are 16-aligned
-     * so their sub1_bo_003 dumps are all-zero anyway. */
-    load_proxy_input_cache(ctx);
 
     struct orknn_model *m = &ctx->model;
     uint32_t rc_off = (uint32_t)(m->regcmd_data - m->wt_data);

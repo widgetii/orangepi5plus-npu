@@ -277,13 +277,6 @@ struct orknn_context {
      * 1 = NCHW (c-major: dst[c*H*W + h*W + w])
      * Detected during sig search by trying both interpretations. */
     uint8_t  act_output_src_order[16];
-    /* Cached proxy BO[3] content for input padding. Read once at run
-     * setup from the intercept dump. For models with W not 16-aligned
-     * (e.g. DeepLabv3: W=513 → 528), this holds the quantized
-     * normalized-input-zero (mean/std-derived, e.g. 0x80) in the
-     * W-padding slots. inputs_set() applies it after writing data. */
-    uint8_t *proxy_input_cache;
-    uint32_t proxy_input_cache_size;
     /* Logging */
     int log_level;
 };
