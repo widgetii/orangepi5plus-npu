@@ -166,15 +166,32 @@ run_phase "Phase 2: openrknn OWN path (full pipeline)" "$LIB" \
 # /tmp/rknn_dump/sub1_bo_001_*.bin. Non-DMA register deltas are real template
 # bugs that drive the phase-1..phase-5 work.
 #
-# This phase is advisory: it does NOT block overall_rc until the template
-# path reaches byte-exact parity on all models (tracked in plan phase 9).
-# Failures print the diff summary so the engineer can see progress.
+# Gating: the phase fails overall_rc if any model OUTSIDE the expected-fail
+# allowlist shows register deltas. Allowlisted models log their diff count
+# and continue; see the comment on DIFF_ALLOWLIST for the list and why each
+# entry is there.
+
+# Models allowed to have template-patch regcmd diffs. Each entry documents
+# the root-cause op so we can remove it once fixed.
+#
+#   mobilenet_v1 : op 30 exSoftmax13 DST/SRC + em=0x0d CNA_DCOMP_ADDR0
+#                  and CNA_FEATURE_DATA_ADDR left unpatched. 28 DMA-class
+#                  diffs. Fix blocks phase 9 (delete copy_proxy_regcmd).
+DIFF_ALLOWLIST="mobilenet_v1"
+
+is_allowlisted() {
+    case " $DIFF_ALLOWLIST " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 DIFF_DIR=/tmp/orknn_diff
 mkdir -p "$DIFF_DIR"
 echo ""
-echo "=== Phase 2.5: template-patch byte-exact diff (advisory) ==="
+echo "=== Phase 2.5: template-patch byte-exact diff ==="
 n_clean=0; n_dirty=0; dirty_names=""
+n_allowlisted_dirty=0; allowlisted_names=""
 for name in $MODELS; do
     bo1_out="$DIFF_DIR/${name}_bo1.bin"
     rm -f "$bo1_out"
@@ -200,6 +217,11 @@ populate_intercept_dump('$MODEL_DIR/$(python3 -c "import json; print(json.load(o
         --own init,query,input,run,outputs >/dev/null 2>&1 || true
 
     if [ ! -s "$bo1_out" ]; then
+        if [ "${name}" = "mobilesam_encoder" ] || [ "${name}" = "lprnet" ]; then
+            # fp16_parse models don't go through the own NPU run path, so
+            # there's no weight BO to dump and nothing to diff.
+            continue
+        fi
         echo "--- $name: template run produced no BO1 dump (skip) ---"
         continue
     fi
@@ -218,16 +240,27 @@ populate_intercept_dump('$MODEL_DIR/$(python3 -c "import json; print(json.load(o
         --template "$bo1_out" \
         --task-bo "$task_bo" 2>&1 | tail -30; then
         n_clean=$((n_clean + 1))
-        echo "  $name: BYTE-EXACT (non-DMA)"
+        echo "  $name: BYTE-EXACT"
     else
-        n_dirty=$((n_dirty + 1))
-        dirty_names="$dirty_names $name"
+        if is_allowlisted "$name"; then
+            n_allowlisted_dirty=$((n_allowlisted_dirty + 1))
+            allowlisted_names="$allowlisted_names $name"
+            echo "  $name: HAS DIFFS (allowlisted, not gating)"
+        else
+            n_dirty=$((n_dirty + 1))
+            dirty_names="$dirty_names $name"
+            echo "  $name: HAS DIFFS (gating failure)"
+        fi
     fi
 done
 echo ""
-echo "  Phase 2.5 result: $n_clean clean, $n_dirty with non-DMA deltas"
+echo "  Phase 2.5 result: $n_clean clean, $n_dirty gating, $n_allowlisted_dirty allowlisted"
 if [ -n "$dirty_names" ]; then
-    echo "  Template-patch deltas remaining for:$dirty_names"
+    echo "  Template-patch regressions:$dirty_names"
+    overall_rc=1
+fi
+if [ -n "$allowlisted_names" ]; then
+    echo "  Template-patch known diffs:$allowlisted_names"
 fi
 
 # --- Phase 3: openrknn proxy-dispatch path ---
