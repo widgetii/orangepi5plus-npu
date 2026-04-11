@@ -352,63 +352,20 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
     uint32_t *patched_offsets = calloc(MAX_PATCHED_OFFSETS, sizeof(uint32_t));
     int n_patched_offsets = 0;
 
-    /* Build a list of task-BO sources to iterate. The primary source is
-     * ctx->task_bo.map (derived from m->task_data by orknn_alloc_model_bos,
-     * already rebased so regcmd_addr is in our weight BO's DMA range).
-     * Per-segment per-cycle task BO snapshots in m->segments[s].task_bo_data[c]
-     * are VENDOR-addressed and need runtime rebasing. Without including
-     * them, CVT patching only covers op_idx tasks in segment 0, and
-     * later segments' input-consuming conv tasks stay on template
-     * placeholders (breaks MBv1 multi-cycle etc.).
-     *
-     * For segment sources we read the vendor weight-BO base from
-     * /tmp/rknn_dump/submit_1.txt. That's a dump dependency that phase 9
-     * will eventually remove along with the per-cycle task BO snapshots. */
+    /* Task-BO source for patching. Previously we also fed per-cycle task
+     * BO snapshots from /tmp/rknn_dump back through this loop; those are
+     * gone (task 9.4) — the only cycle-to-cycle delta the vendor's
+     * snapshots carried was the kernel-owned int_status byte, which the
+     * NPU driver rewrites at completion time regardless. The primary
+     * task BO at ctx->task_bo.map already has every cross-core replica
+     * patched since extract_npu_data copies the raw task blob intact. */
     struct task_entry { uint32_t f[8]; uint64_t regcmd_addr; }
         __attribute__((packed));
-    const struct task_entry *task_srcs[32];
-    uint32_t task_src_counts[32];
-    uint64_t task_src_wt_base[32]; /* per-source DMA base for rebasing */
-    int n_task_srcs = 0;
-    task_srcs[0] = (const struct task_entry *)ctx->task_bo.map;
-    task_src_counts[0] = m->task_count;
-    task_src_wt_base[0] = ctx->weight_bo.dma_addr;
-    n_task_srcs = 1;
-
-    /* Read vendor weight BO base for segment sources. */
-    uint64_t vendor_wt_base = 0;
-    {
-        FILE *mf = fopen("/tmp/rknn_dump/submit_1.txt", "r");
-        if (mf) {
-            char line[256];
-            while (fgets(line, sizeof(line), mf)) {
-                if (strncmp(line, "bo[1]", 5) == 0) {
-                    char *dp = strstr(line, "dma=0x");
-                    if (dp) vendor_wt_base = strtoull(dp + 6, NULL, 16);
-                    break;
-                }
-            }
-            fclose(mf);
-        }
-    }
-
-    for (uint32_t s = 0; s < m->segment_count && n_task_srcs < 32; s++) {
-        for (uint32_t c = 0; c < m->segments[s].n_cycles && n_task_srcs < 32; c++) {
-            uint8_t *td = m->segments[s].task_bo_data[c];
-            uint32_t tsz = m->segments[s].task_bo_size[c];
-            if (td && tsz >= 40 && vendor_wt_base) {
-                task_srcs[n_task_srcs] = (const struct task_entry *)td;
-                task_src_counts[n_task_srcs] = tsz / 40;
-                task_src_wt_base[n_task_srcs] = vendor_wt_base;
-                n_task_srcs++;
-            }
-        }
-    }
-
+    const int n_task_srcs = 1;
     for (int src = 0; src < n_task_srcs; src++) {
-    const struct task_entry *tasks = task_srcs[src];
-    uint32_t src_count = task_src_counts[src];
-    uint64_t src_wt_base = task_src_wt_base[src];
+    const struct task_entry *tasks = (const struct task_entry *)ctx->task_bo.map;
+    uint32_t src_count = m->task_count;
+    uint64_t src_wt_base = ctx->weight_bo.dma_addr;
     /* Per-source sub-task counter: for consecutive REFORMAT tasks with the
      * same op_idx, this counts 0,1,2,... and maps each REFORMAT to a
      * distinct input tensor of the op. Multi-input Concat ops lower to N
@@ -1417,54 +1374,11 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
         uint32_t v = (uint32_t)strtoul(getenv("ORKNN_MAX_SEGS"), NULL, 10);
         if (v < max_segs) max_segs = v;
     }
-    /* Pick cycle snapshot by run count — cycle[run_count] capped at last
-     * available cycle. This matches bench_rknn's warmup + iter 1 pattern:
-     * call 0 = warmup, call 1 = iter 1 (saved), etc. */
+    /* ctx->task_bo was populated once by orknn_alloc_model_bos with the
+     * patched task data; each segment just replays a {sc_start, sc_count}
+     * slice into the NPU. No per-cycle rewrites needed (see task 9.4). */
     for (uint32_t i = 0; i < max_segs; i++) {
         struct orknn_segment *seg = &m->segments[i];
-        uint32_t cycle_idx = ctx->run_count;
-        if (cycle_idx >= seg->n_cycles)
-            cycle_idx = seg->n_cycles > 0 ? seg->n_cycles - 1 : 0;
-        uint8_t *seg_task_data = seg->n_cycles > 0
-            ? seg->task_bo_data[cycle_idx] : NULL;
-        uint32_t seg_task_size = seg->n_cycles > 0
-            ? seg->task_bo_size[cycle_idx] : 0;
-
-        if (seg_task_data && seg_task_size <= ctx->task_bo.size) {
-            memcpy(ctx->task_bo.map, seg_task_data, seg_task_size);
-            /* Rebase regcmd_addr field for every task (offset 32 in each 40-byte task) */
-            struct {
-                uint32_t f[8];
-                uint64_t regcmd_addr;
-            } __attribute__((packed)) *ts = ctx->task_bo.map;
-            uint32_t n_tasks = seg_task_size / 40;
-            /* Proxy weight BO base from dump's submit_1.txt */
-            uint64_t proxy_wt_base = 0;
-            FILE *mf = fopen("/tmp/rknn_dump/submit_1.txt", "r");
-            if (mf) {
-                char line[256];
-                while (fgets(line, sizeof(line), mf)) {
-                    if (strncmp(line, "bo[1]", 5) == 0) {
-                        char *dp = strstr(line, "dma=0x");
-                        if (dp) proxy_wt_base = strtoull(dp + 6, NULL, 16);
-                        break;
-                    }
-                }
-                fclose(mf);
-            }
-            if (proxy_wt_base) {
-                uint64_t our_wt_base = ctx->weight_bo.dma_addr;
-                for (uint32_t t = 0; t < n_tasks; t++) {
-                    if (ts[t].regcmd_addr >= proxy_wt_base &&
-                        ts[t].regcmd_addr < proxy_wt_base + ctx->weight_bo.size) {
-                        ts[t].regcmd_addr =
-                            our_wt_base + (ts[t].regcmd_addr - proxy_wt_base);
-                    }
-                }
-            }
-            orknn_bo_sync_to_device(ctx->npu_fd, &ctx->task_bo);
-        }
-
         int ret = orknn_npu_submit(ctx->npu_fd, &ctx->task_bo, seg);
         if (ret) {
             orknn_log(0, "run: segment %u submit failed", i);

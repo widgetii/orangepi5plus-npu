@@ -99,21 +99,11 @@ struct orknn_bo {
  * Submit segment (from .rknn model)
  * ====================================================================== */
 
-#define ORKNN_MAX_CYCLES 4
-
 struct orknn_segment {
     uint32_t flags;
     uint32_t sc_start;
     uint32_t sc_count;
     uint32_t task_number;
-    /* Per-cycle task BO snapshots. The proxy patches task BO data
-     * differently between iterations (MBv1 iter 1 writes output BO
-     * while warmup doesn't). cycle[0] = warmup/first iter, cycle[1] =
-     * second iter, etc. We pick cycle[min(run_count, n-1)] on each
-     * orknn_own_run call. n_cycles=0 means no snapshots available. */
-    uint8_t *task_bo_data[ORKNN_MAX_CYCLES];
-    uint32_t task_bo_size[ORKNN_MAX_CYCLES];
-    uint32_t n_cycles;
 };
 
 /* ======================================================================

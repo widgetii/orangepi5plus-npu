@@ -46,18 +46,11 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
     }
     if (!have_npu_data) goto alloc_io_bos;
 
-    /* Task BO — needs KERNEL_MAPPING (0x8) flag so RKNPU driver can read it.
-     * Must be large enough to fit the proxy's per-segment task BO snapshots
-     * (which may be larger than our own FB-derived task data). */
+    /* Task BO — needs KERNEL_MAPPING (0x8) flag so RKNPU driver can read
+     * it. Sized from the raw task data we parsed out of the .rknn
+     * FlatBuffer (cross-core replicas included); the segment sc_count
+     * values carve single-core slices out of this BO at submit time. */
     uint32_t task_size = ALIGN_UP(m->task_data_size, 4096);
-    for (uint32_t s = 0; s < m->segment_count; s++) {
-        for (uint32_t c = 0; c < m->segments[s].n_cycles; c++) {
-            if (m->segments[s].task_bo_size[c] > 0) {
-                uint32_t need = ALIGN_UP(m->segments[s].task_bo_size[c], 4096);
-                if (need > task_size) task_size = need;
-            }
-        }
-    }
     if (task_size < 4096) task_size = 4096;
     if (orknn_bo_create_flags(fd, task_size, 0x40b, &ctx->task_bo)) {
         orknn_log(0, "memory: failed to allocate task BO (%u bytes)", task_size);
