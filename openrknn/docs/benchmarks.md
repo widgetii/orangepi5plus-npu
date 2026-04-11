@@ -3,101 +3,154 @@
 Latency comparison between openrknn's OWN mode and the vendor
 `librknnrt.so` on the 7 runtime models from `tests/ground_truth.json`.
 
+## TL;DR
+
+- **Single-core: parity with vendor on all 5 runtime models** (within
+  noise, −0.2% to −1.5% on average latency). openrknn's from-scratch
+  submit path doesn't add any measurable per-run overhead.
+- **Multi-core: openrknn loses 1.31×–1.87× on 4/5 models** because
+  `orknn_npu_submit` in `openrknn_drm.c` hardcodes `core_mask=0x0` and
+  silently ignores whatever the user sets via `rknn_set_core_mask`. The
+  mask is stored in `ctx->core_mask` but never plumbed into the
+  ioctl descriptor. Tracked by [#60][i60].
+
+[i60]: https://github.com/widgetii/orangepi5plus-npu/issues/60
+
 ## Method
 
 - **Hardware**: Orange Pi 5 Plus (RK3588, 16 GB LPDDR4X, Armbian 25.11.1)
-- **NPU**: single core, `core_mask=0x1` on both sides
 - **CPU governor**: `performance` on all 8 cores
-- **Iterations**: 200 measured per run, plus `bench_rknn`'s internal
-  warmup
-- **Harness**: `openrknn/tests/bench_openrknn.py`, which shells out to
-  `librocketnpu/tests/bench_rknn` under three configurations:
+- **Measurement**: ctypes harness calls `rknn_init` + `rknn_set_core_mask(ctx, mask)`
+  + `rknn_inputs_set` + 500× `rknn_run` after 20-iter warmup. Wall-clock
+  timing via `time.perf_counter_ns()`.
+- **Core masks compared**: `RKNN_NPU_CORE_0 (0x1)` and
+  `RKNN_NPU_CORE_0_1_2 (0x7)`
+- **Per-core load verified** via `/sys/kernel/debug/rknpu/load` polled
+  during each run
 
-  | Config | Env | What it measures |
-  |--------|-----|------------------|
-  | `vendor` | (none) | `bench_rknn` linked against `/lib/librknnrt.so` directly — vendor baseline |
-  | `proxy`  | `LD_PRELOAD=openrknn/librknn_api.so` | openrknn's proxy-dispatch path: shim dlopens vendor lib and forwards every call |
-  | `own`    | `LD_PRELOAD=openrknn/librknn_api.so ORKNN_OWN=init,query,input,run,outputs` | openrknn's from-scratch path: FB parse, FB-derived segments, in-place regcmd patching, single-core NPU submit |
+The earlier `tests/bench_openrknn.py` script (which shells out to
+`librocketnpu/tests/bench_rknn`) is useful for quick sanity checks but
+doesn't set `core_mask` explicitly and has measurement artefacts on the
+shortest model (mobilenet_v1 first-iter warmup leaks into the average).
+The numbers below come from the ctypes harness, which bypasses that.
 
-  For `fp16_parse` models (mobilesam_encoder, lprnet) the OWN path is
-  `init,query` only — NPU extraction returns early so the run path
-  falls through to proxy dispatch. That's still a valid measurement of
-  combined openrknn-init + vendor-run latency.
+## Single-core (RKNN_NPU_CORE_0): parity
 
-## Results (2026-04-11, master @ c7b432a)
+| Model             | vendor (ms) | openrknn (ms) | gap     |
+|-------------------|------------:|--------------:|--------:|
+| mobilenet_v1      |    1.98     |     1.95      |  −1.5%  |
+| resnet50          |    9.13     |     9.08      |  −0.5%  |
+| yolov5s_relu_int8 |   18.61     |    18.47      |  −0.7%  |
+| yolov8n           |   16.29     |    16.09      |  −1.3%  |
+| deeplabv3         |   28.85     |    28.79      |  −0.2%  |
 
-| Model | vendor avg/min (ms) | proxy avg/min (ms) | own avg/min (ms) | own vs vendor |
-|-------|--------------------:|-------------------:|-----------------:|--------------:|
-| mobilenet_v1      | 2.87 / 2.81   | 1.99 / 1.95   | **1.95 / 1.91**   | **−32.1%** |
-| resnet50          | 9.15 / 9.14   | 9.17 / 9.15   | **9.08 / 9.08**   | −0.8% |
-| yolov5s_relu_int8 | 18.80 / 18.67 | 18.75 / 18.64 | **18.48 / 18.28** | −1.7% |
-| yolov8n           | 16.38 / 15.65 | 16.33 / 15.52 | **16.08 / 15.13** | −1.8% |
-| deeplabv3         | 28.92 / 28.89 | 28.92 / 28.91 | **28.79 / 28.78** | −0.4% |
-| mobilesam_encoder *(fp16, OWN init+query only)* | 102.24 / 102.06 | 102.37 / 101.90 | 102.21 / 101.96 | −0.0% |
-| lprnet *(fp16, OWN init+query only)*            | 1.74 / 1.71     | 1.74 / 1.74     | 1.78 / 1.74     | +2.3% |
+Negative means openrknn is faster; all five are within measurement noise.
+`/sys/kernel/debug/rknpu/load` shows **Core 0 only** active for both
+paths (0% on Core 1/2).
 
-**Negative = openrknn OWN is faster.** Parity on 6/7 models, a large
-win on mobilenet_v1, and no material regressions on any model. The
-+2.3% on lprnet is well within measurement noise at a 1.74 ms baseline
-(≈40 µs absolute).
+**Takeaway:** openrknn's FB-derived segment submit path has no extra
+overhead vs the vendor's runtime loop. The per-run cost is dominated by
+the NPU-bound compute and the cache-sync ioctls, which both paths do
+identically.
 
-### Why mobilenet_v1 shows a 32% win
+## Triple-core (RKNN_NPU_CORE_0_1_2): gap
 
-The vendor's `bench_rknn` output for this model has higher variance
-than openrknn's — vendor avg 2.87 ms vs min 2.81 ms, openrknn avg
-1.95 ms vs min 1.91 ms. The min values also favor openrknn by 0.9 ms
-consistently, so the gap isn't pure variance. Likely contributors:
+| Model             | vendor (ms) | openrknn (ms) | gap       | single→triple speedup (vendor) |
+|-------------------|------------:|--------------:|----------:|-------------------------------:|
+| mobilenet_v1      |    **1.04** |     1.95      |  **+87%** |  1.90× |
+| resnet50          |    **6.91** |     9.08      |  **+31%** |  1.32× |
+| yolov5s_relu_int8 |   **12.58** |    18.50      |  **+47%** |  1.48× |
+| yolov8n           |   16.35     |    16.03      |   −2.0%   |  1.00× *(model doesn't parallelise)* |
+| deeplabv3         |   **18.95** |    28.79      |  **+52%** |  1.52× |
 
-1. openrknn's first run pays a one-time `patch_regcmd_addresses` cost
-   (~5 ms); subsequent runs go straight to submit. The vendor may be
-   redoing some per-run work we skip.
-2. MBv1 is the smallest model, so per-run fixed overhead (cache syncs,
-   ioctl setup) dominates. A 100 µs difference in that fixed cost
-   shows up as a large percentage.
-3. openrknn's output path skips a few vendor-side sanity checks that
-   cost microseconds per call.
+Positive means openrknn is slower. On every model the vendor can
+parallelise, openrknn gives up 1.31×–1.87× because it silently falls
+back to single-core. yolov8n is the only model where even the vendor
+sees no speedup — its compiled segments don't distribute across cores,
+so openrknn's single-core execution is just as fast.
 
-The absolute saving is ~0.9 ms per inference. On larger models the
-absolute saving is smaller or zero because the NPU-bound computation
-dominates.
+**Takeaway:** the multi-core gap is the single biggest practical
+limitation of openrknn today. Any application that calls
+`rknn_set_core_mask(RKNN_NPU_CORE_0_1_2)` is silently getting
+single-core execution.
+
+## Why openrknn ignores the user's core_mask
+
+`rknn_set_core_mask` stores the requested mask in `ctx->core_mask`
+(see `openrknn_api.c:322`), but `orknn_npu_submit` in
+`openrknn_drm.c:270` hardcodes the ioctl descriptor's `core_mask`
+field to `0x0`:
+
+```c
+struct rknpu_submit sub = {
+    .flags = seg->flags | RKNPU_JOB_BLOCK,
+    .task_start = seg->sc_start,
+    .task_number = seg->task_number,
+    .task_obj_addr = task_bo->obj_addr,
+    .core_mask = 0x0,   /* <-- ignores ctx->core_mask */
+    .subcore_task = {
+        { seg->sc_start, seg->sc_count },
+        { seg->sc_start, seg->sc_count },
+        { seg->sc_start, seg->sc_count },
+        { seg->sc_start, seg->sc_count },
+        { seg->sc_start, seg->sc_count },
+    },
+};
+```
+
+Wiring `ctx->core_mask` through to the submit isn't enough on its own:
+for a real multi-core speedup the segment needs `task_number =
+sc_count × active_cores` (the cross-core replica count) and each of
+the 5 `subcore_task` entries needs a core-specific `(task_start,
+task_count)` slice. The .rknn task BO already contains those replicas
+— we just need to map them. See [#60][i60] for the full design sketch.
 
 ## How to reproduce
 
-On the Orange Pi 5 Plus (or any RK3588 board with `/lib/librknnrt.so`
-installed and the `librocketnpu/tests/bench_rknn` binary available):
+The numbers above came from a one-off ctypes harness (not committed —
+it's too specific to this diagnosis). To reproduce:
 
 ```bash
-# Switch to performance governor
+ssh root@<board>
 for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
     echo performance > "$g"
 done
 
-# Build openrknn
-make -C openrknn
-
-# Run the benchmark (200 iters per configuration)
-python3 openrknn/tests/bench_openrknn.py \
+# The committed single-core-only benchmark (uses bench_rknn):
+python3 /path/to/openrknn/tests/bench_openrknn.py \
     --bench /path/to/librocketnpu/tests/bench_rknn \
-    --lib   openrknn/librknn_api.so \
-    --models-dir /path/to/rknn_model_zoo/models \
-    --ground-truth openrknn/tests/ground_truth.json \
-    --iters 200
+    --lib   /path/to/openrknn/librknn_api.so \
+    --models-dir /path/to/models \
+    --ground-truth /path/to/openrknn/tests/ground_truth.json \
+    --iters 500
 
-# Restore governor
-for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    echo ondemand > "$g"
-done
+# Monitor per-core load while it runs:
+watch -n 0.3 cat /sys/kernel/debug/rknpu/load
 ```
 
-The script prints a markdown table identical to the one in this file.
-Re-running on different kernel versions or DVFS states should give
-comparable numbers; if OWN mode ever regresses materially vs vendor,
-file an issue with the bench output attached.
+For the full triple-core comparison, you need to link a benchmark
+program against librknn_api.so, call `rknn_set_core_mask(ctx, 0x7)`
+before the run loop, and compare vendor vs openrknn explicitly. That
+harness will be committed alongside the fix for [#60][i60].
+
+## Side-finds from this benchmark
+
+1. **deeplabv3 query mismatch** — openrknn's `rknn_query(RKNN_QUERY_INPUT_ATTR)`
+   result for deeplabv3 differs from the vendor's by one byte at offset
+   360. Dims/scale/zp/name all match, just one flag byte. Cosmetic but
+   should be fixed; file a separate issue before it confuses someone.
+2. **`bench_openrknn.py` first-iter leakage** — the earlier benchmark
+   reported −32% for mobilenet_v1 because the vendor's first few
+   iterations at cold NPU state ran ~3 ms each and weren't fully
+   washed out by bench_rknn's internal warmup. The ctypes harness with
+   a 20-iter explicit warmup eliminates this. The committed
+   `bench_openrknn.py` inherits the issue but it only matters for
+   models under ~3 ms; larger models are unaffected.
 
 ## Related
 
-- Tracked in issue [#66](https://github.com/widgetii/orangepi5plus-npu/issues/66)
-- Umbrella roadmap: [#68](https://github.com/widgetii/orangepi5plus-npu/issues/68)
-- Correctness validation (accuracy, not latency) lives in
-  `tests/ci_validate.sh` Phase 2 — every model passes 7/7 in OWN mode
-  with zero vendor runtime dependencies
+- [#60][i60] — Multi-core batch inference (this is the fix)
+- [#66](https://github.com/widgetii/orangepi5plus-npu/issues/66) —
+  Tracking issue for this benchmark
+- [#68](https://github.com/widgetii/orangepi5plus-npu/issues/68) —
+  Roadmap umbrella
