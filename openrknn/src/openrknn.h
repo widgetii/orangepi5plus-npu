@@ -324,7 +324,7 @@ void orknn_bo_destroy(int fd, struct orknn_bo *bo);
 int  orknn_bo_sync_to_device(int fd, struct orknn_bo *bo);
 int  orknn_bo_sync_from_device(int fd, struct orknn_bo *bo);
 int  orknn_npu_submit(int fd, struct orknn_bo *task_bo,
-                      struct orknn_segment *seg);
+                      struct orknn_segment *seg, uint32_t core_mask);
 
 /* ======================================================================
  * Own implementations (phases 2-6)

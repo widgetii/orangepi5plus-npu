@@ -1379,7 +1379,8 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
      * slice into the NPU. No per-cycle rewrites needed (see task 9.4). */
     for (uint32_t i = 0; i < max_segs; i++) {
         struct orknn_segment *seg = &m->segments[i];
-        int ret = orknn_npu_submit(ctx->npu_fd, &ctx->task_bo, seg);
+        int ret = orknn_npu_submit(ctx->npu_fd, &ctx->task_bo, seg,
+                                   ctx->core_mask);
         if (ret) {
             orknn_log(0, "run: segment %u submit failed", i);
             return RKNN_ERR_FAIL;
