@@ -54,10 +54,20 @@ static int scan_blob_offsets(struct orknn_model *m, struct bo1_blob_info *blobs,
     return count;
 }
 
-/* Copy the proxy's fully-patched regcmd into our weight BO, then
- * rebase DMA addresses from proxy BO layout to ours.
- * This handles FC layers and other operations where the template
- * regcmd is completely rewritten by the runtime. */
+/* Load the proxy/vendor's side-state from /tmp/rknn_dump: input-BO
+ * cache (for W-padding), proxy BO address metadata, and per-output
+ * sig-search for the activation-BO offsets where the final output
+ * tensors live. Template-patch in patch_regcmd_addresses already
+ * writes the regcmd byte-exact so we no longer copy the vendor's
+ * weight BO or rebase DMA addresses — this function ONLY handles
+ * the execution-side state that the template-patch path cannot yet
+ * derive from FB metadata alone.
+ *
+ * This function still depends on /tmp/rknn_dump/ being populated by
+ * bench_rknn via validate_accuracy.py --populate-dumps. Phase 9's
+ * next step is replacing these last dump reads with FB-derived
+ * equivalents (output discovery from sg_output tensor f13 offsets,
+ * W-padding bytes from mean/std/zp). */
 static int copy_proxy_regcmd(struct orknn_context *ctx)
 {
     if (!ctx->real_ctx) return -1;
@@ -83,52 +93,14 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
     }
     proxy->rknn_run(ctx->real_ctx, NULL);
 
-    /* Now the proxy's BOs have fully-patched data.
-     * We need to read the proxy's weight BO. Unfortunately we can't
-     * directly access proxy BOs — they're in the proxy's address space.
-     *
-     * Alternative: use rknn_query to check if the model ran, then
-     * read the output. But we actually need the regcmd data...
-     *
-     * For now: check if an intercept dump exists at /tmp/rknn_dump/ */
-    char path[128];
-    snprintf(path, sizeof(path), "/tmp/rknn_dump/sub1_bo_001_%uB.bin",
-             ctx->weight_bo.size);
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        /* Try common sizes */
-        for (uint32_t sz = ctx->weight_bo.size; sz > 0; sz -= 4096) {
-            snprintf(path, sizeof(path), "/tmp/rknn_dump/sub1_bo_001_%uB.bin", sz);
-            f = fopen(path, "rb");
-            if (f) break;
-        }
-    }
-    if (!f) {
-        orknn_log(1, "run: no proxy BO dump found, using template patching");
-        return -1;
-    }
-
-    /* Read proxy's weight BO */
+    /* Need a dummy proxy_bo allocation so free() at the end is safe.
+     * The BO contents are no longer read; we trust template-patch. */
     uint32_t rc_off = (uint32_t)(m->regcmd_data - m->wt_data);
-    uint8_t *proxy_bo = calloc(1, ctx->weight_bo.size);
-    size_t nread = fread(proxy_bo, 1, ctx->weight_bo.size, f);
-    fclose(f);
+    (void)rc_off;
+    uint8_t *proxy_bo = NULL;
 
-    if (nread < rc_off + m->regcmd_size) {
-        orknn_log(0, "run: proxy BO dump too small (%zu < %u)", nread, rc_off + m->regcmd_size);
-        free(proxy_bo);
-        return -1;
-    }
-
-    /* Copy the ENTIRE proxy BO[1] into our weight BO.
-     * This includes both weight data and regcmd — ensures all runtime-
-     * patched register values are correct. Weight data is the same as
-     * ours (from the .rknn file), so only the regcmd section differs. */
-    uint32_t copy_size = nread < ctx->weight_bo.size ? (uint32_t)nread : ctx->weight_bo.size;
-    memcpy(ctx->weight_bo.map, proxy_bo, copy_size);
-    orknn_log(1, "run: copied proxy BO[1] (%u bytes)", copy_size);
-
-    /* Now rebase DMA addresses from proxy layout to ours.
+    /* Parse proxy BO address metadata from submit_1.txt so we can
+     * locate BO[3] (input) and BO[4..n] (outputs) in the dump.
      * Parse all proxy BOs from the dump metadata.
      * BO[0] = task BO (skip)
      * BO[1] = weight BO
@@ -191,113 +163,7 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
         }
     }
 
-    uint32_t our_wt = (uint32_t)ctx->weight_bo.dma_addr;
-    uint32_t our_act = (uint32_t)ctx->activation_bo.dma_addr;
-    uint32_t our_in = ctx->input_bos ? (uint32_t)ctx->input_bos[0].dma_addr : 0;
-
-    orknn_log(1, "run: rebasing DMA: proxy_wt=0x%x act=0x%x in=0x%x (%d BOs)",
-              proxy_wt, proxy_act, proxy_in, n_proxy_bos);
-    orknn_log(1, "run:               ours_wt=0x%x act=0x%x in=0x%x",
-              our_wt, our_act, our_in);
-
-    /* Build output BO mapping: proxy BO[4..n] → our output BOs[0..n_outputs).
-     * The proxy may have FEWER output BOs than our n_outputs (some are
-     * stored in the activation BO instead). Match by index. */
-    uint32_t proxy_out_dma[16] = {0}, proxy_out_size[16] = {0};
-    uint32_t our_out_dma[16] = {0};
-    int n_out_bos = 0;
-    for (int b = 4; b < n_proxy_bos && n_out_bos < 16; b++) {
-        if (n_out_bos < (int)m->n_outputs && ctx->output_bos) {
-            proxy_out_dma[n_out_bos] = proxy_bo_dma[b];
-            proxy_out_size[n_out_bos] = proxy_bo_sizes[b];
-            our_out_dma[n_out_bos] = (uint32_t)ctx->output_bos[n_out_bos].dma_addr;
-            n_out_bos++;
-        }
-    }
-    for (int k = 0; k < n_out_bos; k++) {
-        orknn_log(2, "run: output BO[%d] proxy=0x%x->ours=0x%x size=%u",
-                  k, proxy_out_dma[k], our_out_dma[k], proxy_out_size[k]);
-    }
-
-    /* Rebase DMA addresses: only touch registers that are actually DMA
-     * address registers AND whose values fall in a known proxy BO range. */
-    uint64_t *rc = (uint64_t *)((uint8_t *)ctx->weight_bo.map + rc_off);
-    uint32_t rc_entries = m->regcmd_size / 8;
-    uint32_t rebased = 0;
-
-    uint32_t pw_end = proxy_wt + (proxy_bo_sizes[1] ? proxy_bo_sizes[1] : ctx->weight_bo.size);
-    uint32_t pa_end = proxy_act + (proxy_bo_sizes[2] ? proxy_bo_sizes[2] : ctx->activation_bo.size);
-    uint32_t pi_end = proxy_in + (proxy_bo_sizes[3] ? proxy_bo_sizes[3] : 0x100000);
-    /* Proxy task BO (BO[0]) — models like ResNet50 embed per-task CVT
-     * scale/offset tables inline in the task BO and reference them via
-     * DMA pointers in the regcmd. */
-    uint32_t proxy_task = proxy_bo_dma[0];
-    uint32_t pt_end = proxy_task + proxy_bo_sizes[0];
-    uint32_t our_task = (uint32_t)ctx->task_bo.dma_addr;
-
-    /* Known DMA address registers (verified from librocketnpu rnpu_registers.h
-     * plus empirically from ResNet50 regcmd analysis). */
-    #define IS_DMA_REG(r) ( \
-        (r) == 0x0010 || /* PC_BASE_ADDRESS */ \
-        (r) == 0x1070 || /* CNA_SRC_BASE */ \
-        (r) == 0x1110 || /* RDMA_WT_BASE */ \
-        (r) == 0x1184 || /* CNA per-task CVT table ptr (ResNet50) */ \
-        (r) == 0x4020 || /* DPU_DST_BASE */ \
-        (r) == 0x4074 || /* DPU per-task data ptr (ResNet50) */ \
-        (r) == 0x4080 || /* DPU_OUT_CVT_OFFSET table ptr (ResNet50) */ \
-        (r) == 0x4110 || /* WDMA_BASE */ \
-        (r) == 0x5018 || /* RDMA activation */ \
-        (r) == 0x5020 || /* RDMA_BS_BASE */ \
-        (r) == 0x502c || /* RDMA BS extended ptr (ResNet50) */ \
-        (r) == 0x5038 || /* RDMA related */ \
-        (r) == 0x6070 || /* PC related */ \
-        (r) == 0x701c    /* PC related */ \
-    )
-
-    for (uint32_t i = 0; i < rc_entries; i++) {
-        uint16_t reg = rc[i] & 0xFFFF;
-        uint32_t val = (rc[i] >> 16) & 0xFFFFFFFF;
-        if (val == 0) continue;
-        if (!IS_DMA_REG(reg)) continue;
-
-        uint32_t new_val = val;
-        int matched = 0;
-
-        if (val >= proxy_wt && val < pw_end) {
-            new_val = our_wt + (val - proxy_wt);
-            matched = 1;
-        } else if (val >= proxy_act && val < pa_end) {
-            new_val = our_act + (val - proxy_act);
-            matched = 1;
-        } else if (proxy_in && val >= proxy_in && val < pi_end) {
-            new_val = our_in + (val - proxy_in);
-            matched = 1;
-        } else if (proxy_task && val >= proxy_task && val < pt_end) {
-            new_val = our_task + (val - proxy_task);
-            matched = 1;
-        } else {
-            /* Check each output BO range */
-            for (int k = 0; k < n_out_bos; k++) {
-                uint32_t pob = proxy_out_dma[k];
-                uint32_t pob_end = pob + proxy_out_size[k];
-                if (val >= pob && val < pob_end) {
-                    new_val = our_out_dma[k] + (val - pob);
-                    matched = 1;
-                    break;
-                }
-            }
-        }
-
-        if (!matched) continue;
-
-        if (new_val != val) {
-            rc[i] = (rc[i] & 0xFFFF000000000000ULL) |
-                    ((uint64_t)new_val << 16) | (rc[i] & 0xFFFF);
-            rebased++;
-        }
-    }
-
-    orknn_log(1, "run: rebased %u DMA entries", rebased);
+    (void)proxy_wt; (void)proxy_act; (void)proxy_in;
 
     /* Discover output offsets in the activation BO.
      * The graph memory planner places each output tensor at a specific
@@ -679,22 +545,22 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
         }
     }
 
-    /* Task BO regcmd_addr values were already set correctly by
-     * orknn_alloc_model_bos — don't rebase them. */
-    orknn_bo_sync_to_device(ctx->npu_fd, &ctx->weight_bo);
-
+    /* Template-patch in patch_regcmd_addresses writes the final
+     * weight BO contents and issues its own sync_to_device at the end,
+     * so this function no longer touches the weight BO. */
     free(proxy_bo);
     return 0;
 }
 
 static void patch_regcmd_addresses(struct orknn_context *ctx)
 {
-    /* Try to use proxy's fully-patched regcmd first.
-     * This handles FC layers and complex operations correctly.
-     * ORKNN_FORCE_TEMPLATE=1 skips the proxy path so the template-patch
-     * code below runs unconditionally — used by the phase-0 diff oracle
-     * to surface per-register discrepancies against the vendor BO[1]. */
-    if (!getenv("ORKNN_FORCE_TEMPLATE") && copy_proxy_regcmd(ctx) == 0) return;
+    /* Load proxy-side state from /tmp/rknn_dump (proxy_input_cache
+     * for W-padding, output sig-search for act BO offsets). This is a
+     * non-fatal side-effect pass — if the dump is missing the template
+     * path still runs, but models whose outputs live in the activation
+     * BO (mobilenet_v1, resnet50, deeplabv3) will read garbage from
+     * outputs_get. Phase 9 is gradually removing these dump reads. */
+    copy_proxy_regcmd(ctx);
 
     struct orknn_model *m = &ctx->model;
     uint32_t rc_off = (uint32_t)(m->regcmd_data - m->wt_data);
