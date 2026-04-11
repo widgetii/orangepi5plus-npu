@@ -152,6 +152,19 @@ struct orknn_op_info {
      * Both fields default to UINT32_MAX (no match found). */
     uint32_t implicit_wt_tidx;
     uint32_t implicit_bs_tidx;
+
+    /* Per-stage weight tensor indices for exSoftmax13 ops. The softmax
+     * lowering emits three em=0x0d tasks (ReduceMax -> rescale -> ReduceSum)
+     * and each reads CNA_WT from a distinct compile-time blob. Two of
+     * the blobs (_ReduceMax_output_weight and _reducesum_output_weight)
+     * are top-level tensors that aren't in input_tensors[] and we
+     * resolve them via name-suffix matching against the output tensor's
+     * name. The rescale blob IS in input_tensors[2] so it doesn't need
+     * its own slot.
+     *
+     * Both fields default to UINT32_MAX (no match found). */
+    uint32_t softmax_rmax_tidx;
+    uint32_t softmax_rsum_tidx;
 };
 
 /* ======================================================================

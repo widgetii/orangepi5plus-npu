@@ -171,13 +171,11 @@ run_phase "Phase 2: openrknn OWN path (full pipeline)" "$LIB" \
 # and continue; see the comment on DIFF_ALLOWLIST for the list and why each
 # entry is there.
 
-# Models allowed to have template-patch regcmd diffs. Each entry documents
-# the root-cause op so we can remove it once fixed.
-#
-#   mobilenet_v1 : op 30 exSoftmax13 DST/SRC + em=0x0d CNA_DCOMP_ADDR0
-#                  and CNA_FEATURE_DATA_ADDR left unpatched. 28 DMA-class
-#                  diffs. Fix blocks phase 9 (delete copy_proxy_regcmd).
-DIFF_ALLOWLIST="mobilenet_v1"
+# Models allowed to have template-patch regcmd diffs. Empty right now —
+# all five runtime models in ground_truth.json are byte-exact against the
+# vendor oracle. Keeping the hook here for future models; add an entry
+# and document the root-cause op when a new allowlist is needed.
+DIFF_ALLOWLIST=""
 
 is_allowlisted() {
     case " $DIFF_ALLOWLIST " in

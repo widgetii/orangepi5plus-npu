@@ -609,6 +609,8 @@ static void parse_fb_operators(const uint8_t *fb, struct orknn_model *m)
     for (uint32_t i = 0; i < n_ops; i++) {
         ops[i].implicit_wt_tidx = UINT32_MAX;
         ops[i].implicit_bs_tidx = UINT32_MAX;
+        ops[i].softmax_rmax_tidx = UINT32_MAX;
+        ops[i].softmax_rsum_tidx = UINT32_MAX;
     }
 
     for (uint32_t i = 0; i < n_ops; i++) {
@@ -689,6 +691,58 @@ static void parse_fb_operators(const uint8_t *fb, struct orknn_model *m)
                              "(matched `%s_*`)", i, ops[i].type,
                           ops[i].implicit_wt_tidx,
                           ops[i].implicit_bs_tidx, in0_name);
+            }
+        }
+
+        /* exSoftmax13 compile-time weight tensors. MobileNet's softmax
+         * lowering generates three em=0x0d tasks — ReduceMax, rescale,
+         * and ReduceSum — each with its own CNA weight blob. The
+         * rescale blob is in input_tensors[2] already; the ReduceMax
+         * and ReduceSum blobs are top-level tensors whose names match
+         *   `{output[0].name}_ReduceMax_output_weight*`
+         *   `{output[0].name}_reducesum_output_weight*`
+         * (the lowercase `reducesum` and uppercase `ReduceMax` are the
+         * compiler's actual naming). */
+        for (uint32_t i = 0; i < n_ops; i++) {
+            if (strncmp(ops[i].type, "exSoftmax", 9) != 0) continue;
+            if (ops[i].output_count == 0) continue;
+            uint32_t out0 = ops[i].output_tensors[0];
+            if (out0 >= n_tensors) continue;
+            uint32_t out0_tbl = orknn_fb_vec_at(fb, tensors_fpos, out0);
+            if (!out0_tbl) continue;
+            uint32_t out0_name_f = orknn_fb_field(fb, out0_tbl, 5);
+            if (!out0_name_f) continue;
+            char out0_name[128];
+            orknn_fb_string(fb, out0_name_f, out0_name, sizeof(out0_name));
+            size_t prefix_len = strlen(out0_name);
+            if (prefix_len == 0) continue;
+            for (uint32_t t = 0; t < n_tensors; t++) {
+                uint32_t tbl = orknn_fb_vec_at(fb, tensors_fpos, t);
+                if (!tbl) continue;
+                uint32_t name_f = orknn_fb_field(fb, tbl, 5);
+                if (!name_f) continue;
+                char name[128];
+                orknn_fb_string(fb, name_f, name, sizeof(name));
+                if (strncmp(name, out0_name, prefix_len) != 0) continue;
+                if (name[prefix_len] != '_') continue;
+                const char *suffix = name + prefix_len + 1;
+                if (strstr(suffix, "ReduceMax_output_weight") &&
+                    ops[i].softmax_rmax_tidx == UINT32_MAX) {
+                    ops[i].softmax_rmax_tidx = t;
+                } else if (strstr(suffix, "reducesum_output_weight") &&
+                           ops[i].softmax_rsum_tidx == UINT32_MAX) {
+                    ops[i].softmax_rsum_tidx = t;
+                }
+                if (ops[i].softmax_rmax_tidx != UINT32_MAX &&
+                    ops[i].softmax_rsum_tidx != UINT32_MAX)
+                    break;
+            }
+            if (ops[i].softmax_rmax_tidx != UINT32_MAX ||
+                ops[i].softmax_rsum_tidx != UINT32_MAX) {
+                orknn_log(2, "model: op[%u] %s softmax rmax=%u rsum=%u",
+                          i, ops[i].type,
+                          ops[i].softmax_rmax_tidx,
+                          ops[i].softmax_rsum_tidx);
             }
         }
     }

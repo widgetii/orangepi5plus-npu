@@ -950,6 +950,14 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
     uint32_t prev_op_for_sub = UINT32_MAX;
     int prev_em_for_sub = -1;
     uint32_t reformat_sub_idx = 0;
+    /* exSoftmax13 em=0x0d sub-task counter. The softmax lowering emits
+     * three em=0x0d tasks per op (ReduceMax, rescale, ReduceSum) and
+     * each reads CNA_WT_BASE from a different compile-time weight blob.
+     * We track this counter separately from reformat_sub_idx (which
+     * tracks em=0x18) because both groups live in the same op's task
+     * sequence and their sub-indices advance independently. */
+    uint32_t prev_op_for_em0d = UINT32_MAX;
+    uint32_t em0d_sub_idx = 0;
     for (uint32_t t = 0; t < src_count; t++) {
         uint32_t amt = tasks[t].f[6];
         uint32_t enable_mask = tasks[t].f[2];
@@ -987,16 +995,37 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         int is_reformat = (enable_mask == 0x18);
         uint32_t op = tasks[t].f[1]; /* op_idx */
 
-        /* Update the REFORMAT sub-task counter (see the declaration
-         * above the task loop for the rationale). */
-        if (is_reformat && (int)enable_mask == prev_em_for_sub &&
-            op == prev_op_for_sub) {
-            reformat_sub_idx++;
-        } else {
+        /* Update the REFORMAT sub-task counter. Only increments for
+         * em=0x18 tasks and only resets when op_idx changes. Non-
+         * REFORMAT tasks (em=0x0d softmax continuations) pass through
+         * without affecting the counter, so exSoftmax's interleaved
+         * 0x18/0x0d sequence still assigns `first em=0x18 task = sub 0`
+         * regardless of how many em=0x0d tasks sat in between. */
+        (void)prev_em_for_sub;
+        if (is_reformat) {
+            if (op == prev_op_for_sub) {
+                reformat_sub_idx++;
+            } else {
+                reformat_sub_idx = 0;
+            }
+            prev_op_for_sub = op;
+        } else if (op != prev_op_for_sub) {
             reformat_sub_idx = 0;
+            prev_op_for_sub = UINT32_MAX;
         }
-        prev_op_for_sub = op;
-        prev_em_for_sub = enable_mask;
+
+        /* exSoftmax em=0x0d sub-task counter — see the declaration
+         * above the task loop. Resets per op, counts em=0x0d tasks. */
+        int is_em0d = (enable_mask == 0x0d);
+        if (is_em0d && op == prev_op_for_em0d) {
+            em0d_sub_idx++;
+        } else if (is_em0d) {
+            em0d_sub_idx = 0;
+            prev_op_for_em0d = op;
+        } else if (op != prev_op_for_em0d) {
+            em0d_sub_idx = 0;
+            prev_op_for_em0d = UINT32_MAX;
+        }
 
         /* Find this task's WT/BS offsets from per-op table */
         uint32_t task_wt_off = 0, task_bs_off = 0;
@@ -1072,15 +1101,22 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                         reformat_sub_idx < oi->input_count) {
                         /* Concat: one sub-task per input tensor. */
                         sub = reformat_sub_idx;
-                    } else if (strcmp(oi->type, "Transpose") == 0 &&
+                    } else if ((strcmp(oi->type, "Transpose") == 0 ||
+                                strncmp(oi->type, "exSoftmax", 9) == 0) &&
                                oi->input_count >= 2 &&
                                reformat_sub_idx > 0) {
-                        /* Transpose: sub-task 0 reads input[0], all
-                         * subsequent sub-tasks read from the scratch
-                         * tensor at input[1] regardless of how many
-                         * tasks the lowering emits. */
+                        /* Transpose and exSoftmax13 share the same
+                         * scratch pattern: sub-task 0 reads input[0]
+                         * (real data), all subsequent sub-tasks read
+                         * from the scratch tensor at input[1]. */
                         sub = 1;
                     }
+                } else if (enable_mask == 0x0d &&
+                           strncmp(oi->type, "exSoftmax", 9) == 0 &&
+                           oi->input_count >= 2) {
+                    /* exSoftmax em=0x0d tasks always read from the
+                     * scratch tensor (never from the real input). */
+                    sub = 1;
                 }
                 uint32_t tidx = oi->input_tensors[sub];
                 if (tidx < m->tensor_count) {
@@ -1125,17 +1161,26 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     }
                 }
             }
-            /* Transpose DST override: intermediate REFORMATs stage data
-             * through input_tensors[1] in the activation BO, not the
-             * op's real output tensor. Only the FINAL task in the
-             * Transpose chain writes to the real output (handled in
-             * the 0x4020 case via the pre-patch val == 0 marker). */
-            if (is_reformat && strcmp(oi->type, "Transpose") == 0 &&
+            /* Scratch-tensor DST override: both Transpose and
+             * exSoftmax13 emit multi-REFORMAT / em=0x0d chains that
+             * stage intermediate data through input_tensors[1] in the
+             * activation BO. Only the final REFORMAT in the chain
+             * writes to the real output — we detect that later via a
+             * next-task lookahead and flip dst_tensor_off back. The
+             * em=0x0d softmax continuation tasks always target the
+             * scratch tensor. The output-override is applied after
+             * the scratch-final flag is set (see below). */
+            int op_uses_scratch =
+                (strcmp(oi->type, "Transpose") == 0 ||
+                 strncmp(oi->type, "exSoftmax", 9) == 0);
+            if (op_uses_scratch &&
+                (is_reformat || enable_mask == 0x0d) &&
                 oi->input_count >= 2) {
                 uint32_t tidx = oi->input_tensors[1];
                 if (tidx < m->tensor_count)
                     dst_tensor_off = m->tensor_offsets[tidx];
             }
+            (void)op_uses_scratch;
             if (oi->input_count > 3) {
                 uint32_t tidx = oi->input_tensors[3];
                 if (tidx < m->tensor_count)
@@ -1346,25 +1391,78 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 do_wpad = 1;
         }
 
-        /* Transpose final-task detection: the multi-REFORMAT lowering
-         * for Transpose writes intermediate data into input_tensors[1]
-         * (a scratch tensor) and only the last REFORMAT of the group
-         * copies the result to the op's real output. Flag this task as
-         * "final" iff the next task in the source belongs to a
-         * different op or enable mask (i.e. we are the tail of a
-         * contiguous same-op REFORMAT run). */
-        int is_transpose = 0;
-        int is_transpose_final = 0;
-        if (is_reformat && m->ops && op < m->op_count &&
-            strcmp(m->ops[op].type, "Transpose") == 0) {
-            is_transpose = 1;
-            if (t + 1 < src_count) {
-                uint32_t next_op = tasks[t + 1].f[1];
-                uint32_t next_em = tasks[t + 1].f[2];
-                if (next_op != op || next_em != enable_mask)
-                    is_transpose_final = 1;
-            } else {
-                is_transpose_final = 1;
+        /* Scratch-chain final-task detection: Transpose and exSoftmax
+         * both lower to a chain of REFORMAT (em=0x18) tasks that stage
+         * intermediate data through input_tensors[1] and only the last
+         * REFORMAT in the group copies the result to the op's real
+         * output. Flag the current task as "final" iff it's a REFORMAT
+         * AND the next task is different (different op, or next-is-not
+         * a REFORMAT) — i.e. we are the tail of a contiguous same-op
+         * REFORMAT run. exSoftmax em=0x0d continuation tasks never
+         * touch the real output, they always target the scratch. */
+        int is_scratch_op = 0;
+        int is_scratch_final = 0;
+        if (is_reformat && m->ops && op < m->op_count) {
+            const char *typ = m->ops[op].type;
+            if (strcmp(typ, "Transpose") == 0 ||
+                strncmp(typ, "exSoftmax", 9) == 0) {
+                is_scratch_op = 1;
+                /* Walk forward past trailing non-REFORMAT same-op tasks
+                 * (exSoftmax interleaves em=0x18 and em=0x0d; the real
+                 * last DMA write is the final em=0x18 before op_idx
+                 * changes). */
+                int found_later_reformat = 0;
+                for (uint32_t s = t + 1; s < src_count; s++) {
+                    uint32_t nxt_op = tasks[s].f[1];
+                    if (nxt_op != op) break;
+                    if (tasks[s].f[2] == 0x18) {
+                        found_later_reformat = 1;
+                        break;
+                    }
+                }
+                if (!found_later_reformat)
+                    is_scratch_final = 1;
+            }
+        }
+        /* Kept as aliases so the existing patch-site code keeps
+         * working without a rename pass. */
+        int is_transpose = is_scratch_op;
+        int is_transpose_final = is_scratch_final;
+
+        /* Final scratch-chain task: flip dst_tensor_off back to the
+         * op's real output tensor so the 0x4020 DST_BASE branch writes
+         * there instead of the scratch. The earlier override set
+         * dst_tensor_off = input[1].f13 for every scratch-op task. */
+        if (is_scratch_final && m->ops && op < m->op_count &&
+            m->ops[op].output_count > 0) {
+            uint32_t out_tidx = m->ops[op].output_tensors[0];
+            if (out_tidx < m->tensor_count)
+                dst_tensor_off = m->tensor_offsets[out_tidx];
+        }
+
+        /* For exSoftmax op 30 em=0x0d, select the CNA_WT blob per
+         * sub-index: sub 0 = ReduceMax (softmax_rmax_tidx),
+         * sub 1 = rescale (input_tensors[2] — already op_wt_bo_off),
+         * sub 2 = ReduceSum (softmax_rsum_tidx). Resolve to a weight
+         * BO offset via tensor_weight_blob + wt_blob_offsets. */
+        if (enable_mask == 0x0d && m->ops && op < m->op_count &&
+            strncmp(m->ops[op].type, "exSoftmax", 9) == 0 &&
+            m->tensor_weight_blob && m->wt_blob_offsets) {
+            const struct orknn_op_info *oi = &m->ops[op];
+            uint32_t pick_tidx = UINT32_MAX;
+            if (em0d_sub_idx == 0)
+                pick_tidx = oi->softmax_rmax_tidx;
+            else if (em0d_sub_idx == 1)
+                pick_tidx = oi->input_count > 2 ?
+                            oi->input_tensors[2] : UINT32_MAX;
+            else if (em0d_sub_idx == 2)
+                pick_tidx = oi->softmax_rsum_tidx;
+            if (pick_tidx != UINT32_MAX && pick_tidx < m->tensor_count) {
+                uint32_t blob_idx = m->tensor_weight_blob[pick_tidx];
+                if (blob_idx < m->wt_blob_count) {
+                    op_wt_bo_off = m->wt_blob_offsets[blob_idx];
+                    have_op_wt = 1;
+                }
             }
         }
 
@@ -1375,7 +1473,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
             int do_patch = 0;
 
             switch (reg) {
-            case 0x1070: /* SRC_BASE — main data input */
+            case 0x1070: /* CNA_FEATURE_DATA_ADDR */
                 if (is_input_consuming_task_for_src) {
                     /* First conv reads raw user input from input BO.
                      * Template val is the intra-tile offset within the
@@ -1394,6 +1492,14 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 } else if (is_conv) {
                     /* Subsequent convs read from the activation BO at the
                      * op's primary input tensor offset. */
+                    new_val = act_base + src_tensor_off + val;
+                    do_patch = 1;
+                } else if (enable_mask == 0x0d && m->ops &&
+                           op < m->op_count &&
+                           strncmp(m->ops[op].type, "exSoftmax", 9) == 0) {
+                    /* exSoftmax em=0x0d task reads from the scratch
+                     * tensor (input_tensors[1]). src_tensor_off was
+                     * already set to input[1].f13 above. */
                     new_val = act_base + src_tensor_off + val;
                     do_patch = 1;
                 } else if (val != 0) {
@@ -1437,6 +1543,14 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                      * scratch tensor (input[1]) in the activation BO,
                      * ignoring dst_is_sg_output. Only the final task in
                      * the chain writes to the real output. */
+                    new_val = act_base + dst_tensor_off + val;
+                    do_patch = 1;
+                } else if (enable_mask == 0x0d && m->ops &&
+                           op < m->op_count &&
+                           strncmp(m->ops[op].type, "exSoftmax", 9) == 0) {
+                    /* exSoftmax em=0x0d task writes to the scratch
+                     * tensor (input_tensors[1]) — never to the op's
+                     * real output, those always stay on em=0x18 paths. */
                     new_val = act_base + dst_tensor_off + val;
                     do_patch = 1;
                 } else if (dst_is_sg_output && sg_out_bo_idx >= 0 &&
