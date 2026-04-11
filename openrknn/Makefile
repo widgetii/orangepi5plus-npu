@@ -38,4 +38,14 @@ test_proxy: tests/test_proxy.c librknn_api.so
 tests/bench_throughput: tests/bench_throughput.c include/rknn_api.h
 	$(CC) -O2 -Wall -Iinclude -pthread -o $@ $< -lrknnrt
 
+# Real-world deeplabv3 segmentation demo: pthread pipeline that links
+# *only* against openrknn's librknn_api.so (no vendor librknnrt symbols
+# referenced). The shim still dlopens librknnrt at runtime for any
+# non-OWN paths it gets called on, but the OWN paths used here
+# (init/query/input/run/outputs) handle everything themselves and
+# never call into the vendor lib. To force the OWN paths at runtime:
+#   ORKNN_OWN=init,query,input,run,outputs tests/demo_deeplabv3 ...
+tests/demo_deeplabv3: tests/demo_deeplabv3.c include/rknn_api.h librknn_api.so
+	$(CC) -O2 -Wall -Iinclude -pthread -o $@ $< -L. -lrknn_api -Wl,-rpath,.
+
 .PHONY: all clean
