@@ -30,4 +30,12 @@ clean:
 test_proxy: tests/test_proxy.c librknn_api.so
 	$(CC) -O2 -Wall -Iinclude -o $@ $< -L. -lrknn_api -Wl,-rpath,.
 
+# Throughput benchmark — pure C, pthread, links against the vendor
+# librknnrt.so by default so one binary can test both stacks:
+#   ./tests/bench_throughput ...           → vendor baseline
+#   LD_PRELOAD=./librknn_api.so ORKNN_OWN=init,query,input,run,outputs \
+#     ./tests/bench_throughput ...          → openrknn OWN path
+tests/bench_throughput: tests/bench_throughput.c include/rknn_api.h
+	$(CC) -O2 -Wall -Iinclude -pthread -o $@ $< -lrknnrt
+
 .PHONY: all clean
