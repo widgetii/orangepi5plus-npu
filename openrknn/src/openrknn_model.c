@@ -337,13 +337,13 @@ static void parse_tensor_json(const char *obj, struct orknn_tensor_info *ti,
         ti->n_elems *= ti->dims[i];
     ti->size = ti->n_elems * dtype_size(ti->type);
 
-    /* w_stride = width dimension for 4D tensors */
-    if (ti->n_dims == 4) {
-        if (ti->fmt == RKNN_TENSOR_NHWC)
-            ti->w_stride = ti->dims[2]; /* W */
-        else
-            ti->w_stride = ti->dims[3]; /* W for NCHW */
-    }
+    /* w_stride: for NHWC 4D tensors the vendor reports W padded up to
+     * the next multiple of 16 (e.g. deeplabv3 513 → 528, lprnet 94 →
+     * 96). For NCHW 4D tensors the vendor reports 0. */
+    if (ti->n_dims == 4 && ti->fmt == RKNN_TENSOR_NHWC)
+        ti->w_stride = (ti->dims[2] + 15) & ~15u;
+    else
+        ti->w_stride = 0;
 
     /* size_with_stride: for now same as size */
     ti->size_with_stride = ti->size;
@@ -559,9 +559,12 @@ static void extract_fb_tensor_info(const uint8_t *fb, uint32_t tensor_table_fpos
      * incorrectly on YOLOv5 because the native_dims was stale from
      * parse_tensor_json's c2=16 assumption. */
 
-    /* w_stride: set for NHWC 4D tensors only. */
+    /* w_stride: for NHWC 4D tensors the vendor reports W padded up to
+     * the next multiple of 16 (e.g. deeplabv3 input 513 → 528, lprnet
+     * 94 → 96; mobilenet_v1 224 and yolov5 640 already 16-aligned).
+     * For NCHW 4D tensors and non-4D tensors the vendor reports 0. */
     if (ti->n_dims == 4 && ti->fmt == RKNN_TENSOR_NHWC)
-        ti->w_stride = ti->dims[2]; /* W */
+        ti->w_stride = (ti->dims[2] + 15) & ~15u;
     else
         ti->w_stride = 0;
 
