@@ -552,6 +552,114 @@ static int copy_proxy_regcmd(struct orknn_context *ctx)
     return 0;
 }
 
+/* Derive act_output_offsets / act_output_valid / act_output_layout
+ * from FB metadata alone — no /tmp/rknn_dump reads, no sig-search.
+ *
+ * For each subgraph output tensor X:
+ *   1. Walk back through "logical no-op" ops (Reshape/Flatten/Squeeze/
+ *      Unsqueeze/Identity — ops whose op_idx never appears in the task
+ *      BO, meaning the NPU runtime doesn't execute them and the data
+ *      stays wherever the predecessor wrote it).
+ *   2. Stop at the first tensor Y whose producer op DOES emit tasks.
+ *   3. If Y is itself a subgraph output (Transpose / final conv that
+ *      writes directly to the sg output), the template-patch path
+ *      routes DST via dst_is_sg_output into `output_bos[k]` at offset
+ *      0. Record `valid = 2+k, offset = 0`.
+ *   4. Else (Reshape / exSoftmax13 / plain Conv followed by Reshape),
+ *      the template-patch path falls through to `act_base + Y.f13 +
+ *      val`. Record `valid = 1, offset = Y.f13`.
+ *
+ * Layout: HBWCH16 (cl=3) for output-BO outputs whose tensor is 4D
+ * with non-trivial spatial dims; linear (cl=2) otherwise. src_order
+ * follows the output tensor's `fmt` (NHWC/NCHW).
+ */
+static void discover_outputs_from_fb(struct orknn_context *ctx)
+{
+    struct orknn_model *m = &ctx->model;
+    if (!m->ops || !m->tensor_offsets || !m->sg_output_tensor_idx)
+        return;
+    if (m->n_outputs == 0 || m->n_outputs > 16) return;
+
+    /* Build a "tensor -> producer op_idx" map. */
+    uint32_t *t2op = calloc(m->tensor_count, sizeof(uint32_t));
+    if (!t2op) return;
+    for (uint32_t i = 0; i < m->tensor_count; i++) t2op[i] = UINT32_MAX;
+    for (uint32_t i = 0; i < m->op_count; i++) {
+        for (uint32_t k = 0; k < m->ops[i].output_count; k++) {
+            uint32_t tidx = m->ops[i].output_tensors[k];
+            if (tidx < m->tensor_count && t2op[tidx] == UINT32_MAX)
+                t2op[tidx] = i;
+        }
+    }
+
+    /* "Logical no-op" ops — ops whose output is the same bytes as
+     * their input[0], just with a different shape/view. These don't
+     * emit NPU tasks, so we walk back through them to find the tensor
+     * that actually holds the data at runtime. The list is based on
+     * ONNX/TFLite op types we've seen in the five runtime models.
+     * Relying on op-type strings is more reliable than counting tasks
+     * per op, because the primary task_bo only holds the first
+     * segment's tasks and multi-segment models (YOLOv8 head) would
+     * otherwise appear to have no tasks for their late ops. */
+    #define IS_LOGICAL_NOOP(typ) ( \
+        strcmp((typ), "Reshape") == 0 || \
+        strcmp((typ), "Flatten") == 0 || \
+        strcmp((typ), "Squeeze") == 0 || \
+        strcmp((typ), "Unsqueeze") == 0 || \
+        strcmp((typ), "Identity") == 0 || \
+        strcmp((typ), "OutputOperator") == 0)
+
+    for (uint32_t oi = 0; oi < m->n_outputs; oi++) {
+        uint32_t cur = m->sg_output_tensor_idx[oi];
+        int hops = 0;
+        while (hops++ < 8 && cur < m->tensor_count) {
+            uint32_t op_idx = t2op[cur];
+            if (op_idx == UINT32_MAX) break;
+            const struct orknn_op_info *oi2 = &m->ops[op_idx];
+            if (!IS_LOGICAL_NOOP(oi2->type)) break;
+            if (oi2->input_count == 0) break;
+            cur = oi2->input_tensors[0];
+        }
+        if (cur >= m->tensor_count) continue;
+
+        int cur_is_sg_output = m->tensor_is_sg_output &&
+                               m->tensor_is_sg_output[cur];
+
+        /* Determine layout from the sg output tensor's dimensions. */
+        uint8_t layout = 2; /* linear default */
+        uint8_t src_order = 0; /* NHWC — the native byte order for
+                                * everything the NPU writes, regardless
+                                * of the user-visible tensor fmt. */
+        if (m->outputs[oi].n_dims == 4 && m->outputs[oi].dims[1] > 1 &&
+            m->outputs[oi].dims[2] > 1) {
+            /* 4D with spatial dims: YOLO/detection outputs use HBWCH16
+             * when they land in a dedicated output BO. */
+            layout = cur_is_sg_output ? 3 : 0;
+        }
+
+        if (cur_is_sg_output) {
+            /* Final write goes to output_bos[oi] at offset 0. */
+            ctx->act_output_valid[oi] = (uint8_t)(2 + oi);
+            ctx->act_output_offsets[oi] = 0;
+        } else {
+            /* Final write stayed in the activation BO at cur's f13. */
+            ctx->act_output_valid[oi] = 1;
+            ctx->act_output_offsets[oi] = m->tensor_offsets[cur];
+        }
+        ctx->act_output_layout[oi] = layout;
+        ctx->act_output_src_order[oi] = src_order;
+
+        orknn_log(1, "run: output[%u] FB-derived: %s @ 0x%x (tensor %u, "
+                     "layout=%u, src=%s)",
+                  oi,
+                  cur_is_sg_output ? "output BO" : "ACT BO",
+                  ctx->act_output_offsets[oi], cur, layout,
+                  src_order ? "NCHW" : "NHWC");
+    }
+
+    free(t2op);
+}
+
 static void patch_regcmd_addresses(struct orknn_context *ctx)
 {
     /* Load proxy-side state from /tmp/rknn_dump (proxy_input_cache
@@ -1698,6 +1806,14 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
 
     orknn_log(1, "run: patched %u entries across %u tasks and %d sources",
               patched, m->task_count, n_task_srcs);
+
+    /* FB-derived output discovery — overrides whatever sig-search
+     * found in copy_proxy_regcmd. Gated on env var during phase 9 so
+     * we can A/B against the existing dump-based path. Once verified
+     * byte-exact for all models, the sig-search code becomes dead and
+     * can be deleted. */
+    if (getenv("ORKNN_FB_OUTPUT_DISCOVERY"))
+        discover_outputs_from_fb(ctx);
 
     /* Dump patched regcmd for debugging */
     const char *dump_path = getenv("ORKNN_DUMP_REGCMD");
