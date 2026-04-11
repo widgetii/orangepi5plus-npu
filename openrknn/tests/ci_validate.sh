@@ -87,6 +87,25 @@ make -C "$OPENRKNN_DIR"
 LIB="$OPENRKNN_DIR/librknn_api.so"
 [ -f "$LIB" ] || { echo "ERROR: build did not produce $LIB"; exit 2; }
 
+# --- Preflight: FB-derived segmentation rule regression check ---
+# Verifies that the Python segmentation rule in dump_segments.py still
+# reproduces the committed per-model ground-truth artifacts. Pure Python,
+# no hardware needed — fails fast on any drift in the f[10] extraction,
+# LUT_OPS set, or segment-grouping algorithm. Serves as an early gate
+# before the hardware-dependent Phase 2 even runs.
+SGT_DIR="$SCRIPT_DIR/segmentation_ground_truth"
+if [ -d "$SGT_DIR" ] && compgen -G "$SGT_DIR/*.json" >/dev/null; then
+    echo ""
+    echo "=== Preflight: FB-derived segmentation rule verify ==="
+    if ! python3 "$SCRIPT_DIR/dump_segments.py" --verify "$SGT_DIR"; then
+        echo "ERROR: segmentation rule regression — predicted segments"
+        echo "       diverge from the committed ground truth. Fix the"
+        echo "       rule in dump_segments.py / openrknn_model.c /"
+        echo "       segmentation_from_fb.md and re-run."
+        exit 1
+    fi
+fi
+
 # Get list of model names from ground_truth.json
 MODELS=$(python3 -c "import json; print(' '.join(json.load(open('$GT')).keys()))")
 

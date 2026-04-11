@@ -102,6 +102,24 @@ jobs:
           file librknn_api.so
           aarch64-linux-gnu-objdump -T librknn_api.so | grep -E 'rknn_(init|query|run|inputs_set|outputs_get|destroy)' | sort
 
+  openrknn-segments-verify:
+    # Pure-Python regression check on the FB-derived segmentation rule.
+    # Runs on every PR (no self-hosted runner needed). Loads each
+    # committed ground-truth artifact and asserts that dump_segments.py's
+    # derive_segments() reproduces the exact (flags, sc_start, sc_count)
+    # tuples the vendor emitted at capture time. Fails fast on any drift
+    # in the f[10] extraction, LUT_OPS set, or segment-grouping algorithm
+    # — long before the hardware-dependent openrknn-hw-test even runs.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: openrknn
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify FB-derived segmentation matches ground truth
+        run: python3 tests/dump_segments.py --verify tests/segmentation_ground_truth/
+
   openrknn-hw-test:
     # Real-image accuracy validation on Orange Pi 5 Plus — only on push.
     # Exercises the full openrknn pipeline (init, query, inputs_set, run,
