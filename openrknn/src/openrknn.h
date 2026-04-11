@@ -107,6 +107,25 @@ struct orknn_segment {
 };
 
 /* ======================================================================
+ * Multi-core submit descriptor. One entry per ioctl call. See the
+ * comment on m->submits_2core / submits_3core for how these are built.
+ * `n_cores` is redundant with popcount(mask) but kept for clarity.
+ * ====================================================================== */
+
+struct orknn_multicore_submit {
+    uint32_t mask;      /* rknpu_submit.core_mask */
+    uint32_t flags;     /* pingpong / barrier */
+    uint32_t n_cores;   /* 1, 2, or 3 */
+    /* Per-core task range. For a single-core submit within a
+     * multi-core region, only subcore[0] carries a meaningful count —
+     * the other entries' counts are 0. */
+    struct {
+        uint32_t sc_start;
+        uint32_t sc_count;
+    } subcore[3];
+};
+
+/* ======================================================================
  * Per-operator metadata extracted from the .rknn FlatBuffer operator graph
  * (subgraph field 1). Populated by parse_fb_operators() in openrknn_model.c.
  *
@@ -163,6 +182,21 @@ struct orknn_op_info {
      * Used by fb_build_segments() to compute per-cycle task ranges
      * without reading /tmp/rknn_dump/submit_*.txt. */
     uint32_t task_count;
+
+    /* Full f[10] vector (6 elements) for multi-core segment
+     * derivation. Slot mapping (verified byte-exact against vendor
+     * on all 5 runtime models):
+     *    f10[0] = single-core task count (same as task_count above
+     *             for non-LUT ops)
+     *    f10[1] = dual-core core 0 task count  (or LUT single-core
+     *             total when f10[2] == 0)
+     *    f10[2] = dual-core core 1 task count  (zero for LUT ops)
+     *    f10[3] = triple-core core 0 task count
+     *    f10[4] = triple-core core 1 task count
+     *    f10[5] = triple-core core 2 task count
+     * Summing a slot across all non-IO ops gives the total task
+     * count of the corresponding pre-compiled task BO region. */
+    uint32_t f10[6];
 };
 
 /* ======================================================================
@@ -187,8 +221,30 @@ struct orknn_model {
     uint8_t  *task_data;
     uint32_t  task_count;
     uint32_t  task_data_size;
+    /* Single-core segment list (the default; matches the vendor's
+     * 1-core submit pattern byte-exact on all 5 runtime models). */
     struct orknn_segment *segments;
     uint32_t  segment_count;
+
+    /* Multi-core submit plans. For core_count N ∈ {2, 3} openrknn
+     * now produces a separate plan that references the compiler's
+     * pre-compiled task BO regions at specific offsets. Each entry
+     * in submits_Ncore describes one rknpu_submit ioctl:
+     *
+     *   .mask           — ioctl descriptor core_mask (e.g. 0x7 for 3c)
+     *   .flags          — pingpong (0x5) or barrier (0x1)
+     *   .subcore[i]     — per-core (sc_start, sc_count) pairs; which
+     *                     subcore_task[] slots to fill depends on
+     *                     popcount(mask): 1c → slot[0], 2c → [0..1],
+     *                     3c → [2..4]
+     *
+     * NULL if the model doesn't include a compiled layout for that
+     * core count (caller should fall back to single-core). */
+    struct orknn_multicore_submit *submits_2core;
+    uint32_t  n_submits_2core;
+    struct orknn_multicore_submit *submits_3core;
+    uint32_t  n_submits_3core;
+
     uint32_t  total_weight_size;
     uint32_t  total_internal_size;
     /* Per-operator metadata (phase 3). NULL until parse_fb_operators()
@@ -325,6 +381,8 @@ int  orknn_bo_sync_to_device(int fd, struct orknn_bo *bo);
 int  orknn_bo_sync_from_device(int fd, struct orknn_bo *bo);
 int  orknn_npu_submit(int fd, struct orknn_bo *task_bo,
                       struct orknn_segment *seg, uint32_t core_mask);
+int  orknn_npu_submit_multicore(int fd, struct orknn_bo *task_bo,
+                                const struct orknn_multicore_submit *sub);
 
 /* ======================================================================
  * Own implementations (phases 2-6)

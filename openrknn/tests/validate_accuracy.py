@@ -97,6 +97,12 @@ class RKNNLib:
         )
         if ret != 0:
             raise RuntimeError(f"rknn_init failed: {ret}")
+        # Honour optional ORKNN_CORE_MASK override — used by CI tests
+        # that parametrize over single-core vs multi-core execution.
+        cm = os.environ.get("ORKNN_CORE_MASK")
+        if cm:
+            mask_val = int(cm, 0)
+            self.lib.rknn_set_core_mask(ctx, ctypes.c_uint32(mask_val))
         return ctx
 
     def query_io_num(self, ctx):

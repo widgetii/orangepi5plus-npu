@@ -1376,14 +1376,46 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
     }
     /* ctx->task_bo was populated once by orknn_alloc_model_bos with the
      * patched task data; each segment just replays a {sc_start, sc_count}
-     * slice into the NPU. No per-cycle rewrites needed (see task 9.4). */
-    for (uint32_t i = 0; i < max_segs; i++) {
-        struct orknn_segment *seg = &m->segments[i];
-        int ret = orknn_npu_submit(ctx->npu_fd, &ctx->task_bo, seg,
-                                   ctx->core_mask);
-        if (ret) {
-            orknn_log(0, "run: segment %u submit failed", i);
-            return RKNN_ERR_FAIL;
+     * slice into the NPU. No per-cycle rewrites needed (see task 9.4).
+     *
+     * #60: if the user set core_mask to 2 or 3 cores and the model
+     * has a compiled multi-core submit plan, dispatch through that
+     * plan instead of the single-core segments. The multi-core plan
+     * references pre-compiled task BO regions at different offsets;
+     * the weight BO was already patched in patch_regcmd_addresses,
+     * which iterates the full task BO including those regions. */
+    uint32_t mask_popcount = __builtin_popcount(ctx->core_mask & 0x7);
+    const struct orknn_multicore_submit *mc_plan = NULL;
+    uint32_t mc_count = 0;
+    if (mask_popcount == 2 && m->submits_2core) {
+        mc_plan = m->submits_2core;
+        mc_count = m->n_submits_2core;
+    } else if (mask_popcount == 3 && m->submits_3core) {
+        mc_plan = m->submits_3core;
+        mc_count = m->n_submits_3core;
+    }
+
+    if (mc_plan && mc_count > 0) {
+        orknn_log(2, "run: multi-core submit (mask=0x%x, %u submits)",
+                  ctx->core_mask, mc_count);
+        for (uint32_t i = 0; i < mc_count; i++) {
+            int ret = orknn_npu_submit_multicore(ctx->npu_fd,
+                                                 &ctx->task_bo,
+                                                 &mc_plan[i]);
+            if (ret) {
+                orknn_log(0, "run: multi-core segment %u submit failed", i);
+                return RKNN_ERR_FAIL;
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < max_segs; i++) {
+            struct orknn_segment *seg = &m->segments[i];
+            int ret = orknn_npu_submit(ctx->npu_fd, &ctx->task_bo, seg,
+                                       ctx->core_mask);
+            if (ret) {
+                orknn_log(0, "run: segment %u submit failed", i);
+                return RKNN_ERR_FAIL;
+            }
         }
     }
 
