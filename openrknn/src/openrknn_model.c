@@ -639,6 +639,25 @@ static void parse_fb_operators(const uint8_t *fb, struct orknn_model *m)
             for (uint32_t k = 0; k < count; k++)
                 ops[i].output_tensors[k] = orknn_fb_u32(fb, vec + 4 + k * 4);
         }
+
+        /* f[10] carries per-op task counts; see docs/segmentation_from_fb.md
+         * for the full derivation. Slot 0 is the CONV-only task count, slot
+         * 1 is the total including any activation-LUT pre-task, slot 2 is a
+         * non-zero sub-count for "plain" ops and zero for activation-fused
+         * ones — we use that to disambiguate. */
+        uint32_t f10 = orknn_fb_field(fb, op, 10);
+        if (f10) {
+            uint32_t vec = orknn_fb_follow(fb, f10);
+            uint32_t vlen = orknn_fb_u32(fb, vec);
+            if (vlen >= 3) {
+                uint32_t v0 = orknn_fb_u32(fb, vec + 4);
+                uint32_t v1 = orknn_fb_u32(fb, vec + 8);
+                uint32_t v2 = orknn_fb_u32(fb, vec + 12);
+                ops[i].task_count = (v2 == 0) ? v1 : v0;
+            } else if (vlen >= 1) {
+                ops[i].task_count = orknn_fb_u32(fb, vec + 4);
+            }
+        }
     }
 
     /* Resolve implicit weight/bias tensors for ops like Resize that
@@ -1138,6 +1157,139 @@ static void extract_fb_tensors(const uint8_t *fb, uint32_t fb_size,
 }
 
 /* ======================================================================
+ * FB-derived segmentation — Task 9.3
+ *
+ * Replaces the /tmp/rknn_dump/submit_*.txt reader that extract_npu_data
+ * used to call. See openrknn/docs/segmentation_from_fb.md for the full
+ * rule derivation (including the f[10]-based task-count formula and the
+ * LUT_OPS set). This function requires m->ops[] to be populated by
+ * parse_fb_operators() and returns the same segments the vendor runtime
+ * would emit, byte-exact against the intercept-dump ground truth for all
+ * five runtime models.
+ * ====================================================================== */
+
+static int op_type_is_lut(const char *type)
+{
+    /* Activation-LUT ops get flags=0x1 submits (non-pingpong); everything
+     * else gets flags=0x5 (PC | PINGPONG). Add new op types here when a
+     * future model introduces ConvExMish / ConvExHardSwish / etc. */
+    return (strcmp(type, "ConvSigmoid") == 0 ||
+            strcmp(type, "ConvExSwish") == 0 ||
+            strcmp(type, "exSoftmax13") == 0);
+}
+
+static int op_type_is_io(const char *type)
+{
+    return (strcmp(type, "InputOperator") == 0 ||
+            strcmp(type, "OutputOperator") == 0);
+}
+
+static int fb_build_segments(struct orknn_model *m)
+{
+    if (!m->ops || m->op_count == 0) {
+        orknn_log(0, "segments: m->ops not populated");
+        return -1;
+    }
+
+    /* Count segment slots needed so we can allocate once. Plus one for
+     * slop — ops might terminate a segment even though they don't start
+     * a new one (IO ops at the end of the graph). */
+    uint32_t max_segs = 1;
+    {
+        int cur_flags = -1;
+        for (uint32_t i = 0; i < m->op_count; i++) {
+            struct orknn_op_info *op = &m->ops[i];
+            if (op_type_is_io(op->type) || op->task_count == 0) {
+                if (cur_flags >= 0) cur_flags = -1;
+                continue;
+            }
+            int flags = op_type_is_lut(op->type) ? 0x1 : 0x5;
+            if (cur_flags != flags) {
+                max_segs++;
+                cur_flags = flags;
+            }
+        }
+    }
+
+    struct orknn_segment *segs = calloc(max_segs, sizeof(*segs));
+    if (!segs) return -1;
+
+    uint32_t n_segs = 0;
+    uint32_t cur_task_idx = 0;
+    int cur_flags = -1;
+    uint32_t cur_start = 0;
+    uint32_t cur_count = 0;
+
+    for (uint32_t i = 0; i < m->op_count; i++) {
+        struct orknn_op_info *op = &m->ops[i];
+        uint32_t tc = op->task_count;
+
+        if (op_type_is_io(op->type)) {
+            /* IO ops reserve task-BO slots (DeepLabv3's input reformat
+             * lives at task[0]) but are never submitted. Flush the
+             * current accumulator and advance past their slots. */
+            if (cur_count > 0) {
+                segs[n_segs].flags = (uint32_t)cur_flags;
+                segs[n_segs].sc_start = cur_start;
+                segs[n_segs].sc_count = cur_count;
+                segs[n_segs].task_number = cur_count;
+                n_segs++;
+                cur_count = 0;
+                cur_flags = -1;
+            }
+            cur_task_idx += tc;
+            continue;
+        }
+
+        if (tc == 0)
+            continue;
+
+        int flags = op_type_is_lut(op->type) ? 0x1 : 0x5;
+        if (cur_flags != flags) {
+            if (cur_count > 0) {
+                segs[n_segs].flags = (uint32_t)cur_flags;
+                segs[n_segs].sc_start = cur_start;
+                segs[n_segs].sc_count = cur_count;
+                segs[n_segs].task_number = cur_count;
+                n_segs++;
+            }
+            cur_flags = flags;
+            cur_start = cur_task_idx;
+            cur_count = 0;
+        }
+        cur_count += tc;
+        cur_task_idx += tc;
+    }
+
+    if (cur_count > 0) {
+        segs[n_segs].flags = (uint32_t)cur_flags;
+        segs[n_segs].sc_start = cur_start;
+        segs[n_segs].sc_count = cur_count;
+        segs[n_segs].task_number = cur_count;
+        n_segs++;
+    }
+
+    m->segments = segs;
+    m->segment_count = n_segs;
+
+    /* task_count (the number of task-BO slots patch_regcmd_addresses
+     * iterates over) must stay at whatever extract_npu_data set — the
+     * raw total in the .rknn task blob, which includes cross-core
+     * replicas. We only patch the regcmd slices belonging to this
+     * specific build; the segments are the per-cycle single-core plan
+     * that the RKNPU driver submits against the patched slices. */
+
+    for (uint32_t s = 0; s < n_segs; s++) {
+        orknn_log(1, "model: seg[%u] flags=0x%x sc=[%u..+%u] task_num=%u",
+                  s, segs[s].flags, segs[s].sc_start,
+                  segs[s].sc_count, segs[s].task_number);
+    }
+    orknn_log(1, "model: %u FB-derived segments, first-cycle task_idx=%u",
+              n_segs, cur_task_idx);
+    return 0;
+}
+
+/* ======================================================================
  * Weight/task extraction from FlatBuffer
  * ====================================================================== */
 
@@ -1272,8 +1424,19 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
     orknn_log(1, "model: regcmd at +%u (%u bytes), taskbo at +%u (%u bytes)",
               rc_offset, rc_size, tb_offset, tb_size);
 
-    /* Parse task BO — find single-core task count */
+    /* The .rknn task BO contains the per-op compile-time task records,
+     * usually replicated 3× for triple-core submit layouts. We copy the
+     * whole thing; fb_build_segments() (called from orknn_own_init after
+     * parse_fb_operators) will set model->task_count to the first-cycle
+     * slice it actually needs and leave the excess task_data bytes
+     * unused. Segment derivation and per-op task counting all live in
+     * fb_build_segments() — see docs/segmentation_from_fb.md. */
     uint32_t total_tasks = tb_size / 40;
+
+#if 0  /* Legacy dump-reading segmentation path, replaced by fb_build_segments.
+        * Kept temporarily as a reference for task 9.4 debugging; to be
+        * deleted in task 9.8 along with every other /tmp/rknn_dump read. */
+    /* Parse task BO — find single-core task count */
     uint32_t sc_tasks = total_tasks;
 
     /* Detect single-core task count.
@@ -1577,6 +1740,27 @@ static int extract_npu_data(const uint8_t *fb, uint32_t fb_size,
             fclose(tf);
         }
     }
+#endif  /* end of legacy dump-reading segmentation path */
+
+    /* Copy the complete task BO into model->task_data. fb_build_segments
+     * will later shrink task_count to the first-cycle slice it needs;
+     * we leave the tail bytes in place (they belong to cross-core
+     * replicas the single-core submit path ignores). */
+    model->task_count = total_tasks;
+    model->task_data_size = total_tasks * 40;
+    model->task_data = malloc(model->task_data_size);
+    memcpy(model->task_data, bo1_data + tb_offset, model->task_data_size);
+
+    struct orknn_rknpu_task *tasks = (struct orknn_rknpu_task *)model->task_data;
+    for (uint32_t t = 0; t < total_tasks; t++)
+        tasks[t].regcmd_addr += rc_offset;
+
+    /* Store weight+regcmd combined BO data */
+    model->wt_data = bo1_data;
+    model->wt_size = bo1_size;
+    model->regcmd_data = bo1_data + rc_offset;
+    model->regcmd_size = rc_size;
+    model->total_weight_size = bo1_size;
 
     /* Phase 2: total_internal_size is NOT reliably stored in the .rknn
      * FlatBuffer. The `type=6 len=64 u32@32` pattern we used to match
@@ -1804,6 +1988,18 @@ int orknn_own_init(struct orknn_context *ctx, void *model_buf, uint32_t size,
      * Phase 3 foundation — unblocks future work that needs per-op metadata
      * (CVT computation, FC detection, per-channel ops). */
     parse_fb_operators(fb, m);
+
+    /* Phase 9 / Task 9.3: build submit segments from the FB operator
+     * graph now that m->ops[] is populated. This replaces the
+     * /tmp/rknn_dump/submit_*.txt reader extract_npu_data used to call.
+     * fb_build_segments also shrinks model->task_count from the raw
+     * multi-core total to the first-cycle slice we actually submit,
+     * leaving the tail bytes in task_data unused. */
+    if (ret == 0) {
+        if (fb_build_segments(m) != 0) {
+            orknn_log(0, "model: fb_build_segments failed — run path unusable");
+        }
+    }
 
     /* Phase 3b: parse the header `attrs` string for input pre-processing
      * (mean/std/dtype), then find which op_idx consumes the model input.

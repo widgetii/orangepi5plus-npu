@@ -165,6 +165,14 @@ struct orknn_op_info {
      * Both fields default to UINT32_MAX (no match found). */
     uint32_t softmax_rmax_tidx;
     uint32_t softmax_rsum_tidx;
+
+    /* Number of NPU task slots this op reserves in the task BO.
+     * Extracted from FB field 10 (see docs/segmentation_from_fb.md):
+     *    f[10][2] == 0  → task_count = f[10][1]  (activation-LUT ops)
+     *    f[10][2] != 0  → task_count = f[10][0]  (everything else)
+     * Used by fb_build_segments() to compute per-cycle task ranges
+     * without reading /tmp/rknn_dump/submit_*.txt. */
+    uint32_t task_count;
 };
 
 /* ======================================================================
