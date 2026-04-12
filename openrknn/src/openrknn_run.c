@@ -546,7 +546,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
      * pop the next anonymous blob of matching size. From oracle analysis
      * (SmolVLM l0_mlp), Transpose ops consume 8192B blobs in reverse
      * scan order — the implementation uses that heuristic. */
-    #define MAX_ANON_BLOBS 32
+    #define MAX_ANON_BLOBS 128 /* SmolVLM fused attn has 32+ hidden blobs */
     struct { uint32_t offset; uint32_t size; } anon_blobs[MAX_ANON_BLOBS];
     int n_anon = 0;
     /* Collect "hidden tensor" blob offsets: tensors whose tensor_weight_blob
@@ -606,7 +606,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
      * For each op that emits em=0x0d tasks (identified from the task BO),
      * assign the next available anonymous blob.
      * Heuristic: Transpose ops use 8192B blobs in REVERSE anon order. */
-    #define MAX_EM0D_OPS 16
+    #define MAX_EM0D_OPS 64 /* SmolVLM fused attn: 32 exSDPAttention + Transpose + exNorm */
     struct { uint32_t op_idx; uint32_t blob_off; } em0d_blob_assign[MAX_EM0D_OPS];
     int n_em0d_assign = 0;
     #define MAX_EXNORM_BLOB_ASSIGN 8
@@ -617,9 +617,11 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         /* Find which ops emit em=0x0d tasks */
         uint32_t em0d_ops[MAX_EM0D_OPS];
         int n_em0d_ops = 0;
+        uint32_t em0d_task_count = 0;
         for (uint32_t t = 0; t < m->task_count && n_em0d_ops < MAX_EM0D_OPS; t++) {
             uint32_t *tf = (uint32_t *)((uint8_t *)ctx->task_bo.map + t * 40);
             if (tf[2] != 0x0d) continue;
+            em0d_task_count++;
             uint32_t op = tf[1];
             int seen = 0;
             for (int k = 0; k < n_em0d_ops; k++)
@@ -636,19 +638,27 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
          * same "reverse" convention used by the Conv weight-pair assignment
          * at the top of this function.
          *
-         * Collect Transpose ops (only), then zip with 8k anon blobs. */
+         * Collect ops that use 8k LUT blobs (Transpose, exSDPAttention),
+         * then zip with 8k anon blobs. */
+        orknn_log(1, "run: em0d scan: %u tasks scanned, %u em=0x0d tasks, %u unique ops",
+                  m->task_count, em0d_task_count, n_em0d_ops);
         int n_transpose = 0;
-        uint32_t transpose_ops[MAX_EM0D_OPS];
+        uint32_t transpose_ops[64]; /* up to 64 ops (SmolVLM attn has 32 exSDP) */
         for (int k = 0; k < n_em0d_ops; k++) {
             uint32_t oi = em0d_ops[k];
-            if (oi < m->op_count && strstr(m->ops[oi].type, "Transpose"))
+            if (oi < m->op_count && n_transpose < 64 &&
+                (strstr(m->ops[oi].type, "Transpose") ||
+                 strstr(m->ops[oi].type, "exSDPAttention")))
                 transpose_ops[n_transpose++] = oi;
         }
-        /* Collect 8192-byte anonymous blob offsets (already sorted asc) */
+        /* Collect LUT-sized anonymous blob offsets (already sorted asc).
+         * Transpose uses 8192B, exSDPAttention uses 16384B. Accept both
+         * sizes — the assignment heuristic pairs by count, not size. */
         uint32_t anon_8k[MAX_ANON_BLOBS];
         int n_anon_8k = 0;
         for (int a = 0; a < n_anon; a++)
-            if (anon_blobs[a].size == 8192 && n_anon_8k < MAX_ANON_BLOBS)
+            if ((anon_blobs[a].size == 8192 || anon_blobs[a].size == 16384) &&
+                n_anon_8k < MAX_ANON_BLOBS)
                 anon_8k[n_anon_8k++] = anon_blobs[a].offset;
 
         /* Assign: anon_8k[i] → transpose_ops[n_transpose - 1 - i] */

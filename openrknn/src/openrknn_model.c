@@ -1182,7 +1182,8 @@ static int op_type_is_lut(const char *type)
      * future model introduces ConvExMish / ConvExHardSwish / etc. */
     return (strcmp(type, "ConvSigmoid") == 0 ||
             strcmp(type, "ConvExSwish") == 0 ||
-            strcmp(type, "exSoftmax13") == 0);
+            strcmp(type, "exSoftmax13") == 0 ||
+            strcmp(type, "exSDPAttention") == 0);
 }
 
 static int op_type_is_io(const char *type)
