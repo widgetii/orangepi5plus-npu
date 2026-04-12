@@ -609,6 +609,10 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
     #define MAX_EM0D_OPS 16
     struct { uint32_t op_idx; uint32_t blob_off; } em0d_blob_assign[MAX_EM0D_OPS];
     int n_em0d_assign = 0;
+    #define MAX_EXNORM_BLOB_ASSIGN 8
+    struct { uint32_t op_idx; uint32_t wt_off; uint32_t bs_off; }
+        exnorm_conv_blobs[MAX_EXNORM_BLOB_ASSIGN];
+    int n_exnorm_blob = 0;
     if (m->ops && n_anon > 0) {
         /* Find which ops emit em=0x0d tasks */
         uint32_t em0d_ops[MAX_EM0D_OPS];
@@ -656,6 +660,39 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
             orknn_log(1, "run: em0d blob assign: op=%u (%s) -> wt+0x%x (anon 8k[%d])",
                       oi, m->ops[oi].type, anon_8k[i], i);
             n_em0d_assign++;
+        }
+
+        /* exNorm CONV blobs: 12288-byte anonymous blobs go to ops
+         * with em=0x0d that are NOT Transpose (i.e. exNorm, exLayerNorm).
+         * Same reverse-order assignment as Transpose. These blobs are
+         * used by the em=0x1d CONV tasks AFTER the em=0x0d block. */
+        int n_exnorm = 0;
+        uint32_t exnorm_ops[MAX_EM0D_OPS];
+        for (int k = 0; k < n_em0d_ops; k++) {
+            uint32_t oi = em0d_ops[k];
+            if (oi < m->op_count && !strstr(m->ops[oi].type, "Transpose") &&
+                strncmp(m->ops[oi].type, "exSoftmax", 9) != 0)
+                exnorm_ops[n_exnorm++] = oi;
+        }
+        uint32_t anon_12k[MAX_ANON_BLOBS];
+        int n_anon_12k = 0;
+        for (int a = 0; a < n_anon; a++)
+            if (anon_blobs[a].size == 12288 && n_anon_12k < MAX_ANON_BLOBS)
+                anon_12k[n_anon_12k++] = anon_blobs[a].offset;
+
+        /* Two 12288B blobs per exNorm op (weight + bias for the CONV pass).
+         * Assign in reverse order: anon_12k[0]→last exNorm weight,
+         * anon_12k[1]→last exNorm bias, etc. For a single exNorm,
+         * the first blob is for the second CONV, second for the first. */
+        /* (exnorm_conv_blobs declared at outer scope for register handler access) */
+        for (int k = 0; k < n_exnorm && n_anon_12k >= 2; k++) {
+            uint32_t oi = exnorm_ops[n_exnorm - 1 - k];
+            exnorm_conv_blobs[n_exnorm_blob].op_idx = oi;
+            exnorm_conv_blobs[n_exnorm_blob].wt_off = anon_12k[k * 2 + 1];
+            exnorm_conv_blobs[n_exnorm_blob].bs_off = anon_12k[k * 2];
+            orknn_log(1, "run: exNorm conv blob: op=%u -> wt=0x%x bs=0x%x",
+                      oi, anon_12k[k * 2 + 1], anon_12k[k * 2]);
+            n_exnorm_blob++;
         }
     }
 
@@ -919,16 +956,13 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                      * em0d_block_idx counter increments at each non-
                      * em0d gap within the same op. */
                     sub = 3;
-                } else if (enable_mask == 0x1d &&
-                           em0d_block_idx > 0 &&
-                           oi->input_count > 3) {
-                    /* em=0x1d CONV task that follows an em=0x0d block
-                     * within the same op (e.g. exNorm's second CONV
-                     * reads from the scratch, not the original input).
-                     * em0d_block_idx > 0 means we've already seen at
-                     * least one em=0x0d block for this op. */
-                    sub = 3;
                 }
+                /* NOTE: em=0x1d CONV tasks after an em=0x0d block
+                 * (e.g. exNorm task 144) need SPLIT routing:
+                 *   CNA_FEATURE reads from input[3] (scratch)
+                 *   DPU_RDMA_SRC reads from input[0] (original)
+                 * This can't be expressed via a single `sub` variable.
+                 * The per-register overrides below handle this. */
                 uint32_t tidx = oi->input_tensors[sub];
                 if (tidx < m->tensor_count) {
                     src_tensor_off = m->tensor_offsets[tidx];
@@ -1311,6 +1345,19 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     new_val = (uint32_t)ctx->output_bos[src_sg_bo_idx]
                                   .dma_addr + val;
                     do_patch = 1;
+                } else if (is_conv && em0d_block_idx > 0 &&
+                           m->ops && op < m->op_count &&
+                           m->ops[op].input_count > 3 &&
+                           m->tensor_offsets) {
+                    /* CNA_FEATURE for a CONV task after an em=0x0d block
+                     * (e.g. exNorm task 144): reads from input[3] (scratch
+                     * tensor) not input[0]. The DPU registers for this
+                     * same task still use input[0] — only CNA switches. */
+                    uint32_t scratch_tidx = m->ops[op].input_tensors[3];
+                    uint32_t scratch_off = (scratch_tidx < m->tensor_count) ?
+                        m->tensor_offsets[scratch_tidx] : src_tensor_off;
+                    new_val = act_base + scratch_off + val;
+                    do_patch = 1;
                 } else if (is_conv) {
                     /* Subsequent convs read from the activation BO at the
                      * op's primary input tensor offset. */
@@ -1393,6 +1440,24 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     }
                     new_val = wt_base + em0d_off;
                     do_patch = 1;
+                } else if (is_conv && em0d_block_idx > 0 &&
+                           n_exnorm_blob > 0) {
+                    /* Post-em0d CONV: use hidden weight blob from
+                     * exnorm_conv_blobs table instead of have_op_wt.
+                     * The em0d_block_idx discriminates which CONV:
+                     * block_idx 1 → first CONV (wt_off),
+                     * block_idx 2 → second CONV (bs_off as wt). */
+                    uint32_t conv_wt = 0;
+                    for (int k = 0; k < n_exnorm_blob; k++) {
+                        if (exnorm_conv_blobs[k].op_idx == op) {
+                            conv_wt = (em0d_block_idx <= 1) ?
+                                exnorm_conv_blobs[k].wt_off :
+                                exnorm_conv_blobs[k].bs_off;
+                            break;
+                        }
+                    }
+                    new_val = wt_base + (conv_wt ? conv_wt : op_wt_bo_off) + val;
+                    do_patch = 1;
                 } else if (have_op_wt) {
                     new_val = wt_base + op_wt_bo_off + val;
                     do_patch = 1;
@@ -1432,6 +1497,20 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                      * tensor (input_tensors[1]) — never to the op's
                      * real output, those always stay on em=0x18 paths. */
                     new_val = act_base + dst_tensor_off + val;
+                    do_patch = 1;
+                } else if (is_conv && em0d_block_idx > 0 &&
+                           m->ops && op < m->op_count &&
+                           m->ops[op].input_count > 3 &&
+                           m->tensor_offsets) {
+                    /* em=0x1d CONV after em=0x0d block: DST goes to
+                     * scratch tensor area (input[3]), not output[0].
+                     * Oracle: exNorm task 144 DST = act+0x488040 where
+                     * scratch_off=0x480000. The per-task val encodes
+                     * the intra-scratch offset. */
+                    uint32_t scratch_tidx = m->ops[op].input_tensors[3];
+                    uint32_t scratch_off = (scratch_tidx < m->tensor_count) ?
+                        m->tensor_offsets[scratch_tidx] : dst_tensor_off;
+                    new_val = act_base + scratch_off + val;
                     do_patch = 1;
                 } else if (enable_mask == 0x0d && m->ops &&
                            op < m->op_count &&
@@ -1498,6 +1577,16 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     /* Sentinel REFORMAT task — see DST_BASE comment. */
                     new_val = wt_base + rc_off;
                     do_patch = 1;
+                } else if (is_conv && em0d_block_idx > 0 &&
+                           m->ops && op < m->op_count &&
+                           m->ops[op].input_count > 3) {
+                    /* Post-em0d CONV RDMA_SRC: reads from the ORIGINAL
+                     * data tensor (input[0]) not the scratch. The
+                     * raw val is a compiler-baked scratch offset that
+                     * vendor's runtime replaces with the correct
+                     * src_tensor_off. */
+                    new_val = act_base + src_tensor_off;
+                    do_patch = 1;
                 } else if (is_conv) {
                     /* Only patch if this conv has a fused residual
                      * operand (ConvAdd / ConvReluAdd — input_count >= 4)
@@ -1523,21 +1612,15 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
 
             case 0x5020: /* BS_BASE (bias) */
                 if (is_reformat) {
-                    /* Only BatchNormalization REFORMATs emit a real
-                     * BS_BASE pointer. Everything else — sentinel
-                     * lowering, Concat, Conv/ConvEx* REFORMATs —
-                     * leaves this at 0; only the corresponding CONV
-                     * tasks write the bias pointer.
-                     *
-                     * For BatchNormalization, BS_BASE points at the
-                     * gamma (scale) blob at wt_blob_offsets[input[1]]
-                     * — which is `op_wt_bo_off` in our naming (not
-                     * `op_bs_bo_off`, which points at beta and feeds
-                     * into BN_BASE / 0x502c). Verified byte-exact on
-                     * ResNet50 via the phase-0 diff oracle. */
+                    /* BatchNormalization and exNorm trailing REFORMATs
+                     * emit real BS_BASE pointers. Everything else —
+                     * sentinel, Concat, Conv/ConvEx* REFORMATs —
+                     * leaves this at 0. */
                     if (m->ops && op < m->op_count && have_op_wt &&
-                        strncmp(m->ops[op].type, "BatchNormalization",
-                                18) == 0) {
+                        (strncmp(m->ops[op].type, "BatchNormalization",
+                                18) == 0 ||
+                         (em0d_block_idx > 0 &&
+                          strncmp(m->ops[op].type, "exNorm", 6) == 0))) {
                         new_val = wt_base + op_wt_bo_off + val;
                         do_patch = 1;
                     } else if (m->ops && op < m->op_count && have_op_in0 &&
@@ -1555,6 +1638,13 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                         new_val = 0;
                         do_patch = 1;
                     }
+                } else if (is_conv && em0d_block_idx > 0 &&
+                           m->ops && op < m->op_count &&
+                           m->ops[op].input_count > 3) {
+                    /* Post-em0d CONV (exNorm): no bias in this pass.
+                     * Oracle shows BS_BASE=0 for task 144. */
+                    new_val = 0;
+                    do_patch = 1;
                 } else if (have_op_bs) {
                     new_val = wt_base + op_bs_bo_off + val;
                     do_patch = 1;
@@ -1626,8 +1716,11 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                           * beta/bias blob. Paired with BS_BASE (0x5020)
                           * which points at gamma. */
                 if (is_reformat && m->ops && op < m->op_count &&
-                    strncmp(m->ops[op].type, "BatchNormalization",
-                            18) == 0 && have_op_bs) {
+                    (strncmp(m->ops[op].type, "BatchNormalization",
+                            18) == 0 ||
+                     (em0d_block_idx > 0 &&
+                      strncmp(m->ops[op].type, "exNorm", 6) == 0)) &&
+                    have_op_bs) {
                     new_val = wt_base + op_bs_bo_off + val;
                     do_patch = 1;
                 } else if (is_reformat && m->ops && op < m->op_count &&
@@ -1655,6 +1748,13 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 if (is_reformat && amt >= 1000) {
                     /* Sentinel REFORMAT: vendor leaves EW at 0. */
                     new_val = 0;
+                    do_patch = 1;
+                } else if (is_conv && em0d_block_idx > 0 &&
+                    m->ops && op < m->op_count &&
+                    m->ops[op].input_count > 3) {
+                    /* Post-em0d CONV RDMA_EW: uses data tensor + small
+                     * offset, not the raw val (which is scratch-based). */
+                    new_val = act_base + src_tensor_off + (val & 0xFFFF);
                     do_patch = 1;
                 } else if (is_conv && m->ops && op < m->op_count &&
                     m->ops[op].input_count > 3) {
