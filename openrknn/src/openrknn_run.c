@@ -449,7 +449,13 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 pc3_off = closer_off;
                 pc2_off = farther_off;
             } else {
-                /* Gap between closer and rc_off → closer is PC2. */
+                /* Gap between closer and rc_off → closer is PC2.
+                 * NOTE: this is WRONG for SmolVLM l0_mlp (oracle shows
+                 * the assignment should be swapped). But changing it
+                 * breaks DeepLabv3 which relies on this convention.
+                 * The 20 resulting pc2/pc3 diffs on l0_mlp affect
+                 * per-channel correction (em=0x60) quality but don't
+                 * crash the NPU. Tracked as a follow-up. */
                 pc2_off = closer_off;
                 pc3_off = farther_off;
             }
@@ -1402,6 +1408,21 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                      * real output, those always stay on em=0x18 paths. */
                     new_val = act_base + dst_tensor_off + val;
                     do_patch = 1;
+                } else if (enable_mask == 0x0d && m->ops &&
+                           op < m->op_count &&
+                           m->ops[op].input_count > 3 &&
+                           m->tensor_offsets) {
+                    /* Non-softmax em=0x0d tasks (exNorm, etc.) write to
+                     * a scratch tensor at input_tensors[3], not the op's
+                     * output tensor. Oracle analysis: exNorm DST =
+                     * act + tensor_offsets[input[3]] (e.g. 0x480000).
+                     * openrknn's default dst_tensor_off = output[0]
+                     * which is wrong for these intermediate tasks. */
+                    uint32_t scratch_tidx = m->ops[op].input_tensors[3];
+                    uint32_t scratch_off = (scratch_tidx < m->tensor_count) ?
+                        m->tensor_offsets[scratch_tidx] : dst_tensor_off;
+                    new_val = act_base + scratch_off + val;
+                    do_patch = 1;
                 } else if (dst_is_sg_output && sg_out_bo_idx >= 0 &&
                     (uint32_t)sg_out_bo_idx < m->n_outputs) {
                     /* Writing to a subgraph output tensor: target the
@@ -1538,7 +1559,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
              *     offset baked into the template, e.g. 0xa0 / 0x80).
              *   - Everything else (including Conv fused paths and "Add" /
              *     "Sub" / "Mul") → wt_base + pc2/pc3_off (shared LUT). */
-            case 0x6070: /* PC2 — PPU_DST_BASE_ADDR */
+            case 0x6070: /* PPU_DST_BASE_ADDR */
                 if (enable_mask == 0x60 && m->ops && op < m->op_count &&
                     (strstr(m->ops[op].type, "Pool") != NULL)) {
                     new_val = act_base + dst_tensor_off + val;
@@ -1552,7 +1573,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 }
                 break;
 
-            case 0x701c: /* PC3 — PPU_RDMA_SRC_BASE_ADDR */
+            case 0x701c: /* PPU_RDMA_SRC_BASE_ADDR */
                 if (enable_mask == 0x60 && m->ops && op < m->op_count &&
                     (strstr(m->ops[op].type, "Pool") != NULL)) {
                     new_val = act_base + src_tensor_off + val;
