@@ -129,6 +129,23 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
     uint32_t act_size = max_act_off * 4 + largest_io * 2;
     if (act_size < 1048576) act_size = 1048576;
     act_size = ALIGN_UP(act_size, 4096);
+    /* Dev: ORKNN_ACT_SIZE_MULT=N multiplies the computed activation BO
+     * size by N. Used for Phase-0E testing of the SmolVLM l0_mlp seg-1
+     * hang — vendor allocates ~3x openrknn's activation BO size
+     * (28 MB vs 9 MB), possibly because its regcmd assumes a
+     * pre-compiled multi-core layout even for single-core submits. */
+    const char *mult_env = getenv("ORKNN_ACT_SIZE_MULT");
+    if (mult_env) {
+        uint32_t m_ = (uint32_t)strtoul(mult_env, NULL, 10);
+        if (m_ > 0 && m_ < 16) {
+            uint64_t new_sz = (uint64_t)act_size * m_;
+            if (new_sz < UINT32_MAX) {
+                orknn_log(0, "memory: ORKNN_ACT_SIZE_MULT=%u %u -> %lu",
+                          m_, act_size, (unsigned long)new_sz);
+                act_size = (uint32_t)new_sz;
+            }
+        }
+    }
     orknn_log(1, "memory: activation size: scan=%u+largest_io=%u "
                  "sentinels=%u -> %u",
               max_act_off, largest_io, scan_sentinels, act_size);

@@ -257,42 +257,62 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     uint32_t v = (entries[e] >> 16) & 0xFFFFFFFF;
                     uint32_t nv = v;
                     int is_dma = 0;
+                    /* Common range-based classifier: try each BO in
+                     * turn and rebase if v falls inside. Every check is
+                     * BOUNDED on BOTH sides — an unbounded `>=` was
+                     * the Phase-0E bug: for value 0xfff92580 (which
+                     * sits in the wt range) the old 0x5018 handler
+                     * fell through to `v >= oracle_act` and produced a
+                     * garbage address because act's upper bound was
+                     * missing.
+                     *
+                     * For the general wt-rel set we check wt first;
+                     * for 0x5018/0x701c we check in first (input-
+                     * consuming REFORMAT source). Order only matters
+                     * when two ranges could logically hold the same
+                     * value (they don't on our test models). */
+                    uint32_t act_size = ctx->activation_bo.size;
+                    uint32_t wt_size  = ctx->weight_bo.size;
+                    uint32_t in_size  = ctx->input_bos ?
+                                        ctx->input_bos[0].size : 0;
+                    uint32_t out_size = ctx->output_bos ?
+                                        ctx->output_bos[0].size : 0;
+                    int reg_is_wt_first = !(reg == 0x5018 || reg == 0x701c);
+                    int try_wt_before_act = reg_is_wt_first;
                     switch (reg) {
                     case 0x1070: case 0x1110: case 0x4020:
                     case 0x5020: case 0x502c: case 0x5038:
                     case 0x6070: case 0x0010:
-                    case 0x4048: /* DPU_BS_MUL_CFG — can hold wt-rel LUT ptr */
-                    case 0x504c: /* DPU_RDMA EW/BN variant */
-                        /* wt-rel */
-                        if (v >= oracle_wt && v < oracle_wt + ctx->weight_bo.size) {
+                    case 0x5018: case 0x701c:
+                        if (try_wt_before_act &&
+                            v >= oracle_wt && v < oracle_wt + wt_size) {
                             nv = wt_base + (v - oracle_wt);
                             is_dma = 1;
-                        } else if (oracle_act && v >= oracle_act) {
+                            break;
+                        }
+                        if (oracle_act && v >= oracle_act &&
+                            v < oracle_act + act_size) {
                             nv = act_base + (v - oracle_act);
                             is_dma = 1;
-                        } else if (oracle_in && v >= oracle_in &&
-                                   v < oracle_in + (ctx->input_bos ?
-                                       ctx->input_bos[0].size : 0)) {
+                            break;
+                        }
+                        if (!try_wt_before_act &&
+                            v >= oracle_wt && v < oracle_wt + wt_size) {
+                            nv = wt_base + (v - oracle_wt);
+                            is_dma = 1;
+                            break;
+                        }
+                        if (oracle_in && v >= oracle_in &&
+                            v < oracle_in + in_size) {
                             nv = in_base + (v - oracle_in);
                             is_dma = 1;
-                        } else if (oracle_out && v >= oracle_out) {
+                            break;
+                        }
+                        if (oracle_out && v >= oracle_out &&
+                            v < oracle_out + out_size) {
                             nv = out_base + (v - oracle_out);
                             is_dma = 1;
-                        }
-                        break;
-                    case 0x5018: case 0x701c:
-                        if (oracle_in && v >= oracle_in &&
-                            v < oracle_in + (ctx->input_bos ?
-                                ctx->input_bos[0].size : 0)) {
-                            nv = in_base + (v - oracle_in);
-                            is_dma = 1;
-                        } else if (oracle_act && v >= oracle_act) {
-                            nv = act_base + (v - oracle_act);
-                            is_dma = 1;
-                        } else if (v >= oracle_wt &&
-                                   v < oracle_wt + ctx->weight_bo.size) {
-                            nv = wt_base + (v - oracle_wt);
-                            is_dma = 1;
+                            break;
                         }
                         break;
                     }
@@ -1649,8 +1669,28 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
                     continue;
                 }
             }
-            struct orknn_segment *seg = &m->segments[i];
-            int ret = orknn_npu_submit(ctx->npu_fd, &ctx->task_bo, seg,
+            struct orknn_segment seg_copy = m->segments[i];
+            /* Dev: ORKNN_SEG<N>_TRIM_FIRST=K advances seg N's sc_start
+             * by K and reduces sc_count/task_number accordingly. Used
+             * to test whether skipping the first K tasks of a specific
+             * segment clears a hang on that segment. */
+            char env_name[32];
+            snprintf(env_name, sizeof(env_name), "ORKNN_SEG%u_TRIM_FIRST", i);
+            const char *trim_env = getenv(env_name);
+            if (trim_env) {
+                uint32_t trim = (uint32_t)strtoul(trim_env, NULL, 10);
+                if (trim < seg_copy.sc_count) {
+                    orknn_log(0, "run: %s=%u advancing seg %u "
+                              "sc_start %u→%u count %u→%u",
+                              env_name, trim, i,
+                              seg_copy.sc_start, seg_copy.sc_start + trim,
+                              seg_copy.sc_count, seg_copy.sc_count - trim);
+                    seg_copy.sc_start += trim;
+                    seg_copy.sc_count -= trim;
+                    seg_copy.task_number -= trim;
+                }
+            }
+            int ret = orknn_npu_submit(ctx->npu_fd, &ctx->task_bo, &seg_copy,
                                        ctx->core_mask);
             if (ret) {
                 orknn_log(0, "run: segment %u submit failed", i);
