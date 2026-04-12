@@ -1627,7 +1627,28 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
             }
         }
     } else {
+        /* Dev: ORKNN_SKIP_SEGS="1,2" skips the listed segment indices.
+         * Used for Phase-0E bisection of the SmolVLM l0_mlp seg-1 hang
+         * (can seg 2 run when seg 1 is skipped?). Does nothing unset. */
+        const char *skip_env = getenv("ORKNN_SKIP_SEGS");
         for (uint32_t i = 0; i < max_segs; i++) {
+            if (skip_env) {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%u", i);
+                /* crude substring search: "1,2" or "1" */
+                const char *p = skip_env;
+                int skip = 0;
+                while (*p) {
+                    uint32_t v = (uint32_t)strtoul(p, (char **)&p, 10);
+                    if (v == i) { skip = 1; break; }
+                    if (*p == ',') p++;
+                    else break;
+                }
+                if (skip) {
+                    orknn_log(0, "run: ORKNN_SKIP_SEGS skipping seg %u", i);
+                    continue;
+                }
+            }
             struct orknn_segment *seg = &m->segments[i];
             int ret = orknn_npu_submit(ctx->npu_fd, &ctx->task_bo, seg,
                                        ctx->core_mask);
