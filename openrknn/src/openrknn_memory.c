@@ -145,6 +145,12 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
                 act_size = (uint32_t)new_sz;
             }
         }
+        /* When activation size multiplier is set, enable unified activation
+         * BO layout: input/output data is embedded in the activation BO at
+         * their FB f[13] tensor offsets, matching the vendor's 3-BO layout.
+         * This is required for FP16 transformer models where the vendor's
+         * regcmd template assumes input/output live in the activation BO. */
+        ctx->unified_act = 1;
     }
     orknn_log(1, "memory: activation size: scan=%u+largest_io=%u "
                  "sentinels=%u -> %u",

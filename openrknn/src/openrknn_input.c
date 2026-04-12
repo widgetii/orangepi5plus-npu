@@ -165,7 +165,30 @@ int orknn_own_inputs_set(struct orknn_context *ctx, uint32_t n_inputs,
 
         orknn_bo_sync_to_device(ctx->npu_fd, bo);
 
-        orknn_log(2, "inputs_set: input[%u] %u bytes -> BO dma=0x%lx + act BO",
+        /* Unified activation BO: also copy input data into the activation BO
+         * at the subgraph input tensor's f[13] offset. The vendor's regcmd
+         * template reads input from the activation BO, not a separate BO. */
+        if (ctx->unified_act && ctx->activation_bo.map && m->tensor_offsets) {
+            /* Find subgraph input tensor index from the input-consuming op */
+            uint32_t sg_in_tidx = 0;
+            if (m->ops && m->input_consuming_op_idx < m->op_count) {
+                const struct orknn_op_info *ico = &m->ops[m->input_consuming_op_idx];
+                if (ico->input_count > 0)
+                    sg_in_tidx = ico->input_tensors[0];
+            }
+            uint32_t act_off = (sg_in_tidx < m->tensor_count) ?
+                               m->tensor_offsets[sg_in_tidx] : 0;
+            uint32_t copy_size = bo->size;
+            if (act_off + copy_size <= ctx->activation_bo.size) {
+                memcpy((uint8_t *)ctx->activation_bo.map + act_off,
+                       bo->map, copy_size);
+                orknn_bo_sync_to_device(ctx->npu_fd, &ctx->activation_bo);
+                orknn_log(1, "inputs_set: unified copy %u bytes -> act+0x%x",
+                          copy_size, act_off);
+            }
+        }
+
+        orknn_log(2, "inputs_set: input[%u] %u bytes -> BO dma=0x%lx",
                   idx, inputs[i].size, (unsigned long)bo->dma_addr);
     }
 

@@ -826,6 +826,7 @@ static void parse_fb_tensor_offsets(const uint8_t *fb, struct orknn_model *m)
         weight_blob[i] = 0xFFFFFFFFu; /* sentinel: not a weight */
 
     uint32_t nonzero_off = 0, have_blob = 0;
+    int dump_fields = (getenv("ORKNN_DEBUG_FB_TENSORS") != NULL);
     for (uint32_t i = 0; i < n_tensors; i++) {
         uint32_t t = orknn_fb_vec_at(fb, tensors_fpos, i);
         if (!t) continue;
@@ -834,6 +835,18 @@ static void parse_fb_tensor_offsets(const uint8_t *fb, struct orknn_model *m)
             uint32_t v = orknn_fb_u32(fb, f13);
             offsets[i] = v;
             if (v) nonzero_off++;
+        }
+        if (dump_fields) {
+            /* Dump fields 0..20 for RE diagnosis */
+            for (int fi = 0; fi <= 20; fi++) {
+                uint32_t fp = orknn_fb_field(fb, t, fi);
+                if (fp) {
+                    uint32_t v = orknn_fb_u32(fb, fp);
+                    if (v != 0)
+                        orknn_log(0, "tensor[%u] f[%d] = 0x%x (%u)",
+                                  i, fi, v, v);
+                }
+            }
         }
         /* f[18] = weight_data blob index for weight/bias tensors.
          * Present and non-zero only for tensors whose data is stored as

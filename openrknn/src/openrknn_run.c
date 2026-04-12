@@ -170,8 +170,16 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
 
     uint32_t wt_base = (uint32_t)ctx->weight_bo.dma_addr;
     uint32_t act_base = (uint32_t)ctx->activation_bo.dma_addr;
-    uint32_t in_base = ctx->input_bos ? (uint32_t)ctx->input_bos[0].dma_addr : 0;
-    uint32_t out_base = ctx->output_bos ? (uint32_t)ctx->output_bos[0].dma_addr : 0;
+    uint32_t in_base, out_base;
+    if (ctx->unified_act) {
+        /* Unified BO layout: input/output live inside the activation BO
+         * at their tensor f[13] offsets. No separate I/O base addresses. */
+        in_base = act_base;
+        out_base = act_base;
+    } else {
+        in_base = ctx->input_bos ? (uint32_t)ctx->input_bos[0].dma_addr : 0;
+        out_base = ctx->output_bos ? (uint32_t)ctx->output_bos[0].dma_addr : 0;
+    }
 
     /* Dev: ORKNN_DUMP_BO1_PRE dumps the pre-patch weight BO. Used with
      * tests/diff_regcmd.py to compare vendor's post-init oracle against
@@ -743,6 +751,13 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 orknn_log(0, "  in[%u] tidx=%u blob=%u "
                           "wt_off=0x%x act_off=0x%x",
                           j, tidx, blob_idx, bo_off, act_off);
+            }
+            for (uint32_t j = 0; j < op->output_count && j < 4; j++) {
+                uint32_t tidx = op->output_tensors[j];
+                uint32_t act_off = (tidx < m->tensor_count) ?
+                    m->tensor_offsets[tidx] : UINT32_MAX;
+                orknn_log(1, "  out[%u] tidx=%u act_off=0x%x",
+                          j, tidx, act_off);
             }
         }
     }
@@ -1551,9 +1566,11 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     new_val = act_base + scratch_off + val;
                     do_patch = 1;
                 } else if (dst_is_sg_output && sg_out_bo_idx >= 0 &&
-                    (uint32_t)sg_out_bo_idx < m->n_outputs) {
+                    (uint32_t)sg_out_bo_idx < m->n_outputs &&
+                    !ctx->unified_act) {
                     /* Writing to a subgraph output tensor: target the
-                     * corresponding output BO directly. */
+                     * corresponding output BO directly. In unified mode,
+                     * output lives in the activation BO at dst_tensor_off. */
                     new_val = (uint32_t)ctx->output_bos[sg_out_bo_idx]
                                   .dma_addr + val;
                     do_patch = 1;
