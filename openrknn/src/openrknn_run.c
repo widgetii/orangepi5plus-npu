@@ -609,7 +609,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
     #define MAX_EM0D_OPS 64 /* SmolVLM fused attn: 32 exSDPAttention + Transpose + exNorm */
     struct { uint32_t op_idx; uint32_t blob_off; } em0d_blob_assign[MAX_EM0D_OPS];
     int n_em0d_assign = 0;
-    #define MAX_EXNORM_BLOB_ASSIGN 8
+    #define MAX_EXNORM_BLOB_ASSIGN 64
     struct { uint32_t op_idx; uint32_t wt_off; uint32_t bs_off; }
         exnorm_conv_blobs[MAX_EXNORM_BLOB_ASSIGN];
     memset(exnorm_conv_blobs, 0, sizeof(exnorm_conv_blobs));
@@ -696,7 +696,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
          * anon_12k[1]→last exNorm bias, etc. For a single exNorm,
          * the first blob is for the second CONV, second for the first. */
         /* (exnorm_conv_blobs declared at outer scope for register handler access) */
-        for (int k = 0; k < n_exnorm && n_anon_12k >= 2; k++) {
+        for (int k = 0; k < n_exnorm && (k * 2 + 1) < n_anon_12k && n_exnorm_blob < MAX_EXNORM_BLOB_ASSIGN; k++) {
             uint32_t oi = exnorm_ops[n_exnorm - 1 - k];
             exnorm_conv_blobs[n_exnorm_blob].op_idx = oi;
             exnorm_conv_blobs[n_exnorm_blob].wt_off = anon_12k[k * 2 + 1];
