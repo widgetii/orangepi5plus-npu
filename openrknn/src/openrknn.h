@@ -331,6 +331,11 @@ struct orknn_context {
      * 1 = NCHW (c-major: dst[c*H*W + h*W + w])
      * Detected during sig search by trying both interpretations. */
     uint8_t  act_output_src_order[16];
+    /* Unified activation BO: when set, input/output tensors are embedded
+     * in the activation BO at their f[13] offsets. DMA address resolution
+     * uses act_base for in_base/out_base instead of separate I/O BOs.
+     * Matches vendor's BO layout (3 BOs: task + weight + unified act). */
+    int unified_act;
     /* Logging */
     int log_level;
 };
