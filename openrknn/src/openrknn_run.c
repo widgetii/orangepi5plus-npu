@@ -173,6 +173,117 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
     uint32_t in_base = ctx->input_bos ? (uint32_t)ctx->input_bos[0].dma_addr : 0;
     uint32_t out_base = ctx->output_bos ? (uint32_t)ctx->output_bos[0].dma_addr : 0;
 
+    /* Dev: ORKNN_DUMP_BO1_PRE dumps the pre-patch weight BO. Used with
+     * tests/diff_regcmd.py to compare vendor's post-init oracle against
+     * the raw template we loaded from the .rknn file, helping identify
+     * which registers vendor fills in at runtime. */
+    const char *pre_dump = getenv("ORKNN_DUMP_BO1_PRE");
+    if (pre_dump) {
+        FILE *bf = fopen(pre_dump, "wb");
+        if (bf) {
+            fwrite(ctx->weight_bo.map, 1, ctx->weight_bo.size, bf);
+            fclose(bf);
+            orknn_log(0, "run: dumped pre-patch weight BO to %s", pre_dump);
+        }
+    }
+
+    /* Dev: ORKNN_ORACLE_PATCH=/path/to/vendor_bo1.bin ORKNN_ORACLE_WT_BASE=0x...
+     *
+     * Scouting fallback for models whose patch rules are incomplete.
+     * Copies vendor's post-init weight BO verbatim, then rebases every
+     * known DMA-bearing register from the vendor base to openrknn's base.
+     * This proves whether everything else in the submit/output path
+     * works for a new model class, even when patch_regcmd_addresses
+     * itself can't produce a byte-exact result. */
+    const char *oracle_path = getenv("ORKNN_ORACLE_PATCH");
+    const char *oracle_wt_env = getenv("ORKNN_ORACLE_WT_BASE");
+    if (oracle_path && oracle_wt_env) {
+        uint32_t oracle_wt = (uint32_t)strtoul(oracle_wt_env, NULL, 0);
+        /* Also accept per-BO rebase envs so user can adapt bases. */
+        const char *oracle_act_env = getenv("ORKNN_ORACLE_ACT_BASE");
+        const char *oracle_in_env  = getenv("ORKNN_ORACLE_IN_BASE");
+        const char *oracle_out_env = getenv("ORKNN_ORACLE_OUT_BASE");
+        uint32_t oracle_act = oracle_act_env ? (uint32_t)strtoul(oracle_act_env, NULL, 0) : 0;
+        uint32_t oracle_in  = oracle_in_env  ? (uint32_t)strtoul(oracle_in_env,  NULL, 0) : 0;
+        uint32_t oracle_out = oracle_out_env ? (uint32_t)strtoul(oracle_out_env, NULL, 0) : 0;
+
+        FILE *of = fopen(oracle_path, "rb");
+        if (of) {
+            size_t n = fread(ctx->weight_bo.map, 1, ctx->weight_bo.size, of);
+            fclose(of);
+            orknn_log(0, "run: ORACLE_PATCH loaded %zu bytes from %s "
+                      "(oracle_wt=0x%x act=0x%x in=0x%x out=0x%x)",
+                      n, oracle_path, oracle_wt, oracle_act, oracle_in, oracle_out);
+
+            /* Walk all tasks and rebase the known DMA registers. */
+            struct task_entry_oracle { uint32_t f[8]; uint64_t regcmd_addr; }
+                __attribute__((packed));
+            const struct task_entry_oracle *tk =
+                (const struct task_entry_oracle *)ctx->task_bo.map;
+            for (uint32_t t = 0; t < m->task_count; t++) {
+                uint32_t amt = tk[t].f[6];
+                uint64_t addr = tk[t].regcmd_addr;
+                uint32_t bo_off = (uint32_t)(addr - wt_base);
+                if (bo_off >= ctx->weight_bo.size) continue;
+                uint64_t *entries = (uint64_t *)
+                    ((uint8_t *)ctx->weight_bo.map + bo_off);
+                for (uint32_t e = 0; e < amt + 4; e++) {
+                    uint16_t reg = entries[e] & 0xFFFF;
+                    uint32_t v = (entries[e] >> 16) & 0xFFFFFFFF;
+                    uint32_t nv = v;
+                    int is_dma = 0;
+                    switch (reg) {
+                    case 0x1070: case 0x1110: case 0x4020:
+                    case 0x5020: case 0x502c: case 0x5038:
+                    case 0x6070: case 0x0010:
+                    case 0x4048: /* DPU_BS_MUL_CFG — can hold wt-rel LUT ptr */
+                    case 0x504c: /* DPU_RDMA EW/BN variant */
+                        /* wt-rel */
+                        if (v >= oracle_wt && v < oracle_wt + ctx->weight_bo.size) {
+                            nv = wt_base + (v - oracle_wt);
+                            is_dma = 1;
+                        } else if (oracle_act && v >= oracle_act) {
+                            nv = act_base + (v - oracle_act);
+                            is_dma = 1;
+                        } else if (oracle_in && v >= oracle_in &&
+                                   v < oracle_in + (ctx->input_bos ?
+                                       ctx->input_bos[0].size : 0)) {
+                            nv = in_base + (v - oracle_in);
+                            is_dma = 1;
+                        } else if (oracle_out && v >= oracle_out) {
+                            nv = out_base + (v - oracle_out);
+                            is_dma = 1;
+                        }
+                        break;
+                    case 0x5018: case 0x701c:
+                        if (oracle_in && v >= oracle_in &&
+                            v < oracle_in + (ctx->input_bos ?
+                                ctx->input_bos[0].size : 0)) {
+                            nv = in_base + (v - oracle_in);
+                            is_dma = 1;
+                        } else if (oracle_act && v >= oracle_act) {
+                            nv = act_base + (v - oracle_act);
+                            is_dma = 1;
+                        } else if (v >= oracle_wt &&
+                                   v < oracle_wt + ctx->weight_bo.size) {
+                            nv = wt_base + (v - oracle_wt);
+                            is_dma = 1;
+                        }
+                        break;
+                    }
+                    if (is_dma) {
+                        entries[e] = ((uint64_t)nv << 16) | reg;
+                    }
+                }
+            }
+            orknn_log(0, "run: ORACLE_PATCH rebased DMA registers across %u tasks",
+                      m->task_count);
+            return;
+        } else {
+            orknn_log(0, "run: ORACLE_PATCH failed to open %s", oracle_path);
+        }
+    }
+
     /* Scan blob offsets to find weight, bias, and other data sections */
     /* ResNet50 has 190 weight_data entries and the PC LUT blobs sit
      * near the end (indices 186/187), so a 128-entry cap used to cut
@@ -271,6 +382,16 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
     }
     orknn_log(1, "run: PC LUT blobs: pc2=0x%x pc3=0x%x rc_off=0x%x",
               pc2_off, pc3_off, rc_off);
+    /* Dev: ORKNN_DEBUG_BLOBS dumps the full weight-BO blob layout
+     * (offset/size/type for every scan_blob_offsets() entry). Useful for
+     * matching per-op LUT blobs against op indices when extending the
+     * template-patch rules for a new model. */
+    if (getenv("ORKNN_DEBUG_BLOBS")) {
+        for (int _i = 0; _i < n_blobs; _i++) {
+            orknn_log(0, "blob[%3d] off=0x%08x size=%8u type=%u",
+                      _i, blobs[_i].offset, blobs[_i].size, blobs[_i].type);
+        }
+    }
 
     struct { uint32_t wt_off; uint32_t bs_off; } pairs[16];
     int n_pairs = 0;
@@ -343,13 +464,11 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
     uint32_t patched = 0;
 
     /* Track which regcmd offsets we've already patched to avoid
-     * double-patching shared regcmd sections (multi-core tasks share regcmd). */
-    /* Dedup tracking for unique regcmd sections. Sized to cover the
-     * largest model in our suite (DeepLabv3 = 1858 unique sections).
-     * If this ever overflows we'd re-patch sections multiple times,
-     * producing garbage values — see the log warning below. */
-    #define MAX_PATCHED_OFFSETS 4096
-    uint32_t *patched_offsets = calloc(MAX_PATCHED_OFFSETS, sizeof(uint32_t));
+     * double-patching shared regcmd sections (multi-core tasks share regcmd).
+     * Upper bound on unique sections is m->task_count (at most one distinct
+     * regcmd per task). ViT shards hit ~17k tasks; CNN models ~hundreds. */
+    uint32_t max_patched_offsets = m->task_count ? m->task_count : 1;
+    uint32_t *patched_offsets = calloc(max_patched_offsets, sizeof(uint32_t));
     int n_patched_offsets = 0;
 
     /* Task-BO source for patching. Previously we also fed per-cycle task
@@ -384,6 +503,8 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
      * sequence and their sub-indices advance independently. */
     uint32_t prev_op_for_em0d = UINT32_MAX;
     uint32_t em0d_sub_idx = 0;
+    /* Hoist debug env lookups out of the per-register hot path. */
+    int debug_patch = getenv("ORKNN_DEBUG_PATCH") ? 1 : 0;
     for (uint32_t t = 0; t < src_count; t++) {
         uint32_t amt = tasks[t].f[6];
         uint32_t enable_mask = tasks[t].f[2];
@@ -399,7 +520,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
             if (patched_offsets[j] == bo_off) { already_done = 1; break; }
         }
         if (already_done) continue;
-        if (n_patched_offsets < MAX_PATCHED_OFFSETS) {
+        if ((uint32_t)n_patched_offsets < max_patched_offsets) {
             patched_offsets[n_patched_offsets++] = bo_off;
         } else {
             /* Overflow: we can't dedupe anymore. Any previously-patched
@@ -409,7 +530,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
             if (!warned) {
                 orknn_log(0, "run: patched_offsets overflow (>%u unique "
                              "regcmd sections) — results may be wrong",
-                          MAX_PATCHED_OFFSETS);
+                          max_patched_offsets);
                 warned = 1;
             }
         }
@@ -898,6 +1019,17 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
             uint32_t new_val = val;
             int do_patch = 0;
 
+            /* Dev: ORKNN_DEBUG_PATCH logs raw pre-patch vals for the
+             * main DMA-bearing registers on early tasks. Used when adding
+             * patch rules for new op types — pairs with the vendor oracle
+             * captured by librocketnpu/tests/intercept_swap.so DUMP_ALL_BOS. */
+            if (__builtin_expect(debug_patch != 0, 0) &&
+                (reg == 0x1070 || reg == 0x1110 || reg == 0x5018 ||
+                 reg == 0x4020) && t < 40) {
+                orknn_log(0, "dbg: t=%u op=%u em=0x%x reg=0x%04x raw_val=0x%08x",
+                          t, op, enable_mask, reg, val);
+            }
+
             switch (reg) {
             case 0x1070: /* CNA_FEATURE_DATA_ADDR */
                 if (is_input_consuming_task_for_src) {
@@ -926,6 +1058,18 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     /* exSoftmax em=0x0d task reads from the scratch
                      * tensor (input_tensors[1]). src_tensor_off was
                      * already set to input[1].f13 above. */
+                    new_val = act_base + src_tensor_off + val;
+                    do_patch = 1;
+                } else if (enable_mask == 0x0d) {
+                    /* Non-softmax general compute em=0x0d task (observed
+                     * on SmolVLM l0_mlp ops 3/4/7 — Transpose, exNorm,
+                     * 2nd Transpose). Pattern: src_tensor_off + per-task
+                     * stride (val walks through the input activation in
+                     * uniform chunks, e.g. 0/0x3000/0x6000/... for
+                     * Transpose's 12288-byte tiles). Safe regardless of
+                     * op type because src_tensor_off is the primary
+                     * input's activation BO offset from the FB memory
+                     * plan. */
                     new_val = act_base + src_tensor_off + val;
                     do_patch = 1;
                 } else if (val != 0) {
@@ -1003,6 +1147,26 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                           * residuals (ConvAdd etc.) or as REFORMAT src */
                 if (is_reformat && m->ops && op < m->op_count &&
                     strcmp(m->ops[op].type, "InputOperator") == 0) {
+                    new_val = in_base + val;
+                    do_patch = 1;
+                } else if (is_reformat && is_input_consuming_task_for_src &&
+                           amt < 1000) {
+                    /* When the input-consuming op is itself a REFORMAT
+                     * (e.g. SmolVLM l0_mlp op 1 Reshape consumes the
+                     * subgraph input directly), the RDMA source is the
+                     * input BO, not the activation BO. Without this
+                     * branch the task reads zero-filled activation and
+                     * the NPU job hangs.
+                     *
+                     * val is the intra-tile byte offset within the
+                     * input BO (0 for task 0, stride*k for subsequent
+                     * tile tasks — e.g. 0xff000 for the second tile).
+                     *
+                     * Exclude sentinel tasks (amt >= 1000): YOLOv8's
+                     * first op is also the input-consuming one and has
+                     * a sentinel REFORMAT whose 0x5018 should point at
+                     * `wt_base + rc_off`, not the input BO. The
+                     * sentinel branch below handles that case. */
                     new_val = in_base + val;
                     do_patch = 1;
                 } else if (is_reformat && amt >= 1000) {
