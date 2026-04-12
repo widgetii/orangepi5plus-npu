@@ -449,15 +449,27 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 pc3_off = closer_off;
                 pc2_off = farther_off;
             } else {
-                /* Gap between closer and rc_off → closer is PC2.
-                 * NOTE: this is WRONG for SmolVLM l0_mlp (oracle shows
-                 * the assignment should be swapped). But changing it
-                 * breaks DeepLabv3 which relies on this convention.
-                 * The 20 resulting pc2/pc3 diffs on l0_mlp affect
-                 * per-channel correction (em=0x60) quality but don't
-                 * crash the NPU. Tracked as a follow-up. */
-                pc2_off = closer_off;
-                pc3_off = farther_off;
+                /* Gap between closer and rc_off. For CNN models
+                 * (DeepLabv3), closer=PC2 and farther=PC3. For
+                 * transformer models (SmolVLM, exNorm ops present),
+                 * the assignment is swapped: closer=PC3, farther=PC2.
+                 * Detect via presence of exNorm ops in the op table. */
+                int has_exnorm = 0;
+                if (m->ops) {
+                    for (uint32_t oi = 0; oi < m->op_count; oi++) {
+                        if (strncmp(m->ops[oi].type, "exNorm", 6) == 0) {
+                            has_exnorm = 1;
+                            break;
+                        }
+                    }
+                }
+                if (has_exnorm) {
+                    pc3_off = closer_off;
+                    pc2_off = farther_off;
+                } else {
+                    pc2_off = closer_off;
+                    pc3_off = farther_off;
+                }
             }
         }
     }
