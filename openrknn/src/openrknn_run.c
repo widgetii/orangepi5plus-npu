@@ -531,10 +531,132 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         act_dst_off = H * W * C; /* raw NCHW size, e.g., 32*32*3=3072 */
     }
 
+    /* Phase 1: build per-op anonymous-blob assignment table for em=0x0d
+     * non-softmax tasks. "Anonymous" blobs are entries in scan_blob_offsets
+     * that don't appear in wt_blob_offsets (no tensor references them via
+     * f[18]). Transpose uses 8192-byte anonymous blobs; exNorm uses 1536B.
+     *
+     * Assignment order: for each em=0x0d-emitting op in execution order,
+     * pop the next anonymous blob of matching size. From oracle analysis
+     * (SmolVLM l0_mlp), Transpose ops consume 8192B blobs in reverse
+     * scan order — the implementation uses that heuristic. */
+    #define MAX_ANON_BLOBS 32
+    struct { uint32_t offset; uint32_t size; } anon_blobs[MAX_ANON_BLOBS];
+    int n_anon = 0;
+    /* Collect anonymous type=6 blobs: present in scan_blob_offsets but
+     * NOT in any tensor's wt_blob_offsets. Skip regcmd/task blobs. */
+    orknn_log(1, "run: anon scan: n_blobs=%d wt_blob_count=%u wt_blob_offsets=%s",
+              n_blobs, m->wt_blob_count,
+              m->wt_blob_offsets ? "present" : "NULL");
+    if (getenv("ORKNN_DEBUG_OP_BLOBS") && m->wt_blob_offsets) {
+        for (uint32_t j = 0; j < m->wt_blob_count; j++)
+            orknn_log(0, "  wt_blob_offsets[%u] = 0x%x", j, m->wt_blob_offsets[j]);
+    }
+    for (int i = 0; i < n_blobs && n_anon < MAX_ANON_BLOBS; i++) {
+        if (blobs[i].type != 6) continue;
+        if (blobs[i].offset == rc_off) continue;
+        if (blobs[i].size == m->task_data_size) continue;
+        if (blobs[i].size < 1024 || blobs[i].size == 1024) continue; /* skip tiny + pc LUTs */
+        /* Check if any tensor references this blob offset via
+         * tensor_weight_blob. wt_blob_offsets[] covers ALL FB
+         * weight_data entries (including unreferenced ones like
+         * Transpose LUTs). The filter must check tensor_weight_blob
+         * membership, not just wt_blob_offsets presence. */
+        int is_tensor_ref = 0;
+        if (m->tensor_weight_blob && m->wt_blob_offsets) {
+            for (uint32_t ti = 0; ti < m->tensor_count; ti++) {
+                uint32_t bi = m->tensor_weight_blob[ti];
+                if (bi < m->wt_blob_count &&
+                    m->wt_blob_offsets[bi] == blobs[i].offset) {
+                    is_tensor_ref = 1;
+                    break;
+                }
+            }
+        }
+        if (!is_tensor_ref) {
+            anon_blobs[n_anon].offset = blobs[i].offset;
+            anon_blobs[n_anon].size = blobs[i].size;
+            n_anon++;
+        }
+    }
+    /* Build per-op em=0x0d blob assignment by walking ops in execution
+     * order and consuming anonymous blobs of matching size.
+     * For each op that emits em=0x0d tasks (identified from the task BO),
+     * assign the next available anonymous blob.
+     * Heuristic: Transpose ops use 8192B blobs in REVERSE anon order. */
+    #define MAX_EM0D_OPS 16
+    struct { uint32_t op_idx; uint32_t blob_off; } em0d_blob_assign[MAX_EM0D_OPS];
+    int n_em0d_assign = 0;
+    if (m->ops && n_anon > 0) {
+        /* Find which ops emit em=0x0d tasks */
+        uint32_t em0d_ops[MAX_EM0D_OPS];
+        int n_em0d_ops = 0;
+        for (uint32_t t = 0; t < m->task_count && n_em0d_ops < MAX_EM0D_OPS; t++) {
+            uint32_t *tf = (uint32_t *)((uint8_t *)ctx->task_bo.map + t * 40);
+            if (tf[2] != 0x0d) continue;
+            uint32_t op = tf[1];
+            int seen = 0;
+            for (int k = 0; k < n_em0d_ops; k++)
+                if (em0d_ops[k] == op) { seen = 1; break; }
+            if (!seen) em0d_ops[n_em0d_ops++] = op;
+        }
+
+        /* For each em=0x0d op, find matching anonymous blob.
+         * Strategy: ops are processed in execution order; anonymous
+         * 8192B blobs are consumed in REVERSE scan order (matching
+         * the vendor's observed assignment on SmolVLM l0_mlp). */
+        int anon_8k_next = n_anon - 1; /* start from end */
+        int anon_1536_next = 0; /* start from beginning */
+        for (int k = 0; k < n_em0d_ops && n_em0d_assign < MAX_EM0D_OPS; k++) {
+            uint32_t oi = em0d_ops[k];
+            if (oi >= m->op_count) continue;
+            const char *type = m->ops[oi].type;
+            int need_8k = (strstr(type, "Transpose") != NULL);
+            int need_1536 = 0; /* exNorm uses input_tensors[4+], handled differently */
+
+            if (need_8k) {
+                /* Find next 8192-byte anonymous blob from the end */
+                while (anon_8k_next >= 0 && anon_blobs[anon_8k_next].size != 8192)
+                    anon_8k_next--;
+                if (anon_8k_next >= 0) {
+                    em0d_blob_assign[n_em0d_assign].op_idx = oi;
+                    em0d_blob_assign[n_em0d_assign].blob_off = anon_blobs[anon_8k_next].offset;
+                    orknn_log(1, "run: em0d blob assign: op=%u (%s) -> wt+0x%x (anon 8k)",
+                              oi, type, anon_blobs[anon_8k_next].offset);
+                    n_em0d_assign++;
+                    anon_8k_next--;
+                }
+            }
+        }
+    }
+
     orknn_log(1, "run: patching: wt=0x%x act=0x%x in=0x%x out=0x%x "
-              "rc_off=0x%x act_dst=0x%x n_ops=%d n_pairs=%d",
+              "rc_off=0x%x act_dst=0x%x n_ops=%d n_pairs=%d anon=%d em0d_assign=%d",
               wt_base, act_base, in_base, out_base,
-              rc_off, act_dst_off, n_ops, n_pairs);
+              rc_off, act_dst_off, n_ops, n_pairs, n_anon, n_em0d_assign);
+
+    /* Dev: dump per-op input_tensors → wt_blob_offsets for transformer
+     * patch-rule development (Phase 1 of #80). */
+    if (getenv("ORKNN_DEBUG_OP_BLOBS") && m->ops && m->tensor_weight_blob &&
+        m->wt_blob_offsets) {
+        for (uint32_t oi = 0; oi < m->op_count; oi++) {
+            const struct orknn_op_info *op = &m->ops[oi];
+            orknn_log(0, "op[%u] type=%s inputs=%u",
+                      oi, op->type, op->input_count);
+            for (uint32_t j = 0; j < op->input_count && j < 8; j++) {
+                uint32_t tidx = op->input_tensors[j];
+                uint32_t blob_idx = (tidx < m->tensor_count) ?
+                    m->tensor_weight_blob[tidx] : UINT32_MAX;
+                uint32_t bo_off = (blob_idx < m->wt_blob_count) ?
+                    m->wt_blob_offsets[blob_idx] : UINT32_MAX;
+                uint32_t act_off = (tidx < m->tensor_count) ?
+                    m->tensor_offsets[tidx] : UINT32_MAX;
+                orknn_log(0, "  in[%u] tidx=%u blob=%u "
+                          "wt_off=0x%x act_off=0x%x",
+                          j, tidx, blob_idx, bo_off, act_off);
+            }
+        }
+    }
 
     uint32_t patched = 0;
 
@@ -1162,7 +1284,41 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                  * weight blob (always 0 for start-of-kernel reads). */
                 if (have_op_wt)
                     new_val = wt_base + op_wt_bo_off + val;
-                else
+                else if (enable_mask == 0x0d && val == 0) {
+                    /* em=0x0d non-softmax: look up the anonymous-blob
+                     * assignment table built at the top of this function.
+                     * This handles Transpose / exNorm / etc. ops whose
+                     * LUT blob is NOT referenced by any tensor's f[18]
+                     * but IS present in the scan_blob_offsets table as
+                     * a type=6 anonymous entry. Phase 1 of #80. */
+                    uint32_t em0d_off = 0;
+                    for (int k = 0; k < n_em0d_assign; k++) {
+                        if (em0d_blob_assign[k].op_idx == op) {
+                            em0d_off = em0d_blob_assign[k].blob_off;
+                            break;
+                        }
+                    }
+                    /* Also check exNorm: input_tensors[4+] might have
+                     * weight blob refs for the alternating sub-tasks.
+                     * Use em0d_sub_idx to pick from input[4], [5], ... */
+                    if (em0d_off == 0 && m->ops && op < m->op_count) {
+                        const struct orknn_op_info *oi = &m->ops[op];
+                        uint32_t pick_start = 4; /* skip data/wt/bs/scratch */
+                        uint32_t pick = pick_start + (em0d_sub_idx % (oi->input_count > pick_start ?
+                            oi->input_count - pick_start : 1));
+                        if (pick < oi->input_count && m->tensor_weight_blob &&
+                            m->wt_blob_offsets) {
+                            uint32_t tidx = oi->input_tensors[pick];
+                            if (tidx < m->tensor_count) {
+                                uint32_t bi = m->tensor_weight_blob[tidx];
+                                if (bi < m->wt_blob_count)
+                                    em0d_off = m->wt_blob_offsets[bi];
+                            }
+                        }
+                    }
+                    new_val = wt_base + em0d_off;
+                    do_patch = 1;
+                } else
                     new_val = wt_base + (val ? val : task_wt_off);
                 do_patch = 1;
                 break;
