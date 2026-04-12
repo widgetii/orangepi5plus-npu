@@ -1182,7 +1182,8 @@ static int op_type_is_lut(const char *type)
      * future model introduces ConvExMish / ConvExHardSwish / etc. */
     return (strcmp(type, "ConvSigmoid") == 0 ||
             strcmp(type, "ConvExSwish") == 0 ||
-            strcmp(type, "exSoftmax13") == 0);
+            strcmp(type, "exSoftmax13") == 0 ||
+            strcmp(type, "exSDPAttention") == 0);
 }
 
 static int op_type_is_io(const char *type)
@@ -1925,9 +1926,16 @@ int orknn_own_init(struct orknn_context *ctx, void *model_buf, uint32_t size,
         }
     }
 
-    /* Also init via proxy for cross-validation if available */
+    /* Also init via proxy for cross-validation if available.
+     * Skip proxy init when ALL OWN flags are set — no point allocating
+     * vendor BOs when we'll never use the proxy run path. This avoids
+     * DRM BO conflicts on large FP16 transformer shards where the
+     * combined OWN + vendor BO allocation exceeds available DMA space. */
+    uint32_t full_own = ORKNN_OWN_INIT | ORKNN_OWN_QUERY |
+                         ORKNN_OWN_INPUTS_SET | ORKNN_OWN_RUN |
+                         ORKNN_OWN_OUTPUTS;
     struct orknn_proxy *proxy = orknn_proxy_get();
-    if (proxy) {
+    if (proxy && (ctx->own_flags & full_own) != full_own) {
         ret = proxy->rknn_init(&ctx->real_ctx, model_buf, size, flag, extend);
         if (ret != RKNN_SUCC) {
             orknn_log(0, "model: proxy rknn_init failed: %d", ret);
@@ -1936,6 +1944,8 @@ int orknn_own_init(struct orknn_context *ctx, void *model_buf, uint32_t size,
             orknn_log(1, "model: proxy init OK (real_ctx=0x%lx)",
                       (unsigned long)ctx->real_ctx);
         }
+    } else if (proxy) {
+        orknn_log(1, "model: skipping proxy init (full OWN mode)");
     }
 
     return RKNN_SUCC;

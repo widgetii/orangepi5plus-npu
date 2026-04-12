@@ -380,21 +380,24 @@ def validate_fp16_run(lib, ctx, config):
     if "input_type" in expect and in_attr["type"] != expect["input_type"]:
         return "FAIL", " ".join(details_parts) + f" (expected type={expect['input_type']})"
 
-    # Build zero input matching the model's input tensor size
-    total_elements = 1
-    for d in dims:
-        total_elements *= d
-    # FP16 models accept float32 input (the runtime converts)
-    input_data = np.zeros(total_elements, dtype=np.float32)
-    input_bytes = input_data.tobytes()
+    # Build zero input matching the model's input tensor size.
+    # Use pass_through=1 to send raw bytes in the model's native format,
+    # avoiding any type conversion issues in the runtime's input path.
+    in_size = in_attr.get("size", 0)
+    if in_size == 0:
+        total_elements = 1
+        for d in dims:
+            total_elements *= d
+        in_size = total_elements * 2  # FP16 = 2 bytes per element
+    input_bytes = b'\x00' * in_size
 
     # Set input via raw rknn_inputs_set
     inp = rknn_input_st()
     inp.index = 0
     inp.buf = ctypes.cast(ctypes.c_char_p(input_bytes), ctypes.c_void_p).value
-    inp.size = len(input_bytes)
-    inp.pass_through = 0
-    inp.type = 0  # RKNN_TENSOR_FLOAT32
+    inp.size = in_size
+    inp.pass_through = 0  # let runtime convert NHWC→NC1HWC2
+    inp.type = in_attr["type"]  # match model's declared type
     inp.fmt = RKNN_TENSOR_NHWC
 
     ret = lib.lib.rknn_inputs_set(ctx, ctypes.c_uint32(1), ctypes.byref(inp))
