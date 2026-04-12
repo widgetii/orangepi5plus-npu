@@ -347,6 +347,91 @@ def validate_segmentation(lib, ctx, config, images_dir, models_dir):
     return "PASS", details
 
 
+def validate_fp16_run(lib, ctx, config):
+    """Run a FP16 transformer model end-to-end and verify completion.
+
+    This validates that the NPU submit path doesn't hang or crash for
+    FP16 transformer shards. It feeds zero input (float32), runs
+    inference, and checks that the output buffer is non-empty. Output
+    correctness is NOT validated — that requires a CPU reference and is
+    tracked separately.
+
+    ground_truth.json entry:
+        "type": "fp16_run",
+        "expect": {
+            "input_type": 1,    (FP16)
+            "n_outputs": 1,
+            "min_output_bytes": 1024
+        }
+    Optional env overrides (set per-model in ground_truth.json):
+        "env": {"ORKNN_ACT_SIZE_MULT": "3"}
+    """
+    n_in, n_out = lib.query_io_num(ctx)
+    expect = config.get("expect", {})
+    in_attr = lib.query_attr(ctx, RKNN_QUERY_INPUT_ATTR, 0)
+
+    details_parts = []
+    tp_names = {0: "FP32", 1: "FP16", 2: "INT8", 3: "UINT8"}
+    details_parts.append(f"type={tp_names.get(in_attr['type'], in_attr['type'])}")
+
+    dims = in_attr["dims"]
+    details_parts.append(f"dims={'x'.join(str(d) for d in dims)}")
+
+    if "input_type" in expect and in_attr["type"] != expect["input_type"]:
+        return "FAIL", " ".join(details_parts) + f" (expected type={expect['input_type']})"
+
+    # Build zero input matching the model's input tensor size
+    total_elements = 1
+    for d in dims:
+        total_elements *= d
+    # FP16 models accept float32 input (the runtime converts)
+    input_data = np.zeros(total_elements, dtype=np.float32)
+    input_bytes = input_data.tobytes()
+
+    # Set input via raw rknn_inputs_set
+    inp = rknn_input_st()
+    inp.index = 0
+    inp.buf = ctypes.cast(ctypes.c_char_p(input_bytes), ctypes.c_void_p).value
+    inp.size = len(input_bytes)
+    inp.pass_through = 0
+    inp.type = 0  # RKNN_TENSOR_FLOAT32
+    inp.fmt = RKNN_TENSOR_NHWC
+
+    ret = lib.lib.rknn_inputs_set(ctx, ctypes.c_uint32(1), ctypes.byref(inp))
+    if ret != 0:
+        return "FAIL", " ".join(details_parts) + f" (inputs_set={ret})"
+
+    # Run inference
+    ret = lib.lib.rknn_run(ctx, None)
+    if ret != 0:
+        return "FAIL", " ".join(details_parts) + f" (run={ret})"
+
+    # Get outputs
+    expected_n_out = expect.get("n_outputs", n_out)
+    outputs_arr = (rknn_output_st * expected_n_out)()
+    for i in range(expected_n_out):
+        outputs_arr[i].want_float = 1
+        outputs_arr[i].is_prealloc = 0
+        outputs_arr[i].index = i
+    ret = lib.lib.rknn_outputs_get(
+        ctx, ctypes.c_uint32(expected_n_out), outputs_arr, None)
+    if ret != 0:
+        return "FAIL", " ".join(details_parts) + f" (outputs_get={ret})"
+
+    total_bytes = sum(outputs_arr[i].size for i in range(expected_n_out))
+    details_parts.append(f"out_bytes={total_bytes}")
+
+    min_bytes = expect.get("min_output_bytes", 0)
+    if total_bytes < min_bytes:
+        return "FAIL", " ".join(details_parts) + f" (output too small, need>={min_bytes})"
+
+    # Release outputs
+    lib.lib.rknn_outputs_release(
+        ctx, ctypes.c_uint32(expected_n_out), outputs_arr)
+
+    return "PASS", " ".join(details_parts)
+
+
 def validate_fp16_parse(lib, ctx, config):
     n_in, n_out = lib.query_io_num(ctx)
     expect = config["expect"]
@@ -463,6 +548,14 @@ def run_validation(lib_path, models_dir, images_dir, ground_truth,
                            config["type"], "SKIP", f"model not found"))
             continue
 
+        # Apply per-model env overrides (e.g. ORKNN_ACT_SIZE_MULT for
+        # FP16 transformer shards that need a larger activation BO).
+        saved_env = {}
+        model_env = config.get("env", {})
+        for k, v in model_env.items():
+            saved_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
         # Populate intercept dump for openrknn's 'own' run path
         if populate_dumps and bench_dir:
             populate_intercept_dump(model_path, bench_dir)
@@ -485,6 +578,8 @@ def run_validation(lib_path, models_dir, images_dir, ground_truth,
             elif t == "segmentation":
                 status, details = validate_segmentation(
                     lib, ctx, config, images_dir, models_dir)
+            elif t == "fp16_run":
+                status, details = validate_fp16_run(lib, ctx, config)
             elif t == "fp16_parse":
                 status, details = validate_fp16_parse(lib, ctx, config)
             else:
@@ -495,6 +590,13 @@ def run_validation(lib_path, models_dir, images_dir, ground_truth,
         results.append((name, config.get("image", "—"), config["type"],
                         status, details))
         lib.destroy(ctx)
+
+        # Restore env after model completes
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     return results
 

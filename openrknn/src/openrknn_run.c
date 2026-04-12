@@ -449,7 +449,13 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 pc3_off = closer_off;
                 pc2_off = farther_off;
             } else {
-                /* Gap between closer and rc_off → closer is PC2. */
+                /* Gap between closer and rc_off → closer is PC2.
+                 * NOTE: this is WRONG for SmolVLM l0_mlp (oracle shows
+                 * the assignment should be swapped). But changing it
+                 * breaks DeepLabv3 which relies on this convention.
+                 * The 20 resulting pc2/pc3 diffs on l0_mlp affect
+                 * per-channel correction (em=0x60) quality but don't
+                 * crash the NPU. Tracked as a follow-up. */
                 pc2_off = closer_off;
                 pc3_off = farther_off;
             }
@@ -531,10 +537,192 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         act_dst_off = H * W * C; /* raw NCHW size, e.g., 32*32*3=3072 */
     }
 
+    /* Phase 1: build per-op anonymous-blob assignment table for em=0x0d
+     * non-softmax tasks. "Anonymous" blobs are entries in scan_blob_offsets
+     * that don't appear in wt_blob_offsets (no tensor references them via
+     * f[18]). Transpose uses 8192-byte anonymous blobs; exNorm uses 1536B.
+     *
+     * Assignment order: for each em=0x0d-emitting op in execution order,
+     * pop the next anonymous blob of matching size. From oracle analysis
+     * (SmolVLM l0_mlp), Transpose ops consume 8192B blobs in reverse
+     * scan order — the implementation uses that heuristic. */
+    #define MAX_ANON_BLOBS 32
+    struct { uint32_t offset; uint32_t size; } anon_blobs[MAX_ANON_BLOBS];
+    int n_anon = 0;
+    /* Collect "hidden tensor" blob offsets: tensors whose tensor_weight_blob
+     * points to a valid blob, but the tensor is NOT in any op's input or
+     * output tensor lists. These are per-op LUT blobs (Transpose permutation
+     * tables, exNorm auxiliary blobs) that the compiler generates as hidden
+     * tensors. They're in the FB tensor table but not in any operator's
+     * declared inputs/outputs.
+     *
+     * Sort ascending by offset so the assignment heuristic (reverse order →
+     * Transpose ops in forward execution order) works. */
+    {
+        /* Build bitmap of tensors referenced by ops */
+        uint8_t *in_op = calloc(m->tensor_count + 1, 1);
+        if (in_op && m->ops) {
+            for (uint32_t oi = 0; oi < m->op_count; oi++) {
+                for (uint32_t j = 0; j < m->ops[oi].input_count && j < 8; j++) {
+                    uint32_t ti = m->ops[oi].input_tensors[j];
+                    if (ti < m->tensor_count) in_op[ti] = 1;
+                }
+                for (uint32_t j = 0; j < m->ops[oi].output_count && j < 4; j++) {
+                    uint32_t ti = m->ops[oi].output_tensors[j];
+                    if (ti < m->tensor_count) in_op[ti] = 1;
+                }
+            }
+        }
+        if (in_op && m->tensor_weight_blob && m->wt_blob_offsets) {
+            for (uint32_t ti = 0; ti < m->tensor_count && n_anon < MAX_ANON_BLOBS; ti++) {
+                if (in_op[ti]) continue;
+                uint32_t bi = m->tensor_weight_blob[ti];
+                if (bi >= m->wt_blob_count) continue;
+                uint32_t off = m->wt_blob_offsets[bi];
+                if (off >= rc_off) continue; /* skip regcmd + task BO + post-regcmd */
+                /* Find size from scan */
+                uint32_t bsize = 0;
+                for (int s = 0; s < n_blobs; s++) {
+                    if (blobs[s].offset == off) { bsize = blobs[s].size; break; }
+                }
+                if (bsize < 1536) continue;
+                anon_blobs[n_anon].offset = off;
+                anon_blobs[n_anon].size = bsize;
+                n_anon++;
+            }
+        }
+        free(in_op);
+        /* Sort ascending by offset */
+        for (int a = 0; a < n_anon - 1; a++)
+            for (int b = a + 1; b < n_anon; b++)
+                if (anon_blobs[a].offset > anon_blobs[b].offset) {
+                    uint32_t to = anon_blobs[a].offset, ts = anon_blobs[a].size;
+                    anon_blobs[a] = anon_blobs[b];
+                    anon_blobs[b].offset = to; anon_blobs[b].size = ts;
+                }
+    }
+    /* Build per-op em=0x0d blob assignment by walking ops in execution
+     * order and consuming anonymous blobs of matching size.
+     * For each op that emits em=0x0d tasks (identified from the task BO),
+     * assign the next available anonymous blob.
+     * Heuristic: Transpose ops use 8192B blobs in REVERSE anon order. */
+    #define MAX_EM0D_OPS 16
+    struct { uint32_t op_idx; uint32_t blob_off; } em0d_blob_assign[MAX_EM0D_OPS];
+    int n_em0d_assign = 0;
+    #define MAX_EXNORM_BLOB_ASSIGN 8
+    struct { uint32_t op_idx; uint32_t wt_off; uint32_t bs_off; }
+        exnorm_conv_blobs[MAX_EXNORM_BLOB_ASSIGN];
+    int n_exnorm_blob = 0;
+    if (m->ops && n_anon > 0) {
+        /* Find which ops emit em=0x0d tasks */
+        uint32_t em0d_ops[MAX_EM0D_OPS];
+        int n_em0d_ops = 0;
+        for (uint32_t t = 0; t < m->task_count && n_em0d_ops < MAX_EM0D_OPS; t++) {
+            uint32_t *tf = (uint32_t *)((uint8_t *)ctx->task_bo.map + t * 40);
+            if (tf[2] != 0x0d) continue;
+            uint32_t op = tf[1];
+            int seen = 0;
+            for (int k = 0; k < n_em0d_ops; k++)
+                if (em0d_ops[k] == op) { seen = 1; break; }
+            if (!seen) em0d_ops[n_em0d_ops++] = op;
+        }
+
+        /* Assign anonymous blobs to em=0x0d ops.
+         *
+         * Heuristic from SmolVLM l0_mlp oracle analysis:
+         * 8192-byte hidden-tensor blobs are sorted ascending by offset.
+         * The FIRST such blob goes to the LAST Transpose op in execution
+         * order; the SECOND blob to the second-to-last, etc. This is the
+         * same "reverse" convention used by the Conv weight-pair assignment
+         * at the top of this function.
+         *
+         * Collect Transpose ops (only), then zip with 8k anon blobs. */
+        int n_transpose = 0;
+        uint32_t transpose_ops[MAX_EM0D_OPS];
+        for (int k = 0; k < n_em0d_ops; k++) {
+            uint32_t oi = em0d_ops[k];
+            if (oi < m->op_count && strstr(m->ops[oi].type, "Transpose"))
+                transpose_ops[n_transpose++] = oi;
+        }
+        /* Collect 8192-byte anonymous blob offsets (already sorted asc) */
+        uint32_t anon_8k[MAX_ANON_BLOBS];
+        int n_anon_8k = 0;
+        for (int a = 0; a < n_anon; a++)
+            if (anon_blobs[a].size == 8192 && n_anon_8k < MAX_ANON_BLOBS)
+                anon_8k[n_anon_8k++] = anon_blobs[a].offset;
+
+        /* Assign: anon_8k[i] → transpose_ops[n_transpose - 1 - i] */
+        for (int i = 0; i < n_transpose && i < n_anon_8k &&
+             n_em0d_assign < MAX_EM0D_OPS; i++) {
+            uint32_t oi = transpose_ops[n_transpose - 1 - i];
+            em0d_blob_assign[n_em0d_assign].op_idx = oi;
+            em0d_blob_assign[n_em0d_assign].blob_off = anon_8k[i];
+            orknn_log(1, "run: em0d blob assign: op=%u (%s) -> wt+0x%x (anon 8k[%d])",
+                      oi, m->ops[oi].type, anon_8k[i], i);
+            n_em0d_assign++;
+        }
+
+        /* exNorm CONV blobs: 12288-byte anonymous blobs go to ops
+         * with em=0x0d that are NOT Transpose (i.e. exNorm, exLayerNorm).
+         * Same reverse-order assignment as Transpose. These blobs are
+         * used by the em=0x1d CONV tasks AFTER the em=0x0d block. */
+        int n_exnorm = 0;
+        uint32_t exnorm_ops[MAX_EM0D_OPS];
+        for (int k = 0; k < n_em0d_ops; k++) {
+            uint32_t oi = em0d_ops[k];
+            if (oi < m->op_count && !strstr(m->ops[oi].type, "Transpose") &&
+                strncmp(m->ops[oi].type, "exSoftmax", 9) != 0)
+                exnorm_ops[n_exnorm++] = oi;
+        }
+        uint32_t anon_12k[MAX_ANON_BLOBS];
+        int n_anon_12k = 0;
+        for (int a = 0; a < n_anon; a++)
+            if (anon_blobs[a].size == 12288 && n_anon_12k < MAX_ANON_BLOBS)
+                anon_12k[n_anon_12k++] = anon_blobs[a].offset;
+
+        /* Two 12288B blobs per exNorm op (weight + bias for the CONV pass).
+         * Assign in reverse order: anon_12k[0]→last exNorm weight,
+         * anon_12k[1]→last exNorm bias, etc. For a single exNorm,
+         * the first blob is for the second CONV, second for the first. */
+        /* (exnorm_conv_blobs declared at outer scope for register handler access) */
+        for (int k = 0; k < n_exnorm && n_anon_12k >= 2; k++) {
+            uint32_t oi = exnorm_ops[n_exnorm - 1 - k];
+            exnorm_conv_blobs[n_exnorm_blob].op_idx = oi;
+            exnorm_conv_blobs[n_exnorm_blob].wt_off = anon_12k[k * 2 + 1];
+            exnorm_conv_blobs[n_exnorm_blob].bs_off = anon_12k[k * 2];
+            orknn_log(1, "run: exNorm conv blob: op=%u -> wt=0x%x bs=0x%x",
+                      oi, anon_12k[k * 2 + 1], anon_12k[k * 2]);
+            n_exnorm_blob++;
+        }
+    }
+
     orknn_log(1, "run: patching: wt=0x%x act=0x%x in=0x%x out=0x%x "
-              "rc_off=0x%x act_dst=0x%x n_ops=%d n_pairs=%d",
+              "rc_off=0x%x act_dst=0x%x n_ops=%d n_pairs=%d anon=%d em0d_assign=%d",
               wt_base, act_base, in_base, out_base,
-              rc_off, act_dst_off, n_ops, n_pairs);
+              rc_off, act_dst_off, n_ops, n_pairs, n_anon, n_em0d_assign);
+
+    /* Dev: dump per-op input_tensors → wt_blob_offsets for transformer
+     * patch-rule development (Phase 1 of #80). */
+    if (getenv("ORKNN_DEBUG_OP_BLOBS") && m->ops && m->tensor_weight_blob &&
+        m->wt_blob_offsets) {
+        for (uint32_t oi = 0; oi < m->op_count; oi++) {
+            const struct orknn_op_info *op = &m->ops[oi];
+            orknn_log(0, "op[%u] type=%s inputs=%u",
+                      oi, op->type, op->input_count);
+            for (uint32_t j = 0; j < op->input_count && j < 8; j++) {
+                uint32_t tidx = op->input_tensors[j];
+                uint32_t blob_idx = (tidx < m->tensor_count) ?
+                    m->tensor_weight_blob[tidx] : UINT32_MAX;
+                uint32_t bo_off = (blob_idx < m->wt_blob_count) ?
+                    m->wt_blob_offsets[blob_idx] : UINT32_MAX;
+                uint32_t act_off = (tidx < m->tensor_count) ?
+                    m->tensor_offsets[tidx] : UINT32_MAX;
+                orknn_log(0, "  in[%u] tidx=%u blob=%u "
+                          "wt_off=0x%x act_off=0x%x",
+                          j, tidx, blob_idx, bo_off, act_off);
+            }
+        }
+    }
 
     uint32_t patched = 0;
 
@@ -578,6 +766,11 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
      * sequence and their sub-indices advance independently. */
     uint32_t prev_op_for_em0d = UINT32_MAX;
     uint32_t em0d_sub_idx = 0;
+    /* Block counter for em=0x0d sequences: increments when a non-em=0x0d
+     * task interrupts a consecutive em=0x0d run within the same op. Used
+     * by exNorm's auxiliary blob assignment (Phase 1 of #80). */
+    uint32_t em0d_block_idx = 0;
+    int em0d_in_run = 0; /* true while consecutive em=0x0d tasks of same op */
     /* Hoist debug env lookups out of the per-register hot path. */
     int debug_patch = getenv("ORKNN_DEBUG_PATCH") ? 1 : 0;
     for (uint32_t t = 0; t < src_count; t++) {
@@ -641,12 +834,25 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         int is_em0d = (enable_mask == 0x0d);
         if (is_em0d && op == prev_op_for_em0d) {
             em0d_sub_idx++;
+            em0d_in_run = 1;
         } else if (is_em0d) {
             em0d_sub_idx = 0;
+            em0d_block_idx = 0;
+            em0d_in_run = 1;
             prev_op_for_em0d = op;
         } else if (op != prev_op_for_em0d) {
             em0d_sub_idx = 0;
+            em0d_block_idx = 0;
+            em0d_in_run = 0;
             prev_op_for_em0d = UINT32_MAX;
+        } else {
+            /* Same op, but not em0d → gap in the em0d run.
+             * Increment block_idx HERE (at the gap) rather than at
+             * the next em=0x0d start, so that em=0x1d CONV tasks
+             * immediately after the gap already see block_idx > 0
+             * and can switch to the scratch-tensor source. */
+            if (em0d_in_run) em0d_block_idx++;
+            em0d_in_run = 0;
         }
 
         /* Find this task's WT/BS offsets from per-op table */
@@ -739,7 +945,24 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     /* exSoftmax em=0x0d tasks always read from the
                      * scratch tensor (never from the real input). */
                     sub = 1;
+                } else if (enable_mask == 0x0d &&
+                           em0d_block_idx > 0 &&
+                           oi->input_count > 3 &&
+                           strncmp(oi->type, "exSoftmax", 9) != 0) {
+                    /* Non-softmax em=0x0d tasks in the SECOND+ block
+                     * (after a gap in the em=0x0d sequence) read from
+                     * input[3] (the scratch tensor). The FIRST block
+                     * reads from input[0] (the real data tensor). The
+                     * em0d_block_idx counter increments at each non-
+                     * em0d gap within the same op. */
+                    sub = 3;
                 }
+                /* NOTE: em=0x1d CONV tasks after an em=0x0d block
+                 * (e.g. exNorm task 144) need SPLIT routing:
+                 *   CNA_FEATURE reads from input[3] (scratch)
+                 *   DPU_RDMA_SRC reads from input[0] (original)
+                 * This can't be expressed via a single `sub` variable.
+                 * The per-register overrides below handle this. */
                 uint32_t tidx = oi->input_tensors[sub];
                 if (tidx < m->tensor_count) {
                     src_tensor_off = m->tensor_offsets[tidx];
@@ -1122,6 +1345,19 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     new_val = (uint32_t)ctx->output_bos[src_sg_bo_idx]
                                   .dma_addr + val;
                     do_patch = 1;
+                } else if (is_conv && em0d_block_idx > 0 &&
+                           m->ops && op < m->op_count &&
+                           m->ops[op].input_count > 3 &&
+                           m->tensor_offsets) {
+                    /* CNA_FEATURE for a CONV task after an em=0x0d block
+                     * (e.g. exNorm task 144): reads from input[3] (scratch
+                     * tensor) not input[0]. The DPU registers for this
+                     * same task still use input[0] — only CNA switches. */
+                    uint32_t scratch_tidx = m->ops[op].input_tensors[3];
+                    uint32_t scratch_off = (scratch_tidx < m->tensor_count) ?
+                        m->tensor_offsets[scratch_tidx] : src_tensor_off;
+                    new_val = act_base + scratch_off + val;
+                    do_patch = 1;
                 } else if (is_conv) {
                     /* Subsequent convs read from the activation BO at the
                      * op's primary input tensor offset. */
@@ -1154,17 +1390,81 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 break;
 
             case 0x1110: /* WT_BASE */
-                /* Prefer the per-op weight offset from the FB memory
-                 * plan (tensor.f[18] → wt_blob_offsets[]). Fall back to
-                 * the old blob-pairing heuristic if the FB lookup didn't
-                 * resolve (0 == val uses the fallback value). The
-                 * template val is the intra-kernel offset within the
-                 * weight blob (always 0 for start-of-kernel reads). */
-                if (have_op_wt)
+                /* For em=0x0d non-softmax tasks, use the em0d-specific
+                 * blob lookup (Phase 1) instead of the op's default
+                 * weight blob. The default (have_op_wt → op_wt_bo_off)
+                 * points to input_tensors[1]'s blob which is the CONV
+                 * weight for multi-task ops like exNorm — wrong for the
+                 * em=0x0d continuation tasks which need auxiliary LUTs
+                 * from input_tensors[4+] or anonymous hidden tensors. */
+                if (enable_mask == 0x0d && val == 0 &&
+                    !(m->ops && op < m->op_count &&
+                      strncmp(m->ops[op].type, "exSoftmax", 9) == 0)) {
+                    /* em=0x0d non-softmax: look up the anonymous-blob
+                     * assignment table built at the top of this function.
+                     * This handles Transpose / exNorm / etc. ops whose
+                     * LUT blob is NOT referenced by any tensor's f[18]
+                     * but IS present in the scan_blob_offsets table as
+                     * a type=6 anonymous entry. Phase 1 of #80. */
+                    uint32_t em0d_off = 0;
+                    for (int k = 0; k < n_em0d_assign; k++) {
+                        if (em0d_blob_assign[k].op_idx == op) {
+                            em0d_off = em0d_blob_assign[k].blob_off;
+                            break;
+                        }
+                    }
+                    /* Also check exNorm: input_tensors[4+] might have
+                     * weight blob refs for the alternating sub-tasks.
+                     * Use em0d_sub_idx to pick from input[4], [5], ... */
+                    if (em0d_off == 0 && m->ops && op < m->op_count) {
+                        const struct orknn_op_info *oi = &m->ops[op];
+                        uint32_t pick_start = 4; /* skip data/wt/bs/scratch */
+                        /* Block-based pick from the END of input_tensors:
+                         * exNorm emits em=0x0d tasks in BLOCKS separated
+                         * by em=0x1d/0x18 tasks. Each block uses ONE blob
+                         * from input_tensors[input_count-1-block_idx].
+                         * em0d_block_idx is tracked at task-level above. */
+                        uint32_t n_aux = oi->input_count > pick_start ?
+                                         oi->input_count - pick_start : 1;
+                        uint32_t pick = pick_start +
+                                        (em0d_block_idx % n_aux);
+                        if (pick < oi->input_count && m->tensor_weight_blob &&
+                            m->wt_blob_offsets) {
+                            uint32_t tidx = oi->input_tensors[pick];
+                            if (tidx < m->tensor_count) {
+                                uint32_t bi = m->tensor_weight_blob[tidx];
+                                if (bi < m->wt_blob_count)
+                                    em0d_off = m->wt_blob_offsets[bi];
+                            }
+                        }
+                    }
+                    new_val = wt_base + em0d_off;
+                    do_patch = 1;
+                } else if (is_conv && em0d_block_idx > 0 &&
+                           n_exnorm_blob > 0) {
+                    /* Post-em0d CONV: use hidden weight blob from
+                     * exnorm_conv_blobs table instead of have_op_wt.
+                     * The em0d_block_idx discriminates which CONV:
+                     * block_idx 1 → first CONV (wt_off),
+                     * block_idx 2 → second CONV (bs_off as wt). */
+                    uint32_t conv_wt = 0;
+                    for (int k = 0; k < n_exnorm_blob; k++) {
+                        if (exnorm_conv_blobs[k].op_idx == op) {
+                            conv_wt = (em0d_block_idx <= 1) ?
+                                exnorm_conv_blobs[k].wt_off :
+                                exnorm_conv_blobs[k].bs_off;
+                            break;
+                        }
+                    }
+                    new_val = wt_base + (conv_wt ? conv_wt : op_wt_bo_off) + val;
+                    do_patch = 1;
+                } else if (have_op_wt) {
                     new_val = wt_base + op_wt_bo_off + val;
-                else
+                    do_patch = 1;
+                } else {
                     new_val = wt_base + (val ? val : task_wt_off);
-                do_patch = 1;
+                    do_patch = 1;
+                }
                 break;
 
             case 0x4020: /* DST_BASE — output write */
@@ -1197,6 +1497,35 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                      * tensor (input_tensors[1]) — never to the op's
                      * real output, those always stay on em=0x18 paths. */
                     new_val = act_base + dst_tensor_off + val;
+                    do_patch = 1;
+                } else if (is_conv && em0d_block_idx > 0 &&
+                           m->ops && op < m->op_count &&
+                           m->ops[op].input_count > 3 &&
+                           m->tensor_offsets) {
+                    /* em=0x1d CONV after em=0x0d block: DST goes to
+                     * scratch tensor area (input[3]), not output[0].
+                     * Oracle: exNorm task 144 DST = act+0x488040 where
+                     * scratch_off=0x480000. The per-task val encodes
+                     * the intra-scratch offset. */
+                    uint32_t scratch_tidx = m->ops[op].input_tensors[3];
+                    uint32_t scratch_off = (scratch_tidx < m->tensor_count) ?
+                        m->tensor_offsets[scratch_tidx] : dst_tensor_off;
+                    new_val = act_base + scratch_off + val;
+                    do_patch = 1;
+                } else if (enable_mask == 0x0d && m->ops &&
+                           op < m->op_count &&
+                           m->ops[op].input_count > 3 &&
+                           m->tensor_offsets) {
+                    /* Non-softmax em=0x0d tasks (exNorm, etc.) write to
+                     * a scratch tensor at input_tensors[3], not the op's
+                     * output tensor. Oracle analysis: exNorm DST =
+                     * act + tensor_offsets[input[3]] (e.g. 0x480000).
+                     * openrknn's default dst_tensor_off = output[0]
+                     * which is wrong for these intermediate tasks. */
+                    uint32_t scratch_tidx = m->ops[op].input_tensors[3];
+                    uint32_t scratch_off = (scratch_tidx < m->tensor_count) ?
+                        m->tensor_offsets[scratch_tidx] : dst_tensor_off;
+                    new_val = act_base + scratch_off + val;
                     do_patch = 1;
                 } else if (dst_is_sg_output && sg_out_bo_idx >= 0 &&
                     (uint32_t)sg_out_bo_idx < m->n_outputs) {
@@ -1248,6 +1577,16 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     /* Sentinel REFORMAT task — see DST_BASE comment. */
                     new_val = wt_base + rc_off;
                     do_patch = 1;
+                } else if (is_conv && em0d_block_idx > 0 &&
+                           m->ops && op < m->op_count &&
+                           m->ops[op].input_count > 3) {
+                    /* Post-em0d CONV RDMA_SRC: reads from the ORIGINAL
+                     * data tensor (input[0]) not the scratch. The
+                     * raw val is a compiler-baked scratch offset that
+                     * vendor's runtime replaces with the correct
+                     * src_tensor_off. */
+                    new_val = act_base + src_tensor_off;
+                    do_patch = 1;
                 } else if (is_conv) {
                     /* Only patch if this conv has a fused residual
                      * operand (ConvAdd / ConvReluAdd — input_count >= 4)
@@ -1273,21 +1612,15 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
 
             case 0x5020: /* BS_BASE (bias) */
                 if (is_reformat) {
-                    /* Only BatchNormalization REFORMATs emit a real
-                     * BS_BASE pointer. Everything else — sentinel
-                     * lowering, Concat, Conv/ConvEx* REFORMATs —
-                     * leaves this at 0; only the corresponding CONV
-                     * tasks write the bias pointer.
-                     *
-                     * For BatchNormalization, BS_BASE points at the
-                     * gamma (scale) blob at wt_blob_offsets[input[1]]
-                     * — which is `op_wt_bo_off` in our naming (not
-                     * `op_bs_bo_off`, which points at beta and feeds
-                     * into BN_BASE / 0x502c). Verified byte-exact on
-                     * ResNet50 via the phase-0 diff oracle. */
+                    /* BatchNormalization and exNorm trailing REFORMATs
+                     * emit real BS_BASE pointers. Everything else —
+                     * sentinel, Concat, Conv/ConvEx* REFORMATs —
+                     * leaves this at 0. */
                     if (m->ops && op < m->op_count && have_op_wt &&
-                        strncmp(m->ops[op].type, "BatchNormalization",
-                                18) == 0) {
+                        (strncmp(m->ops[op].type, "BatchNormalization",
+                                18) == 0 ||
+                         (em0d_block_idx > 0 &&
+                          strncmp(m->ops[op].type, "exNorm", 6) == 0))) {
                         new_val = wt_base + op_wt_bo_off + val;
                         do_patch = 1;
                     } else if (m->ops && op < m->op_count && have_op_in0 &&
@@ -1305,6 +1638,13 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                         new_val = 0;
                         do_patch = 1;
                     }
+                } else if (is_conv && em0d_block_idx > 0 &&
+                           m->ops && op < m->op_count &&
+                           m->ops[op].input_count > 3) {
+                    /* Post-em0d CONV (exNorm): no bias in this pass.
+                     * Oracle shows BS_BASE=0 for task 144. */
+                    new_val = 0;
+                    do_patch = 1;
                 } else if (have_op_bs) {
                     new_val = wt_base + op_bs_bo_off + val;
                     do_patch = 1;
@@ -1334,7 +1674,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
              *     offset baked into the template, e.g. 0xa0 / 0x80).
              *   - Everything else (including Conv fused paths and "Add" /
              *     "Sub" / "Mul") → wt_base + pc2/pc3_off (shared LUT). */
-            case 0x6070: /* PC2 — PPU_DST_BASE_ADDR */
+            case 0x6070: /* PPU_DST_BASE_ADDR */
                 if (enable_mask == 0x60 && m->ops && op < m->op_count &&
                     (strstr(m->ops[op].type, "Pool") != NULL)) {
                     new_val = act_base + dst_tensor_off + val;
@@ -1348,7 +1688,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 }
                 break;
 
-            case 0x701c: /* PC3 — PPU_RDMA_SRC_BASE_ADDR */
+            case 0x701c: /* PPU_RDMA_SRC_BASE_ADDR */
                 if (enable_mask == 0x60 && m->ops && op < m->op_count &&
                     (strstr(m->ops[op].type, "Pool") != NULL)) {
                     new_val = act_base + src_tensor_off + val;
@@ -1376,8 +1716,11 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                           * beta/bias blob. Paired with BS_BASE (0x5020)
                           * which points at gamma. */
                 if (is_reformat && m->ops && op < m->op_count &&
-                    strncmp(m->ops[op].type, "BatchNormalization",
-                            18) == 0 && have_op_bs) {
+                    (strncmp(m->ops[op].type, "BatchNormalization",
+                            18) == 0 ||
+                     (em0d_block_idx > 0 &&
+                      strncmp(m->ops[op].type, "exNorm", 6) == 0)) &&
+                    have_op_bs) {
                     new_val = wt_base + op_bs_bo_off + val;
                     do_patch = 1;
                 } else if (is_reformat && m->ops && op < m->op_count &&
@@ -1405,6 +1748,13 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 if (is_reformat && amt >= 1000) {
                     /* Sentinel REFORMAT: vendor leaves EW at 0. */
                     new_val = 0;
+                    do_patch = 1;
+                } else if (is_conv && em0d_block_idx > 0 &&
+                    m->ops && op < m->op_count &&
+                    m->ops[op].input_count > 3) {
+                    /* Post-em0d CONV RDMA_EW: uses data tensor + small
+                     * offset, not the raw val (which is scratch-based). */
+                    new_val = act_base + src_tensor_off + (val & 0xFFFF);
                     do_patch = 1;
                 } else if (is_conv && m->ops && op < m->op_count &&
                     m->ops[op].input_count > 3) {
