@@ -797,7 +797,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         int is_em0d = (enable_mask == 0x0d);
         if (is_em0d && op == prev_op_for_em0d) {
             em0d_sub_idx++;
-            if (!em0d_in_run) { em0d_block_idx++; em0d_in_run = 1; }
+            em0d_in_run = 1;
         } else if (is_em0d) {
             em0d_sub_idx = 0;
             em0d_block_idx = 0;
@@ -809,7 +809,12 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
             em0d_in_run = 0;
             prev_op_for_em0d = UINT32_MAX;
         } else {
-            /* Same op, but not em0d → gap in the em0d run */
+            /* Same op, but not em0d → gap in the em0d run.
+             * Increment block_idx HERE (at the gap) rather than at
+             * the next em=0x0d start, so that em=0x1d CONV tasks
+             * immediately after the gap already see block_idx > 0
+             * and can switch to the scratch-tensor source. */
+            if (em0d_in_run) em0d_block_idx++;
             em0d_in_run = 0;
         }
 
@@ -903,6 +908,26 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     /* exSoftmax em=0x0d tasks always read from the
                      * scratch tensor (never from the real input). */
                     sub = 1;
+                } else if (enable_mask == 0x0d &&
+                           em0d_block_idx > 0 &&
+                           oi->input_count > 3 &&
+                           strncmp(oi->type, "exSoftmax", 9) != 0) {
+                    /* Non-softmax em=0x0d tasks in the SECOND+ block
+                     * (after a gap in the em=0x0d sequence) read from
+                     * input[3] (the scratch tensor). The FIRST block
+                     * reads from input[0] (the real data tensor). The
+                     * em0d_block_idx counter increments at each non-
+                     * em0d gap within the same op. */
+                    sub = 3;
+                } else if (enable_mask == 0x1d &&
+                           em0d_block_idx > 0 &&
+                           oi->input_count > 3) {
+                    /* em=0x1d CONV task that follows an em=0x0d block
+                     * within the same op (e.g. exNorm's second CONV
+                     * reads from the scratch, not the original input).
+                     * em0d_block_idx > 0 means we've already seen at
+                     * least one em=0x0d block for this op. */
+                    sub = 3;
                 }
                 uint32_t tidx = oi->input_tensors[sub];
                 if (tidx < m->tensor_count) {
