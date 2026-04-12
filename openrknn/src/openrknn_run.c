@@ -209,22 +209,47 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
 
         FILE *of = fopen(oracle_path, "rb");
         if (of) {
-            size_t n = fread(ctx->weight_bo.map, 1, ctx->weight_bo.size, of);
+            /* fread directly into an mmap'd DRM BO can behave oddly on
+             * some kernels (write-combining / page cache interactions).
+             * Read into a malloc buffer first, then memcpy into the BO
+             * map — same CPU write pattern openrknn uses everywhere else. */
+            uint8_t *stage = malloc(ctx->weight_bo.size);
+            size_t n = 0;
+            if (stage) {
+                n = fread(stage, 1, ctx->weight_bo.size, of);
+                memcpy(ctx->weight_bo.map, stage, n);
+                free(stage);
+            }
             fclose(of);
             orknn_log(0, "run: ORACLE_PATCH loaded %zu bytes from %s "
                       "(oracle_wt=0x%x act=0x%x in=0x%x out=0x%x)",
                       n, oracle_path, oracle_wt, oracle_act, oracle_in, oracle_out);
 
-            /* Walk all tasks and rebase the known DMA registers. */
+            /* Walk all tasks and rebase the known DMA registers.
+             * Multi-core regions share regcmd sections with the
+             * single-core region — if we re-enter the same section
+             * we'd read already-rebased values as if they were
+             * vendor-bases and apply the offset transform a second
+             * time. Dedup via a sorted array of seen offsets. */
             struct task_entry_oracle { uint32_t f[8]; uint64_t regcmd_addr; }
                 __attribute__((packed));
             const struct task_entry_oracle *tk =
                 (const struct task_entry_oracle *)ctx->task_bo.map;
+            uint32_t *rebased_offs = calloc(m->task_count ? m->task_count : 1,
+                                            sizeof(uint32_t));
+            int n_rebased = 0;
             for (uint32_t t = 0; t < m->task_count; t++) {
                 uint32_t amt = tk[t].f[6];
                 uint64_t addr = tk[t].regcmd_addr;
                 uint32_t bo_off = (uint32_t)(addr - wt_base);
                 if (bo_off >= ctx->weight_bo.size) continue;
+                /* Skip already-rebased sections. */
+                int seen = 0;
+                for (int k = 0; k < n_rebased; k++) {
+                    if (rebased_offs[k] == bo_off) { seen = 1; break; }
+                }
+                if (seen) continue;
+                rebased_offs[n_rebased++] = bo_off;
                 uint64_t *entries = (uint64_t *)
                     ((uint8_t *)ctx->weight_bo.map + bo_off);
                 for (uint32_t e = 0; e < amt + 4; e++) {
@@ -272,12 +297,42 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                         break;
                     }
                     if (is_dma) {
-                        entries[e] = ((uint64_t)nv << 16) | reg;
+                        /* Preserve bits [48..63] (per-entry metadata)
+                         * and reg in bits [0..15]; overwrite only the
+                         * 32-bit val payload. Matches the format used
+                         * by the regular patch loop at the bottom of
+                         * this function. Without this, the NPU PC
+                         * engine sees garbage per-entry control bits
+                         * and hangs on every submit regardless of
+                         * regcmd content. */
+                        entries[e] = (entries[e] & 0xFFFF000000000000ULL) |
+                                     ((uint64_t)nv << 16) |
+                                     (entries[e] & 0xFFFF);
                     }
                 }
             }
-            orknn_log(0, "run: ORACLE_PATCH rebased DMA registers across %u tasks",
-                      m->task_count);
+            orknn_log(0, "run: ORACLE_PATCH rebased DMA registers across %u tasks "
+                      "(%d unique regcmd sections)",
+                      m->task_count, n_rebased);
+            free(rebased_offs);
+            /* Debug dump (same paths as the normal path's ORKNN_DUMP_BO1). */
+            const char *oracle_bo1_dump = getenv("ORKNN_DUMP_BO1");
+            if (oracle_bo1_dump) {
+                FILE *bf = fopen(oracle_bo1_dump, "wb");
+                if (bf) {
+                    fwrite(ctx->weight_bo.map, 1, ctx->weight_bo.size, bf);
+                    fclose(bf);
+                    orknn_log(0, "run: (oracle) dumped weight BO to %s",
+                              oracle_bo1_dump);
+                }
+            }
+            /* Match the end-of-normal-path sync: the regular
+             * patch_regcmd_addresses runs `orknn_bo_sync_to_device` on
+             * the weight BO just before returning. We just rewrote the
+             * BO bytes, so without this sync the NPU will read stale
+             * cached data and the first submit hangs. Skipping this
+             * was the Phase-0 bug blocking oracle-patch on SmolVLM. */
+            orknn_bo_sync_to_device(ctx->npu_fd, &ctx->weight_bo);
             return;
         } else {
             orknn_log(0, "run: ORACLE_PATCH failed to open %s", oracle_path);

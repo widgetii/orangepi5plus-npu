@@ -290,11 +290,35 @@ int orknn_npu_submit(int fd, struct orknn_bo *task_bo,
     if (effective == 0)
         effective = 0x1;  /* AUTO → core 0 */
 
+    /* Dev: ORKNN_MAX_TASKS=N truncates every single-core submit to at
+     * most N tasks. Used for Phase-0 bisection of the ORKNN_ORACLE_PATCH
+     * hang on transformer shards — find the smallest N that still hangs
+     * to localize the first corrupt task. Does NOT affect correctness on
+     * CNN models when unset. */
+    uint32_t eff_task_start  = seg->sc_start;
+    uint32_t eff_task_number = seg->task_number;
+    uint32_t eff_sc_count    = seg->sc_count;
+    const char *task_start_env = getenv("ORKNN_TASK_START");
+    if (task_start_env) {
+        eff_task_start = (uint32_t)strtoul(task_start_env, NULL, 0);
+    }
+    const char *max_tasks_env = getenv("ORKNN_MAX_TASKS");
+    if (max_tasks_env) {
+        uint32_t limit = (uint32_t)strtoul(max_tasks_env, NULL, 0);
+        if (limit > 0) {
+            if (eff_task_number > limit) eff_task_number = limit;
+            if (eff_sc_count    > limit) eff_sc_count    = limit;
+            orknn_log(0, "drm: ORKNN_MAX_TASKS=%u truncated submit "
+                      "(was task_number=%u sc_count=%u, start=%u)",
+                      limit, seg->task_number, seg->sc_count, eff_task_start);
+        }
+    }
+
     struct rknpu_submit sub = {
         .flags = seg->flags | RKNPU_JOB_BLOCK,
         .timeout = 6000,
-        .task_start = seg->sc_start,
-        .task_number = seg->task_number,
+        .task_start = eff_task_start,
+        .task_number = eff_task_number,
         .task_obj_addr = task_bo->obj_addr,
         .core_mask = effective,
         .fence_fd = -1,
@@ -310,12 +334,12 @@ int orknn_npu_submit(int fd, struct orknn_bo *task_bo,
              * single-core range; kernel will either run all 3 cores
              * on redundant work (wasteful + incorrect output) or
              * error out. */
-            { seg->sc_start, seg->sc_count },  /* [0] mask=0x1 → core 0 */
-            { seg->sc_start, seg->sc_count },  /* [1] mask=0x2 → core 1 */
-            { seg->sc_start, seg->sc_count },  /* [2] mask=0x4 → core 2
+            { eff_task_start, eff_sc_count },  /* [0] mask=0x1 → core 0 */
+            { eff_task_start, eff_sc_count },  /* [1] mask=0x2 → core 1 */
+            { eff_task_start, eff_sc_count },  /* [2] mask=0x4 → core 2
                                                 *     (and 3-core: core 0) */
-            { seg->sc_start, seg->sc_count },  /* [3] 3-core: core 1 */
-            { seg->sc_start, seg->sc_count },  /* [4] 3-core: core 2 */
+            { eff_task_start, eff_sc_count },  /* [3] 3-core: core 1 */
+            { eff_task_start, eff_sc_count },  /* [4] 3-core: core 2 */
         },
     };
 
@@ -326,7 +350,7 @@ int orknn_npu_submit(int fd, struct orknn_bo *task_bo,
 
     if (ret)
         orknn_log(0, "drm: SUBMIT failed: %s (tasks=%u sc={%u,%u})",
-                  strerror(errno), seg->task_number, seg->sc_start, seg->sc_count);
+                  strerror(errno), eff_task_number, eff_task_start, eff_sc_count);
 
     return ret;
 }
