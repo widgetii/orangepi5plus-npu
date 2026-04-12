@@ -612,6 +612,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
     #define MAX_EXNORM_BLOB_ASSIGN 8
     struct { uint32_t op_idx; uint32_t wt_off; uint32_t bs_off; }
         exnorm_conv_blobs[MAX_EXNORM_BLOB_ASSIGN];
+    memset(exnorm_conv_blobs, 0, sizeof(exnorm_conv_blobs));
     int n_exnorm_blob = 0;
     if (m->ops && n_anon > 0) {
         /* Find which ops emit em=0x0d tasks */
