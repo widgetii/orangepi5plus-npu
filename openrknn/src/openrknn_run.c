@@ -848,6 +848,21 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         int is_reformat = (enable_mask == 0x18);
         uint32_t op = tasks[t].f[1]; /* op_idx */
 
+        /* Detect the FINAL trailing REFORMAT of an exNorm op: the last
+         * em=0x18 task before the op switches. The final one writes to the
+         * real output tensor (not scratch) and applies BS/BN (gamma/beta).
+         * Intermediate trailing REFORMATs write to scratch with BS/BN=0. */
+        int is_exnorm_final_reformat = 0;
+        if (is_reformat && em0d_block_idx > 0 &&
+            m->ops && op < m->op_count &&
+            strncmp(m->ops[op].type, "exNorm", 6) == 0) {
+            /* Check if next task has a different op_idx */
+            uint32_t next_op = (t + 1 < m->task_count) ?
+                               tasks[t + 1].f[1] : UINT32_MAX;
+            if (next_op != op)
+                is_exnorm_final_reformat = 1;
+        }
+
         /* Update the REFORMAT sub-task counter. Only increments for
          * em=0x18 tasks and only resets when op_idx changes. Non-
          * REFORMAT tasks (em=0x0d softmax continuations) pass through
@@ -1574,9 +1589,19 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     new_val = (uint32_t)ctx->output_bos[sg_out_bo_idx]
                                   .dma_addr + val;
                     do_patch = 1;
+                } else if (is_reformat && em0d_block_idx > 0 &&
+                           !is_exnorm_final_reformat &&
+                           m->ops && op < m->op_count &&
+                           strncmp(m->ops[op].type, "exNorm", 6) == 0 &&
+                           m->ops[op].input_count > 3) {
+                    /* Intermediate exNorm trailing REFORMATs write to the
+                     * scratch tensor (input[3]). The FINAL one writes to
+                     * the real output tensor (dst_tensor_off). */
+                    new_val = act_base + rdma_tensor_off + val;
+                    do_patch = 1;
                 } else if (is_reformat) {
-                    /* Non-output REFORMAT: writes to an intermediate
-                     * activation tensor in act BO. Use memory plan. */
+                    /* Non-output REFORMAT (including exNorm final): writes
+                     * to activation tensor per memory plan. */
                     new_val = act_base + dst_tensor_off + val;
                     do_patch = 1;
                 } else {
@@ -1641,6 +1666,16 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                         new_val = act_base + rdma_tensor_off + val;
                         do_patch = 1;
                     }
+                } else if (is_reformat && em0d_block_idx > 0 &&
+                           m->ops && op < m->op_count &&
+                           strncmp(m->ops[op].type, "exNorm", 6) == 0 &&
+                           m->ops[op].input_count > 3) {
+                    /* exNorm trailing REFORMATs (after em=0x0d block +
+                     * CONV pass) read from the scratch tensor (input[3]),
+                     * not the data tensor (input[0]). The CONV wrote its
+                     * output to scratch; these REFORMATs reformat it. */
+                    new_val = act_base + rdma_tensor_off + val;
+                    do_patch = 1;
                 } else if (is_reformat) {
                     new_val = act_base + src_tensor_off + val;
                     do_patch = 1;
@@ -1659,8 +1694,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     if (m->ops && op < m->op_count && have_op_wt &&
                         (strncmp(m->ops[op].type, "BatchNormalization",
                                 18) == 0 ||
-                         (em0d_block_idx > 0 &&
-                          strncmp(m->ops[op].type, "exNorm", 6) == 0))) {
+                         is_exnorm_final_reformat)) {
                         new_val = wt_base + op_wt_bo_off + val;
                         do_patch = 1;
                     } else if (m->ops && op < m->op_count && have_op_in0 &&
@@ -1758,8 +1792,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 if (is_reformat && m->ops && op < m->op_count &&
                     (strncmp(m->ops[op].type, "BatchNormalization",
                             18) == 0 ||
-                     (em0d_block_idx > 0 &&
-                      strncmp(m->ops[op].type, "exNorm", 6) == 0)) &&
+                     is_exnorm_final_reformat) &&
                     have_op_bs) {
                     new_val = wt_base + op_bs_bo_off + val;
                     do_patch = 1;
