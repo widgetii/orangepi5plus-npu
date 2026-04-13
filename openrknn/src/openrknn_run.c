@@ -2083,12 +2083,14 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
         mc_count = m->n_submits_3core;
     }
     /* FP16 transformer models (unified_act): single-core tasks only cover
-     * ~512 of 1024 spatial positions. The vendor runs all 3 NPU cores
-     * simultaneously (task_number=N*3) via kernel-level multi-core dispatch
-     * set up during rknn_init. openrknn's OWN mode doesn't do this kernel
-     * setup, so submitting with core_mask=0 still runs single-core.
-     * TODO #80: implement kernel-level multi-core dispatch for FP16. */
-    int use_vendor_3core = 0; /* disabled: needs kernel integration */
+     * ~512 of 1024 spatial positions. The vendor submits with task_number
+     * tripled (N*3) and core_mask from ctx, leaving subcore_task[] zeroed.
+     * The kernel auto-distributes tasks across all available cores. */
+    /* FP16 transformer models: single-core tasks cover ~512/1024 spatial
+     * positions. The vendor uses core_mask=0 (kernel auto-distributes
+     * 3x tasks across all 3 cores) with subcore_task zeroed. This requires
+     * kernel-level context setup that openrknn's OWN mode doesn't do.
+     * See #80 for the full multi-core dispatch investigation. */
 
     if (mc_plan && mc_count > 0) {
         orknn_log(2, "run: multi-core submit (mask=0x%x, %u submits)",
@@ -2146,8 +2148,8 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
                     seg_copy.task_number -= trim;
                 }
             }
-            int ret = orknn_npu_submit(ctx->npu_fd, &ctx->task_bo, &seg_copy,
-                                       ctx->core_mask);
+            int ret = orknn_npu_submit(ctx->npu_fd, &ctx->task_bo,
+                                       &seg_copy, ctx->core_mask);
             if (ret) {
                 orknn_log(0, "run: segment %u submit failed", i);
                 return RKNN_ERR_FAIL;
