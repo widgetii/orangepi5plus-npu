@@ -159,6 +159,12 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
         orknn_log(0, "memory: failed to allocate activation BO (%u bytes)", act_size);
         return -1;
     }
+    /* Zero-initialize activation BO: the NPU reads from activation offsets
+     * before any task writes to them (e.g., scratch tensor). Without this,
+     * stale data from previous DMA allocations causes non-deterministic
+     * output. The vendor's runtime also zero-initializes. */
+    memset(ctx->activation_bo.map, 0, act_size);
+    orknn_bo_sync_to_device(fd, &ctx->activation_bo);
     orknn_log(1, "memory: activation BO: %u bytes, dma=0x%lx",
               act_size, (unsigned long)ctx->activation_bo.dma_addr);
 
