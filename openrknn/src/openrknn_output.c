@@ -158,11 +158,36 @@ int orknn_own_outputs_get(struct orknn_context *ctx, uint32_t n_outputs,
             #undef SRC_OFF_HBWCH16
             #undef SRC_OFF
             #undef USER_OFF
+        } else if (ti->n_dims == 3 && ti->type == 1 /* FP16 */ &&
+                   ti->dims[2] > 0 && (ti->dims[2] % 8) == 0) {
+            /* FP16 3D tensor (e.g., [1, 1024, 768] transformer output).
+             * NPU stores in tiled format: [H/8, C, 8] where H=dims[1],
+             * C=dims[2], tile_size=8. Detile to NHWC [H, C] order. */
+            uint32_t H = ti->dims[1];
+            uint32_t C = ti->dims[2];
+            uint32_t tile = 8;
+            uint32_t H_tiles = H / tile;
+            uint16_t *src16 = (uint16_t *)src;
+            if (outputs[i].want_float) {
+                float *fdst = (float *)dst;
+                for (uint32_t ht = 0; ht < H_tiles; ht++)
+                    for (uint32_t hs = 0; hs < tile; hs++)
+                        for (uint32_t c = 0; c < C; c++) {
+                            uint16_t h = src16[ht * C * tile + c * tile + hs];
+                            /* FP16 → FP32 via __fp16 (ARM) */
+                            __fp16 *hp = (__fp16 *)&h;
+                            fdst[(ht * tile + hs) * C + c] = (float)*hp;
+                        }
+            } else {
+                uint16_t *dst16 = (uint16_t *)dst;
+                for (uint32_t ht = 0; ht < H_tiles; ht++)
+                    for (uint32_t hs = 0; hs < tile; hs++)
+                        for (uint32_t c = 0; c < C; c++)
+                            dst16[(ht * tile + hs) * C + c] =
+                                src16[ht * C * tile + c * tile + hs];
+            }
         } else {
-            /* Non-4D (e.g., 2D [1,1001] or 3D [1,1024,768]): direct copy.
-             * copy_size is the tensor data size in bytes (n_elems × dtype_size).
-             * For INT8 models n_elems == byte count; for FP16 models
-             * n_elems is the element count so we need ti->size instead. */
+            /* Other non-4D (e.g., 2D [1,1001]): direct copy. */
             uint32_t copy_size = ti->size;
             if (outputs[i].want_float) {
                 float *fdst = (float *)dst;
