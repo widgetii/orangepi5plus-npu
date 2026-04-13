@@ -194,12 +194,9 @@ run_phase "Phase 2: openrknn OWN path (no vendor deps)" "$LIB" \
 # entry is there.
 
 # Models allowed to have template-patch regcmd diffs.
-# smolvlm_l0_mlp: 26 DMA-class diffs in exNorm REFORMAT tasks (pc2/pc3
-#   heuristic swap + exNorm inter-pass REFORMAT routing). The model runs
-#   end-to-end at 26.7 FPS natively; the diffs affect per-channel
-#   correction quality and exNorm pass routing but don't crash the NPU.
-#   Tracked as #80 Phase 1 follow-up.
-DIFF_ALLOWLIST="smolvlm_l0_mlp smolvlm_l0_attn_fused"
+# smolvlm_l0_attn_fused: attention shard has diffs not yet resolved.
+#   Tracked as #80 follow-up.
+DIFF_ALLOWLIST="smolvlm_l0_attn_fused"
 
 is_allowlisted() {
     case " $DIFF_ALLOWLIST " in

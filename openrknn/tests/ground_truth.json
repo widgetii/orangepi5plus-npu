@@ -69,7 +69,6 @@
   "smolvlm_l0_mlp": {
     "model": "smolvlm_l0_mlp.rknn",
     "type": "fp16_run",
-    "env": {"ORKNN_ACT_SIZE_MULT": "3"},
     "expect": {
       "input_type": 1,
       "n_outputs": 1,
@@ -79,7 +78,6 @@
   "smolvlm_l0_attn_fused": {
     "model": "smolvlm_l0_attn_fused.rknn",
     "type": "fp16_run",
-    "env": {"ORKNN_ACT_SIZE_MULT": "3"},
     "expect": {
       "input_type": 1,
       "n_outputs": 1,

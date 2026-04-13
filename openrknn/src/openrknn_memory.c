@@ -129,27 +129,34 @@ int orknn_alloc_model_bos(struct orknn_context *ctx)
     uint32_t act_size = max_act_off * 4 + largest_io * 2;
     if (act_size < 1048576) act_size = 1048576;
     act_size = ALIGN_UP(act_size, 4096);
-    /* Dev: ORKNN_ACT_SIZE_MULT=N multiplies the computed activation BO
-     * size by N. Used for Phase-0E testing of the SmolVLM l0_mlp seg-1
-     * hang — vendor allocates ~3x openrknn's activation BO size
-     * (28 MB vs 9 MB), possibly because its regcmd assumes a
-     * pre-compiled multi-core layout even for single-core submits. */
-    const char *mult_env = getenv("ORKNN_ACT_SIZE_MULT");
-    if (mult_env) {
-        uint32_t m_ = (uint32_t)strtoul(mult_env, NULL, 10);
-        if (m_ > 0 && m_ < 16) {
-            uint64_t new_sz = (uint64_t)act_size * m_;
-            if (new_sz < UINT32_MAX) {
-                orknn_log(0, "memory: ORKNN_ACT_SIZE_MULT=%u %u -> %lu",
-                          m_, act_size, (unsigned long)new_sz);
-                act_size = (uint32_t)new_sz;
+    /* Auto-detect FP16 transformer models: if the model has FP16 input
+     * and exNorm ops, enable unified activation BO (vendor's 3-BO layout)
+     * and multiply activation size by 3 to match vendor's ~28MB BO. */
+    int is_fp16_transformer = 0;
+    if (m->n_inputs > 0 && m->inputs[0].type == 1 /* FP16 */ && m->ops) {
+        for (uint32_t i = 0; i < m->op_count; i++) {
+            if (strncmp(m->ops[i].type, "exNorm", 6) == 0 ||
+                strncmp(m->ops[i].type, "exSDPAttention", 14) == 0) {
+                is_fp16_transformer = 1;
+                break;
             }
         }
-        /* When activation size multiplier is set, enable unified activation
-         * BO layout: input/output data is embedded in the activation BO at
-         * their FB f[13] tensor offsets, matching the vendor's 3-BO layout.
-         * This is required for FP16 transformer models where the vendor's
-         * regcmd template assumes input/output live in the activation BO. */
+    }
+    /* Dev override: ORKNN_ACT_SIZE_MULT=N forces a specific multiplier. */
+    const char *mult_env = getenv("ORKNN_ACT_SIZE_MULT");
+    if (is_fp16_transformer || mult_env) {
+        uint32_t m_ = 3; /* default for FP16 transformers */
+        if (mult_env) {
+            uint32_t v = (uint32_t)strtoul(mult_env, NULL, 10);
+            if (v > 0 && v < 16) m_ = v;
+        }
+        uint64_t new_sz = (uint64_t)act_size * m_;
+        if (new_sz < UINT32_MAX) {
+            orknn_log(1, "memory: %s act_size %u -> %lu (x%u)",
+                      is_fp16_transformer ? "FP16 transformer" : "ORKNN_ACT_SIZE_MULT",
+                      act_size, (unsigned long)new_sz, m_);
+            act_size = (uint32_t)new_sz;
+        }
         ctx->unified_act = 1;
     }
     orknn_log(1, "memory: activation size: scan=%u+largest_io=%u "
