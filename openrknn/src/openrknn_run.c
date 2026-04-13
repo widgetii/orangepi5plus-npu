@@ -2082,6 +2082,13 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
         mc_plan = m->submits_3core;
         mc_count = m->n_submits_3core;
     }
+    /* FP16 transformer models (unified_act): single-core tasks only cover
+     * ~512 of 1024 spatial positions. The vendor runs all 3 NPU cores
+     * simultaneously (task_number=N*3) via kernel-level multi-core dispatch
+     * set up during rknn_init. openrknn's OWN mode doesn't do this kernel
+     * setup, so submitting with core_mask=0 still runs single-core.
+     * TODO #80: implement kernel-level multi-core dispatch for FP16. */
+    int use_vendor_3core = 0; /* disabled: needs kernel integration */
 
     if (mc_plan && mc_count > 0) {
         orknn_log(2, "run: multi-core submit (mask=0x%x, %u submits)",
