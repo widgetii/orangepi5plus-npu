@@ -159,10 +159,11 @@ int orknn_own_outputs_get(struct orknn_context *ctx, uint32_t n_outputs,
             #undef SRC_OFF
             #undef USER_OFF
         } else {
-            /* Non-4D (e.g., 2D [1,1001]): direct copy, trim padding.
-             * Native BO may be padded (e.g., 1024 for 1001 elements).
-             * Just copy the first n_elems bytes. */
-            uint32_t copy_size = ti->n_elems;
+            /* Non-4D (e.g., 2D [1,1001] or 3D [1,1024,768]): direct copy.
+             * copy_size is the tensor data size in bytes (n_elems × dtype_size).
+             * For INT8 models n_elems == byte count; for FP16 models
+             * n_elems is the element count so we need ti->size instead. */
+            uint32_t copy_size = ti->size;
             if (outputs[i].want_float) {
                 float *fdst = (float *)dst;
                 float scale = ti->scale;
