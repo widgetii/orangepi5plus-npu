@@ -847,6 +847,26 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         int is_conv = (enable_mask == 0x1d);
         int is_reformat = (enable_mask == 0x18);
         uint32_t op = tasks[t].f[1]; /* op_idx */
+        /* CNA tile offset for post-em0d CONVs: captured when processing
+         * CNA_FEAT (0x1070), reused by SRC (0x5018) and EW (0x5038)
+         * within the same task to derive the correct scratch sub-offset.
+         * The SRC tile offset = CNA_val modulo data tensor size. */
+        uint32_t exnorm_conv_cna_tile = 0;
+
+        /* Detect the FINAL trailing REFORMAT of an exNorm op: the last
+         * em=0x18 task before the op switches. The final one writes to the
+         * real output tensor (not scratch) and applies BS/BN (gamma/beta).
+         * Intermediate trailing REFORMATs write to scratch with BS/BN=0. */
+        int is_exnorm_final_reformat = 0;
+        if (is_reformat && em0d_block_idx > 0 &&
+            m->ops && op < m->op_count &&
+            strncmp(m->ops[op].type, "exNorm", 6) == 0) {
+            /* Check if next task has a different op_idx */
+            uint32_t next_op = (t + 1 < m->task_count) ?
+                               tasks[t + 1].f[1] : UINT32_MAX;
+            if (next_op != op)
+                is_exnorm_final_reformat = 1;
+        }
 
         /* Update the REFORMAT sub-task counter. Only increments for
          * em=0x18 tasks and only resets when op_idx changes. Non-
@@ -1395,6 +1415,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     uint32_t scratch_off = (scratch_tidx < m->tensor_count) ?
                         m->tensor_offsets[scratch_tidx] : src_tensor_off;
                     new_val = act_base + scratch_off + val;
+                    exnorm_conv_cna_tile = val;
                     do_patch = 1;
                 } else if (is_conv) {
                     /* Subsequent convs read from the activation BO at the
@@ -1574,9 +1595,19 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     new_val = (uint32_t)ctx->output_bos[sg_out_bo_idx]
                                   .dma_addr + val;
                     do_patch = 1;
+                } else if (is_reformat && em0d_block_idx > 0 &&
+                           !is_exnorm_final_reformat &&
+                           m->ops && op < m->op_count &&
+                           strncmp(m->ops[op].type, "exNorm", 6) == 0 &&
+                           m->ops[op].input_count > 3) {
+                    /* Intermediate exNorm trailing REFORMATs write to the
+                     * scratch tensor (input[3]). The FINAL one writes to
+                     * the real output tensor (dst_tensor_off). */
+                    new_val = act_base + rdma_tensor_off + val;
+                    do_patch = 1;
                 } else if (is_reformat) {
-                    /* Non-output REFORMAT: writes to an intermediate
-                     * activation tensor in act BO. Use memory plan. */
+                    /* Non-output REFORMAT (including exNorm final): writes
+                     * to activation tensor per memory plan. */
                     new_val = act_base + dst_tensor_off + val;
                     do_patch = 1;
                 } else {
@@ -1617,14 +1648,21 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     /* Sentinel REFORMAT task — see DST_BASE comment. */
                     new_val = wt_base + rc_off;
                     do_patch = 1;
+                } else if (is_conv && em0d_block_idx > 1 &&
+                           m->ops && op < m->op_count &&
+                           m->ops[op].input_count > 3) {
+                    /* Second+ post-em0d CONV RDMA_SRC: reads from scratch
+                     * tensor (where intermediate REFORMATs wrote). First
+                     * CONV (block_idx=1) still reads from data tensor.
+                     * Tile offset derived from CNA_FEAT modulo data size. */
+                    uint32_t src_tile = exnorm_conv_cna_tile %
+                        (src_tensor_off ? src_tensor_off : 1);
+                    new_val = act_base + rdma_tensor_off + src_tile;
+                    do_patch = 1;
                 } else if (is_conv && em0d_block_idx > 0 &&
                            m->ops && op < m->op_count &&
                            m->ops[op].input_count > 3) {
-                    /* Post-em0d CONV RDMA_SRC: reads from the ORIGINAL
-                     * data tensor (input[0]) not the scratch. The
-                     * raw val is a compiler-baked scratch offset that
-                     * vendor's runtime replaces with the correct
-                     * src_tensor_off. */
+                    /* First post-em0d CONV reads from data tensor. */
                     new_val = act_base + src_tensor_off;
                     do_patch = 1;
                 } else if (is_conv) {
@@ -1641,6 +1679,24 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                         new_val = act_base + rdma_tensor_off + val;
                         do_patch = 1;
                     }
+                } else if (is_reformat && em0d_block_idx > 0 &&
+                           m->ops && op < m->op_count &&
+                           strncmp(m->ops[op].type, "exNorm", 6) == 0 &&
+                           m->ops[op].input_count > 3) {
+                    /* exNorm trailing REFORMATs (after em=0x0d block +
+                     * CONV pass) read from the scratch tensor (input[3]),
+                     * not the data tensor (input[0]). The CONV wrote its
+                     * output to scratch; these REFORMATs reformat it. */
+                    new_val = act_base + rdma_tensor_off + val;
+                    do_patch = 1;
+                } else if (is_reformat && ctx->unified_act &&
+                           t > 0 && tasks[t-1].f[1] == op &&
+                           (tasks[t-1].f[2] & 0xFF) == 0x1d) {
+                    /* Post-CONV REFORMAT in unified-BO mode: reads from
+                     * the CONV's output tensor, not the op's input. The
+                     * preceding task was a CONV (em=0x1d) of the same op. */
+                    new_val = act_base + dst_tensor_off + val;
+                    do_patch = 1;
                 } else if (is_reformat) {
                     new_val = act_base + src_tensor_off + val;
                     do_patch = 1;
@@ -1659,8 +1715,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     if (m->ops && op < m->op_count && have_op_wt &&
                         (strncmp(m->ops[op].type, "BatchNormalization",
                                 18) == 0 ||
-                         (em0d_block_idx > 0 &&
-                          strncmp(m->ops[op].type, "exNorm", 6) == 0))) {
+                         is_exnorm_final_reformat)) {
                         new_val = wt_base + op_wt_bo_off + val;
                         do_patch = 1;
                     } else if (m->ops && op < m->op_count && have_op_in0 &&
@@ -1758,8 +1813,7 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 if (is_reformat && m->ops && op < m->op_count &&
                     (strncmp(m->ops[op].type, "BatchNormalization",
                             18) == 0 ||
-                     (em0d_block_idx > 0 &&
-                      strncmp(m->ops[op].type, "exNorm", 6) == 0)) &&
+                     is_exnorm_final_reformat) &&
                     have_op_bs) {
                     new_val = wt_base + op_bs_bo_off + val;
                     do_patch = 1;
@@ -1789,11 +1843,16 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                     /* Sentinel REFORMAT: vendor leaves EW at 0. */
                     new_val = 0;
                     do_patch = 1;
+                } else if (is_conv && em0d_block_idx > 1 &&
+                    m->ops && op < m->op_count &&
+                    m->ops[op].input_count > 3) {
+                    /* Second+ post-em0d CONV RDMA_EW: reads from scratch. */
+                    new_val = act_base + rdma_tensor_off + (val & 0xFFFF);
+                    do_patch = 1;
                 } else if (is_conv && em0d_block_idx > 0 &&
                     m->ops && op < m->op_count &&
                     m->ops[op].input_count > 3) {
-                    /* Post-em0d CONV RDMA_EW: uses data tensor + small
-                     * offset, not the raw val (which is scratch-based). */
+                    /* First post-em0d CONV EW: reads from data tensor. */
                     new_val = act_base + src_tensor_off + (val & 0xFFFF);
                     do_patch = 1;
                 } else if (is_conv && m->ops && op < m->op_count &&
