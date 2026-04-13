@@ -288,7 +288,7 @@ int orknn_npu_submit(int fd, struct orknn_bo *task_bo,
         popcount = 1;
     }
     if (effective == 0)
-        effective = 0x1;  /* AUTO → core 0 */
+        effective = 0x1;  /* AUTO → core 0 (kernel panics with 0 without vendor init) */
 
     /* Dev: ORKNN_MAX_TASKS=N truncates every single-core submit to at
      * most N tasks. Used for Phase-0 bisection of the ORKNN_ORACLE_PATCH
@@ -323,23 +323,11 @@ int orknn_npu_submit(int fd, struct orknn_bo *task_bo,
         .core_mask = effective,
         .fence_fd = -1,
         .subcore_task = {
-            /* Single-core: kernel reads subcore_task[core_index] where
-             * core_index is the bit position of the active core. We
-             * populate all 3 single-core slots with the same range so
-             * mask=0x1, 0x2, 0x4 all work.
-             *
-             * Multi-core (experimental): slots [2..4] would need to
-             * carry per-core task regions from a multi-core task BO
-             * layout we don't yet parse. Filled with the same
-             * single-core range; kernel will either run all 3 cores
-             * on redundant work (wasteful + incorrect output) or
-             * error out. */
-            { eff_task_start, eff_sc_count },  /* [0] mask=0x1 → core 0 */
-            { eff_task_start, eff_sc_count },  /* [1] mask=0x2 → core 1 */
-            { eff_task_start, eff_sc_count },  /* [2] mask=0x4 → core 2
-                                                *     (and 3-core: core 0) */
-            { eff_task_start, eff_sc_count },  /* [3] 3-core: core 1 */
-            { eff_task_start, eff_sc_count },  /* [4] 3-core: core 2 */
+            { eff_task_start, eff_sc_count },
+            { eff_task_start, eff_sc_count },
+            { eff_task_start, eff_sc_count },
+            { eff_task_start, eff_sc_count },
+            { eff_task_start, eff_sc_count },
         },
     };
 
