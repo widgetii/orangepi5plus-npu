@@ -2157,6 +2157,19 @@ int orknn_own_run(struct orknn_context *ctx, rknn_run_extend *extend)
         }
     }
 
+    /* Dev: dump activation BO after run for layout analysis */
+    const char *act_dump = getenv("ORKNN_DUMP_ACT");
+    if (act_dump && ctx->activation_bo.map) {
+        orknn_bo_sync_from_device(ctx->npu_fd, &ctx->activation_bo);
+        FILE *af = fopen(act_dump, "wb");
+        if (af) {
+            fwrite(ctx->activation_bo.map, 1, ctx->activation_bo.size, af);
+            fclose(af);
+            orknn_log(1, "run: dumped act BO (%u bytes) to %s",
+                      ctx->activation_bo.size, act_dump);
+        }
+    }
+
     ctx->run_count++;
     return RKNN_SUCC;
 }
