@@ -465,7 +465,8 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 int has_exnorm = 0;
                 if (m->ops) {
                     for (uint32_t oi = 0; oi < m->op_count; oi++) {
-                        if (strncmp(m->ops[oi].type, "exNorm", 6) == 0) {
+                        if (strncmp(m->ops[oi].type, "exNorm", 6) == 0 ||
+                            strncmp(m->ops[oi].type, "exSDPAttention", 14) == 0) {
                             has_exnorm = 1;
                             break;
                         }
@@ -847,6 +848,8 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
         int is_conv = (enable_mask == 0x1d);
         int is_reformat = (enable_mask == 0x18);
         uint32_t op = tasks[t].f[1]; /* op_idx */
+        int is_exsdp = (m->ops && op < m->op_count &&
+                        strncmp(m->ops[op].type, "exSDPAttention", 14) == 0);
         /* CNA tile offset for post-em0d CONVs: captured when processing
          * CNA_FEAT (0x1070), reused by SRC (0x5018) and EW (0x5038)
          * within the same task to derive the correct scratch sub-offset.
@@ -1100,6 +1103,16 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                 uint32_t tidx = oi->input_tensors[oi->input_count - 1];
                 if (tidx < m->tensor_count)
                     ew_tensor_off = m->tensor_offsets[tidx];
+            }
+            /* exSDPAttention tensor routing:
+             * inputs: [0]=Q_tile [1]=K [2]=V [3]=output_buf
+             * CNA_FEATURE reads Q_tile (input[0]) — keep src_tensor_off
+             * DPU_RDMA_SRC reads V (input[2]) — handled per-register
+             * DPU_DST writes to output_buf (input[3]) — override dst */
+            if (is_exsdp && oi->input_count >= 4) {
+                uint32_t out_tidx = oi->input_tensors[3];
+                if (out_tidx < m->tensor_count)
+                    dst_tensor_off = m->tensor_offsets[out_tidx];
             }
             /* input_tensors[0] weight-BO offset: only set if input[0]
              * has a weight blob (InputOperator's mask tensor). Most
@@ -1689,12 +1702,22 @@ static void patch_regcmd_addresses(struct orknn_context *ctx)
                      * output to scratch; these REFORMATs reformat it. */
                     new_val = act_base + rdma_tensor_off + val;
                     do_patch = 1;
+                } else if (is_reformat && is_exsdp) {
+                    /* exSDPAttention REFORMAT SRC: reads from V tensor
+                     * (input[2]), not Q tile (input[0]). Takes priority
+                     * over the post-CONV branch because exSDPAttention's
+                     * internal REFORMATs always route through V. */
+                    uint32_t v_off = (m->ops[op].input_count > 2 &&
+                        m->ops[op].input_tensors[2] < m->tensor_count)
+                        ? m->tensor_offsets[m->ops[op].input_tensors[2]]
+                        : src_tensor_off;
+                    new_val = act_base + v_off + val;
+                    do_patch = 1;
                 } else if (is_reformat && ctx->unified_act &&
                            t > 0 && tasks[t-1].f[1] == op &&
                            (tasks[t-1].f[2] & 0xFF) == 0x1d) {
                     /* Post-CONV REFORMAT in unified-BO mode: reads from
-                     * the CONV's output tensor, not the op's input. The
-                     * preceding task was a CONV (em=0x1d) of the same op. */
+                     * the CONV's output tensor, not the op's input. */
                     new_val = act_base + dst_tensor_off + val;
                     do_patch = 1;
                 } else if (is_reformat) {
